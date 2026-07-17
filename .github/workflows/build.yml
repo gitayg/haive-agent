@@ -1,0 +1,177 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write        # OIDC — mint the Sigstore identity for provenance
+  attestations: write    # store the signed build-provenance attestations
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            suffix: windows
+            ext: ".exe"
+          - os: macos-latest
+            suffix: macos
+            ext: ""
+          # Linux builds run on 24.04 (its PipeWire/SPA headers are new enough for
+          # the libspa crate) but link an OLD glibc via cargo-zigbuild, so the
+          # binaries also run on Debian 12 / Ubuntu 22.04 and ARM SBCs (Radxa).
+          - os: ubuntu-24.04
+            suffix: linux
+            ext: ""
+            triple: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            suffix: linux-arm64
+            ext: ""
+            triple: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}   # gates the Windows signing step
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Linux capture/input build deps
+        if: startsWith(matrix.os, 'ubuntu')
+        run: >
+          sudo apt-get update && sudo apt-get install -y
+          libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
+          libx11-dev libxtst-dev libdbus-1-dev pkg-config
+          libwayland-dev libxkbcommon-dev
+          libpipewire-0.3-dev libclang-dev
+          libegl-dev libgl-dev libgles-dev libgbm-dev libdrm-dev
+
+      - name: Install zig + cargo-zigbuild (Linux — link an older glibc)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          pip3 install "ziglang==0.13.0"
+          cargo install --locked cargo-zigbuild
+          rustup target add ${{ matrix.triple }}
+
+      - name: Build all binaries (Linux, glibc 2.31 floor)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: cargo zigbuild --release --target ${{ matrix.triple }}.2.31
+
+      - name: Build all binaries (macOS / Windows)
+        if: ${{ !startsWith(matrix.os, 'ubuntu') }}
+        run: cargo build --release
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir out
+          dir="target/release"
+          if [ -n "${{ matrix.triple }}" ]; then dir="target/${{ matrix.triple }}/release"; fi
+          for b in HaiveControl haivectl haive-mcp; do
+            cp "${dir}/${b}${{ matrix.ext }}" "out/${b}-${{ matrix.suffix }}${{ matrix.ext }}"
+          done
+
+      # macOS: sign the Mach-O binaries with your Developer ID + notarize. No
+      # MAC_CSC_LINK secret → binaries ship unsigned, exactly as before.
+      - name: Sign & notarize macOS binaries
+        if: matrix.os == 'macos-latest' && startsWith(github.ref, 'refs/tags/')
+        env:
+          MAC_CSC_B64: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_PASS: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$MAC_CSC_B64" ]; then echo "no MAC_CSC_LINK secret — leaving macOS binaries unsigned"; exit 0; fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KCPASS="$(openssl rand -base64 24)"
+          security create-keychain -p "$KCPASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPASS" "$KC"
+          echo "$MAC_CSC_B64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MAC_CSC_PASS" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          ID="$(security find-identity -v -p codesigning "$KC" | awk '/Developer ID Application/{print $2; exit}')"
+          echo "Signing with identity $ID"
+          for f in out/*-macos; do
+            codesign --force --options runtime --timestamp --keychain "$KC" --sign "$ID" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+          done
+          # Bare Mach-O binaries notarize (submit) but can't be stapled — that's fine for a
+          # curl'd terminal binary. Non-fatal so a notarization flake never blocks a release.
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            ( cd out && zip -q notarize.zip *-macos )
+            xcrun notarytool submit out/notarize.zip --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait \
+              || echo "⚠ notarization failed (binaries still Developer-ID signed)"
+            rm -f out/notarize.zip
+          fi
+
+      # Windows: Authenticode-sign the .exe files via Azure Trusted Signing, OR swap this
+      # for the SignPath Foundation action (free for public OSS). No AZURE_CLIENT_ID → no-op.
+      - name: Sign Windows binaries (Azure Trusted Signing)
+        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/') && env.AZURE_CLIENT_ID != ''
+        uses: azure/trusted-signing-action@v0.5.9
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE }}
+          files-folder: ${{ github.workspace }}/out
+          files-folder-filter: exe
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Signed provenance ties each binary to the exact repo+commit+workflow that
+      # built it — the public answer to "who is behind this tool". Verify:
+      #   gh attestation verify <file> --repo gitayg/haive-agent
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: haive-${{ matrix.suffix }}
+          path: out/*
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: out/*
+
+  # One SHA256SUMS covering every released binary, so installs can verify
+  # integrity (the MCP install command checks this before chmod +x).
+  checksums:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dl
+      - name: Generate SHA256SUMS
+        run: |
+          : > SHA256SUMS
+          find dl -type f | while read -r f; do
+            printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> SHA256SUMS
+          done
+          sort -k2 -o SHA256SUMS SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: SHA256SUMS

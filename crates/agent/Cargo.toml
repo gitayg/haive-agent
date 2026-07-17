@@ -1,0 +1,55 @@
+[package]
+name = "haive-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "HaiveControl"
+path = "src/main.rs"
+
+[dependencies]
+tiny_http = { version = "0.12", features = ["ssl-rustls"] }
+xcap = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Pure-Rust X11 (XTEST) backend instead of the default `xdo` feature, which
+# hard-links libxdo.so.3 and makes the binary fail to load on a bare Ubuntu
+# server that lacks libxdo3. x11rb needs no shared lib at load time; input
+# still works over $DISPLAY, and Enigo::new() degrades gracefully when headless.
+enigo = { version = "0.2", default-features = false, features = ["x11rb"] }
+rcgen = "0.13"
+sha2 = "0.10"
+mdns-sd = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+ureq = { version = "2", features = ["json"] }
+sysinfo = "0.33"
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
+self-replace = "1"
+portable-pty = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+# Session 0 isolation: a SYSTEM service can't reach the interactive desktop, so
+# screen capture is delegated to a one-shot run inside the active user's session.
+# The WTS/token APIs address that session by ID — no username involved — which is
+# what makes it work on Azure AD / Microsoft-account boxes where schtasks /RU
+# can't resolve a name to a SID.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_System_Environment",
+] }
+
+# Wayland screen capture on GNOME/KDE (no wlr-screencopy): the xdg-desktop-portal
+# ScreenCast API (D-Bus, via zbus blocking) hands us a PipeWire fd + node, which
+# the pipewire crate streams one frame from. zbus + pipewire are already in the
+# tree (transitive), so this adds no new system libs beyond libpipewire — which
+# every Wayland desktop already ships.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+pipewire = "0.9"
