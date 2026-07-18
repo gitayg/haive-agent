@@ -35,7 +35,9 @@ jobs:
             triple: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     env:
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}   # gates the Windows signing step
+      # Gate the Windows signing paths — same secret names as your other apps.
+      SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}  # preferred path
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}                    # fallback path
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -114,10 +116,35 @@ jobs:
             rm -f out/notarize.zip
           fi
 
-      # Windows: Authenticode-sign the .exe files via Azure Trusted Signing, OR swap this
-      # for the SignPath Foundation action (free for public OSS). No AZURE_CLIENT_ID → no-op.
+      # Windows Authenticode — two gated paths matching your other apps: SignPath Foundation
+      # (preferred, free for public OSS) → Azure Trusted Signing (fallback). Both are total
+      # no-ops unless their secrets are present, so an unsigned build still ships. SignPath
+      # pulls the artifact from the GitHub API to verify provenance, so: upload the unsigned
+      # .exe files → submit a signing request → the signed .exe files are written back to out/.
+      # Requires the SignPath GitHub App on the repo + a 'haive-agent' project + 'release-signing' policy.
+      - name: Upload unsigned .exe for SignPath
+        id: signpath-upload
+        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/') && env.SIGNPATH_ORGANIZATION_ID != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-windows-exe
+          path: out/*-windows.exe
+          if-no-files-found: error
+
+      - name: Sign Windows binaries (SignPath Foundation)
+        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/') && env.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: haive-agent
+          signing-policy-slug: release-signing
+          github-artifact-id: ${{ steps.signpath-upload.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: out
+
       - name: Sign Windows binaries (Azure Trusted Signing)
-        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/') && env.AZURE_CLIENT_ID != ''
+        if: matrix.os == 'windows-latest' && startsWith(github.ref, 'refs/tags/') && env.AZURE_CLIENT_ID != '' && env.SIGNPATH_ORGANIZATION_ID == ''
         uses: azure/trusted-signing-action@v0.5.9
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
