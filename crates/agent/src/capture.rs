@@ -18,7 +18,27 @@ pub struct Grabber {
 /// the relay is not — so contain it here, at the one choke point every capture
 /// path goes through.
 fn no_panic<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok().flatten()
+    // catch_unwind CONTAINS the panic but does not silence it: the default hook
+    // still prints the full "thread 'main' panicked …" block, which reads exactly
+    // like a crash even though we recovered — the first thing you see in
+    // agent.log is a scary trace for a device that is actually fine. Swap in a
+    // quiet hook for the duration and report one honest line instead.
+    //
+    // The hook is process-global, so a panic on another thread during this short
+    // window would also lose its message. Capture calls are brief and rare
+    // (startup geometry + per screenshot), and the panic itself still propagates
+    // normally there — only the printout is affected.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    std::panic::set_hook(prev);
+    match r {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("capture unavailable: the screen-capture backend panicked (unsupported compositor — e.g. WSLg). Continuing without screen capture; relay and exec are unaffected.");
+            None
+        }
+    }
 }
 
 impl Grabber {
