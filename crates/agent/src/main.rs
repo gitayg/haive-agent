@@ -72,8 +72,27 @@ struct Args {
     capture_once: Option<String>,
 }
 
-/// If `--background` was given, re-spawn ourselves detached (no console, no
-/// inherited stdio) and return true so the caller exits — leaving the real agent
+/// Where a detached agent's stdout/stderr land, so "it just vanished" is always
+/// answerable. Lives beside the agent's certs in ~/.haive.
+fn log_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(persistence::home()).join(".haive").join("agent.log")
+}
+
+/// Append handle to the log, creating ~/.haive as needed. Truncated once past
+/// ~1 MB so an agent that restart-loops for months can't fill the disk.
+fn log_file() -> Option<std::fs::File> {
+    let p = log_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::metadata(&p).map(|m| m.len() > 1_000_000).unwrap_or(false) {
+        let _ = std::fs::remove_file(&p);
+    }
+    std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
+}
+
+/// If `--background` was given, re-spawn ourselves detached (no console, stdio to
+/// ~/.haive/agent.log) and return true so the caller exits — leaving the real agent
 /// running after this window closes. HAIVE_DETACHED guards against re-spawning.
 fn relaunch_detached() -> bool {
     if std::env::var("HAIVE_DETACHED").is_ok() {
@@ -84,9 +103,19 @@ fn relaunch_detached() -> bool {
     let mut c = std::process::Command::new(exe);
     c.args(&rest)
         .env("HAIVE_DETACHED", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null());
+    // Detached output used to go to /dev/null, so an agent that died right after
+    // printing "running in the background" left NO trace — a panic, a failed bind
+    // and a rejected token all looked identical (the device just never appeared).
+    // Point stdout+stderr at ~/.haive/agent.log so a silent death is self-diagnosing.
+    match (log_file(), log_file()) {
+        (Some(out), Some(err)) => {
+            c.stdout(std::process::Stdio::from(out)).stderr(std::process::Stdio::from(err));
+        }
+        _ => {
+            c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        }
+    }
     let spawned;
     #[cfg(windows)]
     {
@@ -128,6 +157,7 @@ fn relaunch_detached() -> bool {
     }
     if spawned.is_some() {
         println!("HaiveControl is now running in the background — you can close this window.");
+        println!("  log: {}", log_path().display());
         true
     } else {
         false

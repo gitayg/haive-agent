@@ -107,7 +107,7 @@ pub fn uninstall() {
     restore_sleep();
 }
 
-fn home() -> String {
+pub(crate) fn home() -> String {
     env::var("HOME")
         .or_else(|_| env::var("USERPROFILE"))
         .unwrap_or_default()
@@ -221,6 +221,10 @@ fn win_install_service(exe: &Path, args: &[String]) {
         tr.push(' ');
         tr.push_str(a);
     }
+    // Same reason as the Run key above: a console-subsystem binary launched by the
+    // task shows a console window at logon. --background makes it re-spawn itself
+    // DETACHED_PROCESS and exit, so the task completes and no window appears.
+    tr.push_str(" --background");
     let _ = std::process::Command::new("schtasks")
         .args(["/Create", "/TN", "HaiveControl", "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"])
         .status();
