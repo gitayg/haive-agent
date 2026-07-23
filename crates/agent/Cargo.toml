@@ -30,6 +30,11 @@ nokhwa = { version = "0.10", default-features = false, features = ["input-native
 self-replace = "1"
 portable-pty = "0.8"
 
+# setsid() when backgrounding, so the detached agent survives the terminal/SSH
+# closing (the Unix analog of the Windows job-breakaway below).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 # Session 0 isolation: a SYSTEM service can't reach the interactive desktop, so

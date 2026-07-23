@@ -109,6 +109,21 @@ fn relaunch_detached() -> bool {
     }
     #[cfg(not(windows))]
     {
+        use std::os::unix::process::CommandExt;
+        // Unix analog of the Windows job-breakaway above. A plain spawn leaves the
+        // child in the launching shell's session, so closing the window/SSH — which
+        // the success message literally tells the user to do — sends SIGHUP to the
+        // whole session and kills the "backgrounded" agent before it stays
+        // registered. setsid() makes the child its own session leader, detached from
+        // the controlling terminal, so SIGHUP never reaches it. pre_exec runs
+        // post-fork/pre-exec in the child (not a group leader there), so setsid
+        // always succeeds.
+        unsafe {
+            c.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
         spawned = c.spawn().ok();
     }
     if spawned.is_some() {

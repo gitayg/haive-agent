@@ -189,6 +189,13 @@ fn win_install(exe: &Path, args: &[String]) {
         for a in args {
             cmd.push_str(&format!(" \"{a}\""));
         }
+        // Re-add --background for the login launch. The Run key starts a
+        // console-subsystem binary directly, so without this Windows pops a visible
+        // console window on every login. With it, the launched process immediately
+        // re-spawns itself DETACHED_PROCESS and exits, so no console ever appears.
+        // (persist_args strips --background because on macOS/Linux the autostart
+        // launch is already windowless; only Windows needs it back.)
+        cmd.push_str(" \"--background\"");
         let _ = key.set_value("HaiveControl", &cmd);
     }
 }

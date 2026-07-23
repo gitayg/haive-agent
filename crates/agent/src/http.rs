@@ -53,7 +53,27 @@ pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
         }
     }
 
-    let server = Arc::new(build_server(&cfg));
+    // The public LAN listener is a convenience for direct (non-relay) access. A
+    // relay-enrolled device is fully functional over the outbound tunnel plus the
+    // loopback twin above, so failing to bind it must NOT kill the agent. This used
+    // to `.expect()` — on the MAIN thread — so a taken port (a previous instance
+    // still releasing it, or WSL mirroring localhost with Windows) panicked the
+    // whole process, taking the relay thread with it. With `--background` stderr is
+    // /dev/null, so the agent died silently right after printing "running in the
+    // background" and never registered.
+    let server = match build_server(&cfg) {
+        Some(s) => Arc::new(s),
+        None => {
+            eprintln!(
+                "warn: could not bind 0.0.0.0:{} (port in use?) — continuing with relay + loopback only",
+                cfg.port
+            );
+            // Park the main thread so the process stays alive for the relay loop.
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+    };
     let mut handles = Vec::new();
     for _ in 0..8 {
         let (s, c, tx) = (server.clone(), cfg.clone(), input_tx.clone());
@@ -69,17 +89,19 @@ pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
     }
 }
 
-fn build_server(cfg: &Config) -> Server {
+/// Bind the public LAN listener, or None if it can't be bound. Never panics —
+/// the caller degrades to relay + loopback rather than killing the agent.
+fn build_server(cfg: &Config) -> Option<Server> {
     let addr = format!("0.0.0.0:{}", cfg.port);
     if cfg.tls {
-        let (c, k) = cfg.cert.clone().expect("tls enabled without cert");
+        let (c, k) = cfg.cert.clone()?;
         Server::https(
             addr,
             tiny_http::SslConfig { certificate: c, private_key: k },
         )
-        .expect("bind https")
+        .ok()
     } else {
-        Server::http(addr).expect("bind http")
+        Server::http(addr).ok()
     }
 }
 
