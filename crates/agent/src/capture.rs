@@ -8,13 +8,28 @@ pub struct Grabber {
     pub index: usize,
 }
 
+/// Run a capture-stack call, turning a PANIC into None.
+///
+/// xcap's Wayland backend (libwayshot) panics instead of returning Err on
+/// compositors it doesn't support — WSLg panics with `UnsupportedVersion`. Our
+/// callers already handle `Err` (`Monitor::all().ok()?`), but a Result can't catch
+/// a panic, so it unwound into `thread 'main'` (geometry() runs at startup) and
+/// killed the whole agent before it could register. Screen capture is optional;
+/// the relay is not — so contain it here, at the one choke point every capture
+/// path goes through.
+fn no_panic<T>(f: impl FnOnce() -> Option<T>) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok().flatten()
+}
+
 impl Grabber {
     fn monitor(&self) -> Option<Monitor> {
-        Monitor::all()
-            .ok()?
-            .into_iter()
-            .nth(self.index)
-            .or_else(|| Monitor::all().ok().and_then(|m| m.into_iter().next()))
+        no_panic(|| {
+            Monitor::all()
+                .ok()?
+                .into_iter()
+                .nth(self.index)
+                .or_else(|| Monitor::all().ok().and_then(|m| m.into_iter().next()))
+        })
     }
 
     pub fn grab_jpeg(&self, quality: u8, max_width: u32) -> Option<Vec<u8>> {
@@ -26,7 +41,7 @@ impl Grabber {
     /// have no wlr-screencopy), falls back to the xdg-desktop-portal ScreenCast
     /// path, whose reason (e.g. "consent pending") is surfaced to the caller.
     pub fn grab(&self, quality: u8, max_width: u32) -> Result<Vec<u8>, String> {
-        if let Some(img) = self.monitor().and_then(|m| m.capture_image().ok()) {
+        if let Some(img) = no_panic(|| self.monitor().and_then(|m| m.capture_image().ok())) {
             return Ok(encode_rgb(image::DynamicImage::ImageRgba8(img).to_rgb8(), quality, max_width));
         }
         #[cfg(target_os = "linux")]
@@ -45,7 +60,7 @@ impl Grabber {
 
     /// (origin_x, origin_y, width, height) — origin assumed 0,0.
     pub fn geometry(&self) -> (i32, i32, u32, u32) {
-        match self.monitor().and_then(|m| m.capture_image().ok()) {
+        match no_panic(|| self.monitor().and_then(|m| m.capture_image().ok())) {
             Some(img) => (0, 0, img.width(), img.height()),
             None => (0, 0, 1920, 1080),
         }
@@ -102,4 +117,25 @@ pub fn camera_snapshot(index: u32, quality: u8) -> Option<Vec<u8>> {
         let _ = cam.frame();
     }
     frame_to_jpeg(&mut cam, quality)
+}
+
+#[cfg(test)]
+mod capture_panic_tests {
+    use super::no_panic;
+
+    /// The WSLg case: the capture backend panics (libwayshot → UnsupportedVersion)
+    /// instead of returning Err. It must degrade to None, not unwind into the
+    /// caller — geometry() runs on thread 'main' at startup, so an escaping panic
+    /// killed the agent before it could register.
+    #[test]
+    fn panicking_backend_degrades_to_none() {
+        let got: Option<u32> = no_panic(|| panic!("UnsupportedVersion"));
+        assert!(got.is_none(), "panic must be contained, not propagated");
+    }
+
+    #[test]
+    fn working_backend_still_returns_its_value() {
+        assert_eq!(no_panic(|| Some(42u32)), Some(42));
+        assert_eq!(no_panic(|| None::<u32>), None);
+    }
 }
