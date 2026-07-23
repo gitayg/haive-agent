@@ -510,6 +510,27 @@ fn kill_pid(id: u32) {
     let _ = std::process::Command::new("kill").args(["-9", &id.to_string()]).output();
 }
 
+/// Most captured output we'll put in one exec reply. Beyond this the JSON body
+/// grows unbounded and the reply has to be pushed back through the relay in one
+/// piece — which is how a single noisy command (a big file dump) used to wedge the
+/// channel and make the whole device look unreachable.
+const MAX_EXEC_OUTPUT: usize = 256 * 1024;
+
+/// Lossy-decode captured output, truncating past MAX_EXEC_OUTPUT and saying so.
+/// Slices on a byte boundary and lets from_utf8_lossy fix a split character.
+fn clip_output(b: &[u8]) -> String {
+    if b.len() <= MAX_EXEC_OUTPUT {
+        return String::from_utf8_lossy(b).into_owned();
+    }
+    let mut s = String::from_utf8_lossy(&b[..MAX_EXEC_OUTPUT]).into_owned();
+    s.push_str(&format!(
+        "\n… [output truncated — {} of {} bytes shown. Redirect to a file and fetch it with the file browser instead.]",
+        MAX_EXEC_OUTPUT,
+        b.len()
+    ));
+    s
+}
+
 fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
     if !cfg.exec_enabled {
         return json_resp(&serde_json::json!({"ok": false, "error": "remote exec disabled"}), 403);
@@ -575,8 +596,9 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
             &serde_json::json!({
                 "ok": true,
                 "code": o.status.code().unwrap_or(-1),
-                "stdout": String::from_utf8_lossy(&o.stdout),
-                "stderr": String::from_utf8_lossy(&o.stderr),
+                "stdout": clip_output(&o.stdout),
+                "stderr": clip_output(&o.stderr),
+                "truncated": o.stdout.len() > MAX_EXEC_OUTPUT || o.stderr.len() > MAX_EXEC_OUTPUT,
             }),
             200,
         ),
@@ -855,3 +877,34 @@ async function run(c){if(!c)return;out.style.display='block';out.textContent='$ 
     :('[error] '+(j.error||'failed')));}
   catch(err){out.textContent='$ '+c+'\n[error] '+err;}}
 </script></body></html>"####;
+
+#[cfg(test)]
+mod exec_output_tests {
+    use super::{clip_output, MAX_EXEC_OUTPUT};
+
+    #[test]
+    fn small_output_passes_through_untouched() {
+        assert_eq!(clip_output(b"hello"), "hello");
+    }
+
+    /// A huge output must not be serialized whole — that unbounded reply is what
+    /// wedged the relay and made the device look unreachable.
+    #[test]
+    fn huge_output_is_truncated_and_labelled() {
+        let big = vec![b'x'; MAX_EXEC_OUTPUT * 3];
+        let out = clip_output(&big);
+        assert!(out.len() < big.len(), "must shrink");
+        assert!(out.contains("output truncated"), "must say it was truncated: {}", &out[out.len().saturating_sub(120)..]);
+        assert!(out.starts_with("xxx"), "keeps the head of the output");
+    }
+
+    /// Truncating mid-character must not panic or produce invalid UTF-8.
+    #[test]
+    fn truncation_on_a_split_multibyte_char_is_safe() {
+        let mut v = vec![b'a'; MAX_EXEC_OUTPUT - 1];
+        v.extend_from_slice("é".as_bytes()); // straddles the cut
+        v.extend(std::iter::repeat(b'b').take(MAX_EXEC_OUTPUT));
+        let out = clip_output(&v);
+        assert!(out.contains("output truncated"));
+    }
+}
