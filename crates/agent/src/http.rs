@@ -19,6 +19,82 @@ pub fn loopback_port() -> u16 {
     LOOPBACK_PORT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// Set once at startup (relay mode only) so the loopback /ai/chat handler can reach
+// the hub's relay AI endpoint on the user's behalf — the tray chat posts here.
+static AI_HUB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static AI_RID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static AI_TOK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_ai_relay(hub: &str, rid: &str, tok: &str) {
+    let _ = AI_HUB.set(hub.trim_end_matches('/').to_string());
+    let _ = AI_RID.set(rid.to_string());
+    let _ = AI_TOK.set(tok.to_string());
+}
+
+/// Forward the local chat message up to the hub, which runs the cloud AI loop
+/// (Claude + read-only tools dispatched back down to us) and returns the answer.
+/// The endpoint never sees the API key — it lives on the hub.
+fn ai_chat_forward(req: &mut Request) -> Resp {
+    let (Some(hub), Some(rid), Some(tok)) = (AI_HUB.get(), AI_RID.get(), AI_TOK.get()) else {
+        return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs relay mode (this agent was started without --relay)."}), 200);
+    };
+    let mut body = String::new();
+    let _ = req.as_reader().read_to_string(&mut body);
+    let url = format!("{hub}/relay/ai-chat?tok={tok}&id={rid}");
+    match ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(150))
+        .send_string(&body)
+    {
+        Ok(r) => Response::from_string(r.into_string().unwrap_or_default())
+            .with_status_code(200)
+            .with_header(hdr("Content-Type", "application/json")),
+        Err(ureq::Error::Status(code, r)) => {
+            json_resp(&serde_json::json!({"ok": false, "error": format!("hub returned {code}: {}", r.into_string().unwrap_or_default())}), 200)
+        }
+        Err(e) => json_resp(&serde_json::json!({"ok": false, "error": format!("could not reach hub: {e}")}), 200),
+    }
+}
+
+const CHAT_PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HaiveControl — IT Assistant</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#0b0d13;color:#e7ebf2;height:100vh;display:flex;flex-direction:column}
+header{padding:14px 18px;border-bottom:1px solid #1c2130;font-weight:600;font-size:15px}
+header span{color:#8a93a6;font-weight:400;font-size:12px}
+#log{flex:1;overflow:auto;padding:16px 18px;display:flex;flex-direction:column;gap:10px}
+.msg{font-size:14px;line-height:1.55;padding:9px 13px;border-radius:12px;max-width:82%;white-space:pre-wrap;word-wrap:break-word}
+.user{align-self:flex-end;background:#5b9dff;color:#fff}
+.bot{align-self:flex-start;background:#161c27;border:1px solid #212836}
+.bot code{background:#0b0d13;padding:1px 5px;border-radius:4px;font-size:12px}
+.err{border-color:#5b2b2b;color:#f0a0a0}
+.think{opacity:.6}
+.steps{align-self:flex-start;display:flex;flex-wrap:wrap;gap:6px;max-width:100%}
+.step{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#0b0d13;border:1px solid #212836;border-radius:5px;padding:2px 7px;color:#7bd88f;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.step.bad{color:#f0a0a0;border-color:#5b2b2b}
+footer{display:flex;gap:8px;padding:12px 18px;border-top:1px solid #1c2130}
+#in{flex:1;background:#0b0d13;border:1px solid #212836;border-radius:10px;padding:10px 13px;color:#e7ebf2;font-size:14px}
+#send{background:#5b9dff;color:#fff;border:none;border-radius:10px;padding:0 18px;font-size:14px;cursor:pointer}
+#send:disabled{opacity:.5}
+</style></head><body>
+<header>&#129302; IT Assistant <span>&mdash; read-only diagnostics of this computer</span></header>
+<div id="log"><div class="msg bot">Hi &mdash; tell me what's wrong with this computer and I'll take a look. I can inspect it (not change anything yet). For example: &quot;my wifi keeps dropping&quot; or &quot;why is it so slow?&quot;</div></div>
+<footer><input id="in" placeholder="Describe the problem&hellip;" autofocus><button id="send">Send</button></footer>
+<script>
+var HIST=[],BUSY=false;
+var log=document.getElementById('log'),inp=document.getElementById('in'),send=document.getElementById('send');
+function esc(t){return (t+'').replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+function md(t){return esc(t).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');}
+function add(cls,html){var d=document.createElement('div');d.className='msg '+cls;d.innerHTML=html;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+function go(){if(BUSY)return;var m=inp.value.trim();if(!m)return;inp.value='';add('user',esc(m));BUSY=true;send.disabled=true;var t=add('bot think','investigating&hellip;');
+fetch('/ai/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m,history:HIST})}).then(function(r){return r.json();}).then(function(j){t.remove();BUSY=false;send.disabled=false;inp.focus();
+if(!j.ok){add('bot err','&#9888; '+esc(j.error||'failed'));return;}
+if(j.steps&&j.steps.length){var s=document.createElement('div');s.className='steps';s.innerHTML=j.steps.map(function(x){return '<span class="step'+(x.ok?'':' bad')+'" title="'+esc(x.arg||'')+'">'+esc(x.tool==='system_report'?('report: '+(x.arg||'')):('$ '+(x.arg||x.tool)))+'</span>';}).join('');log.appendChild(s);}
+add('bot',md(j.reply||'(no answer)'));HIST=j.history||HIST;log.scrollTop=log.scrollHeight;
+}).catch(function(e){t.remove();BUSY=false;send.disabled=false;add('bot err','error: '+esc(''+e));});}
+send.onclick=go;inp.addEventListener('keydown',function(e){if(e.key==='Enter')go();});
+</script></body></html>"#;
+
 pub struct Config {
     pub password: String,
     pub port: u16,
@@ -176,6 +252,8 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
     }
     let resp = match (&method, path.as_str()) {
         (Method::Get, "/") => Response::from_string(PAGE).with_header(hdr("Content-Type", "text/html")),
+        (Method::Get, "/chat") => Response::from_string(CHAT_PAGE).with_header(hdr("Content-Type", "text/html")),
+        (Method::Post, "/ai/chat") => ai_chat_forward(&mut req),
         (Method::Get, "/frame") => frame_ep(cfg),
         (Method::Get, "/camera") => camera_ep(&url, cfg),
         (Method::Post, "/input") => {

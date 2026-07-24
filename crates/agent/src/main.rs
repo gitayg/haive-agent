@@ -11,6 +11,8 @@ mod persistence;
 mod wakelock;
 mod presence;
 mod relay;
+#[cfg(windows)]
+mod tray;
 mod schedule;
 mod shell;
 mod tls;
@@ -565,6 +567,9 @@ fn main() {
         analysis::start(relay_addr.clone(), rid.clone(), token.clone());
         let asset = agent_asset();
         discovery::auto_update_relay(relay_addr.clone(), asset);
+        // Give the loopback /ai/chat handler what it needs to reach the hub's
+        // relay AI endpoint on the user's behalf (the tray chat talks to this).
+        http::set_ai_relay(&relay_addr, &rid, &token);
         std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si, token));
     }
 
@@ -591,5 +596,10 @@ fn main() {
         direct_token,
     });
     schedule::run_scheduler();
+    // Windows-only tray icon + embedded chat window. Spawns its own thread and
+    // waits for the loopback server (below) to bind; a no-desktop session just
+    // ends that thread. Headless/other platforms: no-op.
+    #[cfg(windows)]
+    tray::spawn();
     http::serve(cfg, tx);
 }

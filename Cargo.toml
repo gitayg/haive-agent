@@ -3,6 +3,6 @@ resolver = "2"
 members = ["crates/agent", "crates/cli", "crates/mcp"]
 
 [workspace.package]
-version = "2.28.5"
+version = "2.28.6"
 edition = "2021"
 license = "AGPL-3.0-or-later"

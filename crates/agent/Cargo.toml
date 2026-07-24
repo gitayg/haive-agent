@@ -37,6 +37,13 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+# Tray icon + embedded chat window (Phase 2). Windows-only for now — the Linux
+# webview (webkit2gtk) would drag a heavy system lib into the zigbuild, and macOS
+# can follow. Best-effort: if the GUI can't init (Session 0 service, no desktop),
+# the tray thread just exits and the agent keeps running headless.
+tray-icon = "0.19"
+tao = "0.30"
+wry = "0.45"
 # Session 0 isolation: a SYSTEM service can't reach the interactive desktop, so
 # screen capture is delegated to a one-shot run inside the active user's session.
 # The WTS/token APIs address that session by ID — no username involved — which is
