@@ -73,8 +73,17 @@ fn run(port: u16) {
 
     let mut win: Option<(Window, WebView)> = None;
 
-    event_loop.run(move |_event, target, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
+
+        // Clicking the window's X fires CloseRequested. Without handling it the X
+        // does nothing. Hide instead of destroy so "Ask AI" reopens with the
+        // conversation intact.
+        if let tao::event::Event::WindowEvent { event: tao::event::WindowEvent::CloseRequested, .. } = &event {
+            if let Some((w, _)) = &win {
+                w.set_visible(false);
+            }
+        }
 
         while let Ok(ev) = menu_rx.try_recv() {
             if ev.id == open_id {

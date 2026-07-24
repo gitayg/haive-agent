@@ -35,12 +35,23 @@ pub fn set_ai_relay(hub: &str, rid: &str, tok: &str) {
 /// (Claude + read-only tools dispatched back down to us) and returns the answer.
 /// The endpoint never sees the API key — it lives on the hub.
 fn ai_chat_forward(req: &mut Request) -> Resp {
+    ai_forward(req, "ai-chat")
+}
+
+fn ai_apply_forward(req: &mut Request) -> Resp {
+    ai_forward(req, "ai-apply")
+}
+
+/// Forward a tray-chat request out through the relay to the hub's cloud AI. The hub
+/// owns the API key and the tool loop; the endpoint never sees the key. `endpoint`
+/// picks the hub route: `ai-chat` (diagnose) or `ai-apply` (run an approved fix).
+fn ai_forward(req: &mut Request, endpoint: &str) -> Resp {
     let (Some(hub), Some(rid), Some(tok)) = (AI_HUB.get(), AI_RID.get(), AI_TOK.get()) else {
         return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs relay mode (this agent was started without --relay)."}), 200);
     };
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
-    let url = format!("{hub}/relay/ai-chat?tok={tok}&id={rid}");
+    let url = format!("{hub}/relay/{endpoint}?tok={tok}&id={rid}");
     match ureq::post(&url)
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(150))
@@ -72,13 +83,26 @@ header span{color:#8a93a6;font-weight:400;font-size:12px}
 .steps{align-self:flex-start;display:flex;flex-wrap:wrap;gap:6px;max-width:100%}
 .step{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#0b0d13;border:1px solid #212836;border-radius:5px;padding:2px 7px;color:#7bd88f;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .step.bad{color:#f0a0a0;border-color:#5b2b2b}
+.fix{border-left:3px solid #5b9dff!important}
+.fx-t{font-weight:600;margin-bottom:3px}
+.fx-x{font-size:12.5px;color:#9fb0c8;margin-bottom:7px}
+.fx-c{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#0b0d13;border:1px solid #212836;border-radius:5px;padding:4px 7px;color:#8fb3ff;white-space:pre-wrap;word-break:break-all;margin-bottom:8px}
+.fx-row{display:flex;gap:8px}
+.fx-ap{background:#5b9dff;color:#fff;border:none;border-radius:8px;padding:6px 16px;font-size:13px;cursor:pointer}
+.fx-sk{background:transparent;color:#9fb0c8;border:1px solid #2a3242;border-radius:8px;padding:6px 14px;font-size:13px;cursor:pointer}
+.fx-ap:disabled,.fx-sk:disabled{opacity:.5}
+.fx-sk-d{font-size:12.5px;color:#8a94a6}
+.fx-res{font-size:13px}
+.fx-res.ok{color:#7bd88f}
+.fx-res.bad{color:#f0a0a0}
+.fx-out{font-family:ui-monospace,Menlo,monospace;font-size:11px;background:#0b0d13;border:1px solid #212836;border-radius:5px;padding:4px 7px;color:#c3ccdb;white-space:pre-wrap;word-break:break-word;margin-top:6px;max-height:150px;overflow:auto}
 footer{display:flex;gap:8px;padding:12px 18px;border-top:1px solid #1c2130}
 #in{flex:1;background:#0b0d13;border:1px solid #212836;border-radius:10px;padding:10px 13px;color:#e7ebf2;font-size:14px}
 #send{background:#5b9dff;color:#fff;border:none;border-radius:10px;padding:0 18px;font-size:14px;cursor:pointer}
 #send:disabled{opacity:.5}
 </style></head><body>
-<header>&#129302; IT Assistant <span>&mdash; read-only diagnostics of this computer</span></header>
-<div id="log"><div class="msg bot">Hi &mdash; tell me what's wrong with this computer and I'll take a look. I can inspect it (not change anything yet). For example: &quot;my wifi keeps dropping&quot; or &quot;why is it so slow?&quot;</div></div>
+<header>&#129302; IT Assistant <span>&mdash; diagnose &amp; fix this computer</span></header>
+<div id="log"><div class="msg bot">Hi &mdash; tell me what's wrong with this computer and I'll take a look. I inspect it first, and if I find a fix I'll offer you a button to apply it &mdash; nothing changes until you approve. For example: &quot;my wifi keeps dropping&quot; or &quot;why is it so slow?&quot;</div></div>
 <footer><input id="in" placeholder="Describe the problem&hellip;" autofocus><button id="send">Send</button></footer>
 <script>
 var HIST=[],BUSY=false;
@@ -90,8 +114,10 @@ function go(){if(BUSY)return;var m=inp.value.trim();if(!m)return;inp.value='';ad
 fetch('/ai/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m,history:HIST})}).then(function(r){return r.json();}).then(function(j){t.remove();BUSY=false;send.disabled=false;inp.focus();
 if(!j.ok){add('bot err','&#9888; '+esc(j.error||'failed'));return;}
 if(j.steps&&j.steps.length){var s=document.createElement('div');s.className='steps';s.innerHTML=j.steps.map(function(x){return '<span class="step'+(x.ok?'':' bad')+'" title="'+esc(x.arg||'')+'">'+esc(x.tool==='system_report'?('report: '+(x.arg||'')):('$ '+(x.arg||x.tool)))+'</span>';}).join('');log.appendChild(s);}
-add('bot',md(j.reply||'(no answer)'));HIST=j.history||HIST;log.scrollTop=log.scrollHeight;
+add('bot',md(j.reply||'(no answer)'));if(j.proposals&&j.proposals.length){j.proposals.forEach(proposal);}HIST=j.history||HIST;log.scrollTop=log.scrollHeight;
 }).catch(function(e){t.remove();BUSY=false;send.disabled=false;add('bot err','error: '+esc(''+e));});}
+function proposal(p){var card=add('bot fix','');var t=document.createElement('div');t.className='fx-t';t.innerHTML='&#128295; '+esc(p.title||'Proposed fix');var x=document.createElement('div');x.className='fx-x';x.textContent=p.explanation||'';var c=document.createElement('div');c.className='fx-c';c.textContent=p.command||'';var row=document.createElement('div');row.className='fx-row';var ap=document.createElement('button');ap.className='fx-ap';ap.textContent='Apply';var sk=document.createElement('button');sk.className='fx-sk';sk.textContent='Skip';ap.onclick=function(){apply(p,ap,sk,row);};sk.onclick=function(){row.innerHTML='<span class="fx-sk-d">Skipped</span>';};row.appendChild(ap);row.appendChild(sk);card.appendChild(t);card.appendChild(x);card.appendChild(c);card.appendChild(row);log.scrollTop=log.scrollHeight;}
+function apply(p,ap,sk,row){ap.disabled=true;sk.disabled=true;ap.textContent='Applying…';fetch('/ai/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:p.kind,arg:p.arg||''})}).then(function(r){return r.json();}).then(function(j){var res=document.createElement('div');if(!j.ok){res.className='fx-res bad';res.textContent='⚠ '+(j.error||'failed');}else{res.className='fx-res ok';res.innerHTML='✓ Applied'+(j.output&&j.output.trim()?('<pre class="fx-out">'+esc(j.output)+'</pre>'):'');}row.replaceWith(res);log.scrollTop=log.scrollHeight;}).catch(function(e){ap.disabled=false;sk.disabled=false;ap.textContent='Apply';add('bot err','apply error: '+esc(''+e));});}
 send.onclick=go;inp.addEventListener('keydown',function(e){if(e.key==='Enter')go();});
 </script></body></html>"#;
 
@@ -254,6 +280,7 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         (Method::Get, "/") => Response::from_string(PAGE).with_header(hdr("Content-Type", "text/html")),
         (Method::Get, "/chat") => Response::from_string(CHAT_PAGE).with_header(hdr("Content-Type", "text/html")),
         (Method::Post, "/ai/chat") => ai_chat_forward(&mut req),
+        (Method::Post, "/ai/apply") => ai_apply_forward(&mut req),
         (Method::Get, "/frame") => frame_ep(cfg),
         (Method::Get, "/camera") => camera_ep(&url, cfg),
         (Method::Post, "/input") => {
