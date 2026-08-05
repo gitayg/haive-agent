@@ -52,7 +52,7 @@ fn run(port: u16) {
 
     let menu = Menu::new();
     let open_item = MenuItem::new("Ask AI…", true, None);
-    let quit_item = MenuItem::new("Quit HaiveControl", true, None);
+    let quit_item = MenuItem::new("Quit IT-AI", true, None);
     let _ = menu.append(&open_item);
     let _ = menu.append(&quit_item);
     let open_id = open_item.id().clone();
@@ -63,7 +63,7 @@ fn run(port: u16) {
     // Keep the tray alive for the loop's lifetime.
     let mut tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("HaiveControl — Ask AI")
+        .with_tooltip("IT-AI — Ask AI")
         .with_icon(icon().unwrap_or_else(|| Icon::from_rgba(vec![91, 157, 255, 255], 1, 1).unwrap()))
         .build()
         .ok();
@@ -106,7 +106,7 @@ fn open_chat(win: &mut Option<(Window, WebView)>, target: &EventLoopWindowTarget
         return;
     }
     let window = match WindowBuilder::new()
-        .with_title("HaiveControl — IT Assistant")
+        .with_title("IT-AI — IT Assistant")
         .with_inner_size(LogicalSize::new(420.0, 640.0))
         .build(target)
     {

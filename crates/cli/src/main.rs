@@ -1,8 +1,8 @@
-// HaiveControl — LAN remote control & screen sharing with an AI/MCP interface.
-// Copyright (C) 2026 The HaiveControl Authors.
+// IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
+// Copyright (C) 2026 The IT-AI Authors.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// haivectl — run commands and transfer files against a registered device by
+// itai — run commands and transfer files against a registered device by
 // its hub name. The device is resolved through the hub, so no IP is needed.
 use std::process::exit;
 
@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 use reqwest::blocking::Client;
 
 #[derive(Parser)]
-#[command(name = "haivectl", version = "2.3.0",
-    about = "Drive a HaiveControl device from the Mac (resolved by hub name).")]
+#[command(name = "itai", version = "2.3.0",
+    about = "Drive a IT-AI device from the Mac (resolved by hub name).")]
 struct Cli {
     /// hub URL
     #[arg(long, env = "HAIVE_HUB", default_value = "http://localhost:8770")]
@@ -91,7 +91,7 @@ fn resolve(client: &Client, hub: &str, name: &str) -> Result<String, Box<dyn std
         }
     };
     if matches.is_empty() {
-        return Err(format!("no device matching '{name}' (try: haivectl list)").into());
+        return Err(format!("no device matching '{name}' (try: itai list)").into());
     }
     if matches.len() > 1 {
         let names: Vec<_> = matches.iter().filter_map(|a| a["name"].as_str()).collect();

@@ -1,5 +1,5 @@
-// HaiveControl — LAN remote control & screen sharing with an AI/MCP interface.
-// Copyright (C) 2026 The HaiveControl Authors.
+// IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
+// Copyright (C) 2026 The IT-AI Authors.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 mod analysis;
 mod capture;
@@ -29,8 +29,8 @@ use clap::Parser;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
-#[command(name = "HaiveControl", version = VERSION,
-    about = "HaiveControl agent — screen + control + shell over HTTPS on the LAN")]
+#[command(name = "IT-AI", version = VERSION,
+    about = "IT-AI agent — screen + control + shell over HTTPS on the LAN")]
 struct Args {
     /// the id shown by the Mac hub
     mac_id: Option<String>,
@@ -75,12 +75,12 @@ struct Args {
 }
 
 /// Where a detached agent's stdout/stderr land, so "it just vanished" is always
-/// answerable. Lives beside the agent's certs in ~/.haive.
+/// answerable. Lives beside the agent's certs in ~/.it-ai.
 fn log_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(persistence::home()).join(".haive").join("agent.log")
+    std::path::PathBuf::from(persistence::home()).join(".it-ai").join("agent.log")
 }
 
-/// Append handle to the log, creating ~/.haive as needed. Truncated once past
+/// Append handle to the log, creating ~/.it-ai as needed. Truncated once past
 /// ~1 MB so an agent that restart-loops for months can't fill the disk.
 fn log_file() -> Option<std::fs::File> {
     let p = log_path();
@@ -94,7 +94,7 @@ fn log_file() -> Option<std::fs::File> {
 }
 
 /// If `--background` was given, re-spawn ourselves detached (no console, stdio to
-/// ~/.haive/agent.log) and return true so the caller exits — leaving the real agent
+/// ~/.it-ai/agent.log) and return true so the caller exits — leaving the real agent
 /// running after this window closes. HAIVE_DETACHED guards against re-spawning.
 fn relaunch_detached() -> bool {
     if std::env::var("HAIVE_DETACHED").is_ok() {
@@ -109,7 +109,7 @@ fn relaunch_detached() -> bool {
     // Detached output used to go to /dev/null, so an agent that died right after
     // printing "running in the background" left NO trace — a panic, a failed bind
     // and a rejected token all looked identical (the device just never appeared).
-    // Point stdout+stderr at ~/.haive/agent.log so a silent death is self-diagnosing.
+    // Point stdout+stderr at ~/.it-ai/agent.log so a silent death is self-diagnosing.
     match (log_file(), log_file()) {
         (Some(out), Some(err)) => {
             c.stdout(std::process::Stdio::from(out)).stderr(std::process::Stdio::from(err));
@@ -158,7 +158,7 @@ fn relaunch_detached() -> bool {
         spawned = c.spawn().ok();
     }
     if spawned.is_some() {
-        println!("HaiveControl is now running in the background — you can close this window.");
+        println!("IT-AI is now running in the background — you can close this window.");
         println!("  log: {}", log_path().display());
         true
     } else {
@@ -245,13 +245,13 @@ fn relay_id() -> String {
 /// (relay or LAN) without re-triggering install or backgrounding.
 /// The release asset name for this platform + arch (matches build.yml suffixes),
 /// so auto-update pulls the right binary — e.g. an aarch64 Linux box (a Radxa/Pi)
-/// gets HaiveControl-linux-arm64, not the x86_64 one.
+/// gets it-ai-linux-arm64, not the x86_64 one.
 fn agent_asset() -> String {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", _) => "HaiveControl-windows.exe",
-        ("macos", _) => "HaiveControl-macos",
-        ("linux", "aarch64") => "HaiveControl-linux-arm64",
-        _ => "HaiveControl-linux",
+        ("windows", _) => "it-ai-windows.exe",
+        ("macos", _) => "it-ai-macos",
+        ("linux", "aarch64") => "it-ai-linux-arm64",
+        _ => "it-ai-linux",
     }
     .to_string()
 }
@@ -435,7 +435,7 @@ fn main() {
 
     if args.uninstall {
         persistence::uninstall();
-        println!("HaiveControl autostart removed.");
+        println!("IT-AI autostart removed.");
         return;
     }
 
@@ -458,7 +458,7 @@ fn main() {
 
     let mac_id = args.mac_id.clone().or_else(|| std::env::var("SCREEN_HUB").ok());
     if mac_id.is_none() && args.relay.is_none() {
-        eprintln!("usage: HaiveControl <mac-id> [password] [--name N] [--persist | --ttl MIN] [--relay HOST[:PORT]]");
+        eprintln!("usage: IT-AI <mac-id> [password] [--name N] [--persist | --ttl MIN] [--relay HOST[:PORT]]");
         std::process::exit(2);
     }
     let mac_id_disp = mac_id.clone().unwrap_or_default();
@@ -507,8 +507,8 @@ fn main() {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_default();
-        let dir = format!("{home}/.haive");
-        let c = tls::ensure_cert(&dir, &discovery::local_ip(), &[hostname(), "haive.local".to_string()]);
+        let dir = format!("{home}/.it-ai");
+        let c = tls::ensure_cert(&dir, &discovery::local_ip(), &[hostname(), "it-ai.local".to_string()]);
         if c.is_none() {
             eprintln!("cert generation failed; falling back to plain HTTP");
             tls = false;
@@ -567,7 +567,7 @@ fn main() {
                         .collect()
                 })
                 .unwrap_or_default();
-            sans.push(format!("{rid}.haive.lan"));
+            sans.push(format!("{rid}.it-ai.lan"));
             if let Some(c) = config::fetch_hub_cert(&relay_addr, &rid, &token, sans) {
                 println!("   lan-direct: using hub-signed cert");
                 cert = Some(c);
@@ -585,7 +585,7 @@ fn main() {
     }
 
     let registering = if mac_id.is_some() { format!("registering to '{mac_id_disp}'") } else { "relay-only".to_string() };
-    println!("HaiveControl {VERSION} — serving '{name}' on {scheme}://…:{port}, {registering}");
+    println!("IT-AI {VERSION} — serving '{name}' on {scheme}://…:{port}, {registering}");
     println!("   lifetime: {lifetime}");
     println!(
         "   tls: {} | password: {} | exec: {}",

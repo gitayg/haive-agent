@@ -1,8 +1,8 @@
-// HaiveControl — LAN remote control & screen sharing with an AI/MCP interface.
-// Copyright (C) 2026 The HaiveControl Authors.
+// IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
+// Copyright (C) 2026 The IT-AI Authors.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// HaiveControl MCP server — exposes registered devices as MCP tools so an AI
+// IT-AI MCP server — exposes registered devices as MCP tools so an AI
 // client can list_devices, screenshot, run_command, control input, and move
 // files. Runs on your Mac; it drives devices entirely through the hub's /m API
 // (token + owner authed), so it works against cloud/relay devices too — not
@@ -721,7 +721,7 @@ impl ServerHandler for Srv {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Control HaiveControl devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), camera_snapshot, update_agent, dissolve_agent.".to_string(),
+            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), camera_snapshot, update_agent, dissolve_agent.".to_string(),
         );
         info
     }

@@ -1834,59 +1834,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "haive-agent"
-version = "2.30.0"
-dependencies = [
- "base64 0.22.1",
- "clap",
- "enigo",
- "image",
- "libc",
- "mdns-sd",
- "nokhwa",
- "pipewire",
- "portable-pty",
- "rcgen",
- "self-replace",
- "serde",
- "serde_json",
- "sha2",
- "sysinfo",
- "tao",
- "tiny_http",
- "tray-icon",
- "ureq",
- "windows-sys 0.59.0",
- "winreg 0.52.0",
- "wry",
- "xcap",
- "zbus",
-]
-
-[[package]]
-name = "haive-cli"
-version = "2.30.0"
-dependencies = [
- "clap",
- "reqwest",
- "serde_json",
-]
-
-[[package]]
-name = "haive-mcp"
-version = "2.30.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "reqwest",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2266,6 +2213,59 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "it-ai-agent"
+version = "3.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "clap",
+ "enigo",
+ "image",
+ "libc",
+ "mdns-sd",
+ "nokhwa",
+ "pipewire",
+ "portable-pty",
+ "rcgen",
+ "self-replace",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sysinfo",
+ "tao",
+ "tiny_http",
+ "tray-icon",
+ "ureq",
+ "windows-sys 0.59.0",
+ "winreg 0.52.0",
+ "wry",
+ "xcap",
+ "zbus",
+]
+
+[[package]]
+name = "it-ai-cli"
+version = "3.0.0"
+dependencies = [
+ "clap",
+ "reqwest",
+ "serde_json",
+]
+
+[[package]]
+name = "it-ai-mcp"
+version = "3.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "reqwest",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "itertools"

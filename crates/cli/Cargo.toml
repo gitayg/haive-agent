@@ -1,11 +1,11 @@
 [package]
-name = "haive-cli"
+name = "it-ai-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "haivectl"
+name = "itai"
 path = "src/main.rs"
 
 [dependencies]

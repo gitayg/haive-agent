@@ -44,7 +44,7 @@ pub fn is_wayland() -> bool {
 
 fn token_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::Path::new(&home).join(".haive").join("screencast.token")
+    std::path::Path::new(&home).join(".it-ai").join("screencast.token")
 }
 fn load_restore_token() -> Option<String> {
     std::fs::read_to_string(token_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
@@ -143,7 +143,7 @@ fn capture_rgb_inner() -> Result<(u32, u32, Vec<u8>), CaptureErr> {
     let mut counter: u32 = 0;
     let mut new_token = |prefix: &str| {
         counter += 1;
-        format!("haive_{prefix}_{counter}")
+        format!("itai_{prefix}_{counter}")
     };
 
     // --- CreateSession -------------------------------------------------------
@@ -180,7 +180,7 @@ fn run_capture(
 ) -> Result<(u32, u32, Vec<u8>), CaptureErr> {
     let mut new_token = |prefix: &str| {
         *counter += 1;
-        format!("haive_{prefix}_{}", *counter)
+        format!("itai_{prefix}_{}", *counter)
     };
 
     // --- SelectSources (monitor, embedded cursor, persistent) ----------------
@@ -311,7 +311,7 @@ fn pw_capture_one(fd: zbus::zvariant::OwnedFd, node_id: u32) -> Result<(u32, u32
 
     let stream = pw::stream::StreamRc::new(
         core,
-        "haive-screencap",
+        "it-ai-screencap",
         pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Video",
             *pw::keys::MEDIA_CATEGORY => "Capture",

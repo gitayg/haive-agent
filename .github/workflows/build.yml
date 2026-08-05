@@ -76,7 +76,7 @@ jobs:
           mkdir out
           dir="target/release"
           if [ -n "${{ matrix.triple }}" ]; then dir="target/${{ matrix.triple }}/release"; fi
-          for b in HaiveControl haivectl haive-mcp; do
+          for b in it-ai itai it-ai-mcp; do
             cp "${dir}/${b}${{ matrix.ext }}" "out/${b}-${{ matrix.suffix }}${{ matrix.ext }}"
           done
 
@@ -91,7 +91,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: haive-${{ matrix.suffix }}
+          name: it-ai-${{ matrix.suffix }}
           path: out/*
 
       - uses: softprops/action-gh-release@v2

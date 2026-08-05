@@ -9,7 +9,7 @@
 //     resolve). We now address the session by ID via WTS, so no username is ever
 //     involved.
 //   * launching the installed exe directly — it can live somewhere the logged-in
-//     user cannot read (e.g. C:\Users\<other>\airm.exe, ACL'd to that profile), so
+//     user cannot read (e.g. C:\Users\<other>\it-ai.exe, ACL'd to that profile), so
 //     CreateProcessAsUser fails with access-denied. We stage a copy in %PUBLIC%
 //     (where INTERACTIVE has Modify) and launch that instead. The screenshot is
 //     written there too, since a service's %TEMP% isn't writable by the user.
@@ -77,7 +77,7 @@ fn public_dir() -> String {
 /// The installed exe may sit in another profile (ACL'd to that user), so we can't
 /// launch it as them. Refreshed when our binary changes (e.g. after auto-update).
 fn ensure_helper(exe: &Path, dir: &str) -> Result<String, String> {
-    let helper = format!("{dir}\\haive_helper.exe");
+    let helper = format!("{dir}\\itai_helper.exe");
     let stale = match (std::fs::metadata(&helper), std::fs::metadata(exe)) {
         (Ok(h), Ok(e)) => h.len() != e.len(),
         _ => true,
@@ -106,7 +106,7 @@ pub fn capture_once() -> Result<Vec<u8>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let dir = public_dir();
     let helper = ensure_helper(&exe, &dir)?;
-    let shot = format!("{dir}\\haive_shot.jpg");
+    let shot = format!("{dir}\\itai_shot.jpg");
     let _ = std::fs::remove_file(&shot);
 
     let cmdline = format!("\"{helper}\" --capture-once \"{shot}\"");

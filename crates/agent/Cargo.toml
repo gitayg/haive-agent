@@ -1,11 +1,11 @@
 [package]
-name = "haive-agent"
+name = "it-ai-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "HaiveControl"
+name = "it-ai"
 path = "src/main.rs"
 
 [dependencies]

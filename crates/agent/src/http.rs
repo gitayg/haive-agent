@@ -67,7 +67,7 @@ fn ai_forward(req: &mut Request, endpoint: &str) -> Resp {
     }
 }
 
-const CHAT_PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HaiveControl — IT Assistant</title>
+const CHAT_PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IT-AI — IT Assistant</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#0b0d13;color:#e7ebf2;height:100vh;display:flex;flex-direction:column}
@@ -258,7 +258,7 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         let _ = req.respond(
             Response::from_string("Authentication required")
                 .with_status_code(401)
-                .with_header(hdr("WWW-Authenticate", "Basic realm=\"HaiveControl\"")),
+                .with_header(hdr("WWW-Authenticate", "Basic realm=\"IT-AI\"")),
         );
         return;
     }
@@ -361,7 +361,7 @@ fn update_ep(req: &mut Request) -> Resp {
 pub(crate) fn apply_update(bytes: &[u8]) -> bool {
     // Resolve our own path BEFORE self_replace. Afterwards, on Linux, the running
     // binary's inode is unlinked and current_exe() returns a stale
-    // ".../airm (deleted)" path — exec/spawn against that fail with ENOENT, so we'd
+    // ".../it-ai (deleted)" path — exec/spawn against that fail with ENOENT, so we'd
     // be unable to restart. Capturing it here keeps a valid path that resolves to
     // the freshly written binary. (This is what killed an unsupervised agent on
     // 2.24.1→2.24.3: relaunch silently failed, yet the caller still exited.)
@@ -372,7 +372,7 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
             return false;
         }
     };
-    let tmp = std::env::temp_dir().join("airm-update.bin");
+    let tmp = std::env::temp_dir().join("it-ai-update.bin");
     if std::fs::write(&tmp, bytes).is_err() {
         return false;
     }
@@ -1037,7 +1037,7 @@ fn percent_decode(s: &str) -> String {
 
 pub const PAGE: &str = r####"<!doctype html><html><head>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HaiveControl</title>
+<title>IT-AI</title>
 <style>
  html,body{margin:0;background:#111;color:#ddd;font-family:system-ui,sans-serif}
  #screen{display:block;max-width:100%;height:auto;cursor:crosshair;margin:0 auto}

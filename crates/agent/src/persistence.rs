@@ -70,7 +70,7 @@ pub fn current_mode() -> &'static str {
 fn win_task_exists() -> bool {
     use std::os::windows::process::CommandExt;
     std::process::Command::new("schtasks")
-        .args(["/Query", "/TN", "HaiveControl"])
+        .args(["/Query", "/TN", "IT-AI"])
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — no console flash
         .output()
         .map(|o| o.status.success())
@@ -83,7 +83,7 @@ fn win_run_exists() -> bool {
     use winreg::RegKey;
     RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-        .and_then(|k| k.get_value::<String, _>("HaiveControl"))
+        .and_then(|k| k.get_value::<String, _>("IT-AI"))
         .is_ok()
 }
 
@@ -116,7 +116,7 @@ pub(crate) fn home() -> String {
 // ---- macOS: LaunchAgent ----
 #[cfg(target_os = "macos")]
 fn plist_path() -> PathBuf {
-    PathBuf::from(home()).join("Library/LaunchAgents/com.haive.agent.plist")
+    PathBuf::from(home()).join("Library/LaunchAgents/com.itai.agent.plist")
 }
 
 #[cfg(target_os = "macos")]
@@ -126,7 +126,7 @@ fn mac_install(exe: &Path, args: &[String]) {
         pa.push_str(&format!("      <string>{a}</string>\n"));
     }
     let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.haive.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n</dict></plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.itai.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n</dict></plist>\n"
     );
     let p = plist_path();
     if let Some(dir) = p.parent() {
@@ -150,7 +150,7 @@ fn mac_uninstall() {
 // ---- Linux: XDG autostart ----
 #[cfg(all(unix, not(target_os = "macos")))]
 fn desktop_path() -> PathBuf {
-    PathBuf::from(home()).join(".config/autostart/haivecontrol.desktop")
+    PathBuf::from(home()).join(".config/autostart/it-ai.desktop")
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -161,7 +161,7 @@ fn linux_install(exe: &Path, args: &[String]) {
         ex.push_str(a);
     }
     let entry = format!(
-        "[Desktop Entry]\nType=Application\nName=HaiveControl\nExec={ex}\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName=IT-AI\nExec={ex}\nX-GNOME-Autostart-enabled=true\n"
     );
     let p = desktop_path();
     if let Some(dir) = p.parent() {
@@ -196,7 +196,7 @@ fn win_install(exe: &Path, args: &[String]) {
         // (persist_args strips --background because on macOS/Linux the autostart
         // launch is already windowless; only Windows needs it back.)
         cmd.push_str(" \"--background\"");
-        let _ = key.set_value("HaiveControl", &cmd);
+        let _ = key.set_value("IT-AI", &cmd);
     }
 }
 
@@ -209,7 +209,7 @@ fn win_uninstall() {
         r"Software\Microsoft\Windows\CurrentVersion\Run",
         KEY_SET_VALUE,
     ) {
-        let _ = key.delete_value("HaiveControl");
+        let _ = key.delete_value("IT-AI");
     }
 }
 
@@ -226,21 +226,21 @@ fn win_install_service(exe: &Path, args: &[String]) {
     // DETACHED_PROCESS and exit, so the task completes and no window appears.
     tr.push_str(" --background");
     let _ = std::process::Command::new("schtasks")
-        .args(["/Create", "/TN", "HaiveControl", "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"])
+        .args(["/Create", "/TN", "IT-AI", "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"])
         .status();
 }
 
 #[cfg(windows)]
 fn win_service_uninstall() {
     let _ = std::process::Command::new("schtasks")
-        .args(["/Delete", "/TN", "HaiveControl", "/F"])
+        .args(["/Delete", "/TN", "IT-AI", "/F"])
         .status();
 }
 
 // ---- macOS: LaunchDaemon (starts at boot, root) ----
 #[cfg(target_os = "macos")]
 fn daemon_path() -> PathBuf {
-    PathBuf::from("/Library/LaunchDaemons/com.haive.agent.plist")
+    PathBuf::from("/Library/LaunchDaemons/com.itai.agent.plist")
 }
 
 #[cfg(target_os = "macos")]
@@ -250,7 +250,7 @@ fn mac_install_service(exe: &Path, args: &[String]) {
         pa.push_str(&format!("      <string>{a}</string>\n"));
     }
     let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.haive.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n</dict></plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.itai.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n</dict></plist>\n"
     );
     let p = daemon_path();
     let _ = std::fs::write(&p, plist);
@@ -267,7 +267,7 @@ fn mac_service_uninstall() {
 // ---- Linux: systemd system service (starts at boot, root) ----
 #[cfg(all(unix, not(target_os = "macos")))]
 fn unit_path() -> PathBuf {
-    PathBuf::from("/etc/systemd/system/haivecontrol.service")
+    PathBuf::from("/etc/systemd/system/it-ai.service")
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -278,16 +278,16 @@ fn linux_install_service(exe: &Path, args: &[String]) {
         ex.push_str(a);
     }
     let unit = format!(
-        "[Unit]\nDescription=HaiveControl agent\nAfter=network.target\n\n[Service]\nExecStart={ex}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+        "[Unit]\nDescription=IT-AI agent\nAfter=network.target\n\n[Service]\nExecStart={ex}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
     );
     let _ = std::fs::write(unit_path(), unit);
     let _ = std::process::Command::new("systemctl").arg("daemon-reload").status();
-    let _ = std::process::Command::new("systemctl").args(["enable", "--now", "haivecontrol.service"]).status();
+    let _ = std::process::Command::new("systemctl").args(["enable", "--now", "it-ai.service"]).status();
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn linux_service_uninstall() {
-    let _ = std::process::Command::new("systemctl").args(["disable", "--now", "haivecontrol.service"]).status();
+    let _ = std::process::Command::new("systemctl").args(["disable", "--now", "it-ai.service"]).status();
     let _ = std::fs::remove_file(unit_path());
 }
 
@@ -298,11 +298,11 @@ fn linux_service_uninstall() {
 // gsettings is per-user; Windows powercfg / macOS pmset generally want elevation).
 
 fn sleep_prior_file() -> PathBuf {
-    PathBuf::from(home()).join(".haive").join("sleep_prior")
+    PathBuf::from(home()).join(".it-ai").join("sleep_prior")
 }
 
 pub fn keep_awake_on_ac() {
-    let _ = std::fs::create_dir_all(PathBuf::from(home()).join(".haive"));
+    let _ = std::fs::create_dir_all(PathBuf::from(home()).join(".it-ai"));
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         // GNOME: remember the current AC idle action, then set it to do nothing.
