@@ -67,6 +67,13 @@ struct UploadArgs {
     remote_dir: Option<String>,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
+struct PushArgs {
+    device: String,
+    local_path: String,
+    #[serde(default)]
+    remote_dir: Option<String>,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
 struct ClickArgs {
     device: String,
     /// horizontal position as a fraction of the screen width, 0.0 (left) to 1.0 (right)
@@ -437,6 +444,70 @@ impl Srv {
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
+    #[tool(description = "Push a local file to the device via stage-and-pull: the hub stages the bytes and the device pulls them over HTTP with a sha256 integrity check. Robust for large files (won't wedge the relay tunnel like a base64-over-command hack would). Returns the saved remote path.")]
+    async fn push_file(&self, Parameters(a): Parameters<PushArgs>) -> Result<CallToolResult, ErrorData> {
+        let target = self.resolve(&a.device).await.map_err(err)?;
+        let data = std::fs::read(&a.local_path).map_err(err)?;
+        let name = std::path::Path::new(&a.local_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "push.bin".to_string());
+        // 1) Stage the bytes on the hub (owner-scoped, sha256-hashed, 1h TTL).
+        let staged: serde_json::Value = self
+            .client
+            .post(self.m("stage", ""))
+            .body(data)
+            .send()
+            .await
+            .map_err(err)?
+            .json()
+            .await
+            .map_err(err)?;
+        let token = staged["token"].as_str().unwrap_or("");
+        if token.is_empty() {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "[error] stage failed: {}",
+                staged["error"].as_str().unwrap_or("unknown")
+            ))]));
+        }
+        // 2) Tell the device to pull it (out-of-band GET, not through the tunnel).
+        let mut extra = format!("target={}&token={}&name={}", urlencode(&target), urlencode(token), urlencode(&name));
+        if let Some(dir) = a.remote_dir.as_deref().filter(|d| !d.is_empty()) {
+            extra.push_str(&format!("&dir={}", urlencode(dir)));
+        }
+        let push: serde_json::Value =
+            self.client.post(self.m("push-file", &extra)).send().await.map_err(err)?.json().await.map_err(err)?;
+        if !push["ok"].as_bool().unwrap_or(false) {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "[error] {}",
+                push["error"].as_str().unwrap_or("push failed")
+            ))]));
+        }
+        let job = push["job"].as_str().unwrap_or("").to_string();
+        // 3) Poll the device's job status until the pull completes (~10 min cap).
+        let status_extra = format!("target={}&job={}&token={}", urlencode(&target), urlencode(&job), urlencode(token));
+        for _ in 0..300 {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let st: serde_json::Value = match self.client.get(self.m("file-status", &status_extra)).send().await {
+                Ok(r) => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
+                Err(_) => continue,
+            };
+            if st["done"].as_bool().unwrap_or(false) {
+                let text = if st["success"].as_bool().unwrap_or(false) {
+                    format!(
+                        "pushed {} bytes to {}",
+                        st["bytes"].as_u64().unwrap_or(0),
+                        st["path"].as_str().unwrap_or("device")
+                    )
+                } else {
+                    format!("[error] transfer failed: {}", st["error"].as_str().unwrap_or("unknown"))
+                };
+                return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
+            }
+        }
+        Ok(CallToolResult::success(vec![ContentBlock::text("[error] transfer timed out after 10 minutes".to_string())]))
+    }
+
     #[tool(description = "Click at a position on the device's screen. x and y are fractions 0.0-1.0 from the top-left.")]
     async fn click(&self, Parameters(a): Parameters<ClickArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
@@ -650,7 +721,7 @@ impl ServerHandler for Srv {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Control HaiveControl devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, camera_snapshot, update_agent, dissolve_agent.".to_string(),
+            "Control HaiveControl devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), camera_snapshot, update_agent, dissolve_agent.".to_string(),
         );
         info
     }
