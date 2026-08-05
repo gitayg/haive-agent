@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "haive-agent"
-version = "2.29.0"
+version = "2.30.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "haive-cli"
-version = "2.29.0"
+version = "2.30.0"
 dependencies = [
  "clap",
  "reqwest",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "haive-mcp"
-version = "2.29.0"
+version = "2.30.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

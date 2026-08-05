@@ -540,6 +540,17 @@ fn main() {
         let rid = relay_id();
         let (nm, si) = (name.clone(), sysinfo.clone());
         let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
+        // A token is mandatory: the agent will not enroll un-owned. The hub also
+        // rejects a tokenless /relay/hello, but refuse up front so it fails loudly
+        // here instead of silently never appearing on the hub.
+        if token.is_empty() {
+            eprintln!(
+                "error: relay mode requires an enrollment token.\n\
+                 pass --relay-token htok_… (or set HIVE_RELAY_TOKEN). Mint one from the\n\
+                 hub dashboard's \"Register a device\" panel — the device enrolls under your account."
+            );
+            std::process::exit(2);
+        }
         direct_token = agent_direct_token(&token, &rid);
         // LAN-direct: get a hub-signed leaf cert (SANs = our LAN IPs + a stable
         // name) so a same-LAN controller can validate a direct connection to us
