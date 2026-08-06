@@ -568,6 +568,65 @@ fn stream_camera(req: Request, cfg: &Config, index: u32) {
     }
 }
 
+/// ConsentStore app keys encode a desktop app's exe path with '#' for '\'; reduce
+/// to the readable leaf (e.g. `Teams.exe`). Packaged family names are left as-is.
+#[cfg(windows)]
+fn friendly_cam_app(key: &str) -> String {
+    if key.contains('#') {
+        key.rsplit('#').find(|s| !s.is_empty()).unwrap_or(key).to_string()
+    } else {
+        key.to_string()
+    }
+}
+
+/// Apps that currently hold the webcam OPEN, per Windows' own per-app usage store
+/// (the same source as the taskbar "an app is using your camera"). An app is in-use
+/// while its `LastUsedTimeStop` is 0. Covers both packaged and desktop apps.
+#[cfg(windows)]
+fn camera_in_use_by() -> Vec<String> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+    const BASE: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
+    let mut out: Vec<String> = Vec::new();
+    let in_use = |k: &RegKey| k.get_value::<u64, _>("LastUsedTimeStop").map(|v| v == 0).unwrap_or(false);
+    for hive in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let Ok(webcam) = RegKey::predef(hive).open_subkey(BASE) else { continue };
+        for name in webcam.enum_keys().flatten() {
+            if name.eq_ignore_ascii_case("NonPackaged") {
+                if let Ok(np) = webcam.open_subkey(&name) {
+                    for app in np.enum_keys().flatten() {
+                        if np.open_subkey(&app).map(|k| in_use(&k)).unwrap_or(false) {
+                            out.push(friendly_cam_app(&app));
+                        }
+                    }
+                }
+            } else if webcam.open_subkey(&name).map(|k| in_use(&k)).unwrap_or(false) {
+                out.push(friendly_cam_app(&name));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// A specific, actionable failure message: name whatever holds the camera when we
+/// can, and otherwise explain the "LED on, no app" case (system/effects process).
+fn camera_failure_message() -> String {
+    #[cfg(windows)]
+    {
+        let holders = camera_in_use_by();
+        if !holders.is_empty() {
+            return format!("camera capture failed — the camera is in use by: {}. Close it and retry.", holders.join(", "));
+        }
+        return "camera capture failed — no app is registered as using the camera (per Windows). An LED that stays on with no app is usually a system/effects process holding it: turn off Windows Studio Effects for this camera (Settings \u{2192} Bluetooth & devices \u{2192} Cameras), or pause vendor presence-detection (e.g. Dell Optimizer). It can also mean the selected device has no live video source.".to_string();
+    }
+    #[cfg(not(windows))]
+    {
+        "camera capture failed or timed out".to_string()
+    }
+}
+
 fn camera_ep(url: &str, cfg: &Config) -> Resp {
     let index = query_index(url);
     let quality = cfg.quality;
@@ -577,7 +636,7 @@ fn camera_ep(url: &str, cfg: &Config) -> Resp {
     });
     match rx.recv_timeout(std::time::Duration::from_secs(12)) {
         Ok(Some(bytes)) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
-        _ => Response::from_string("camera capture failed or timed out").with_status_code(500),
+        _ => Response::from_string(camera_failure_message()).with_status_code(500),
     }
 }
 
