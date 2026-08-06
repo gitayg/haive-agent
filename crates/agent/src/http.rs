@@ -749,6 +749,29 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
     if cmd.is_empty() {
         return json_resp(&serde_json::json!({"ok": false, "error": "empty command"}), 400);
     }
+    // Hub-authored native posture sentinels: the hub emits `it-ai:probe/<key>`
+    // for the Windows av/services/encryption/firewall probes and the
+    // empty_recycle_bin fix instead of a PowerShell/manage-bde/netsh command.
+    // Run them as native WMI/shell32 code (crates/agent/src/winprobe.rs) and
+    // reply in the exact {ok,code,stdout,stderr,truncated} shape the capture path
+    // below returns, so the hub's exec_output parses it unchanged.
+    #[cfg(windows)]
+    {
+        let native: Option<String> = match cmd.as_str() {
+            "it-ai:probe/av" => Some(crate::winprobe::av_status()),
+            "it-ai:probe/services" => Some(crate::winprobe::services_running()),
+            "it-ai:probe/encryption" => Some(crate::winprobe::encryption_status()),
+            "it-ai:probe/firewall" => Some(crate::winprobe::firewall_status()),
+            "it-ai:probe/empty_recycle_bin" => Some(crate::winprobe::empty_recycle_bin()),
+            _ => None,
+        };
+        if let Some(stdout) = native {
+            return json_resp(
+                &serde_json::json!({"ok": true, "code": 0, "stdout": stdout, "stderr": "", "truncated": false}),
+                200,
+            );
+        }
+    }
     // Fire-and-forget launch (e.g. a GUI app) must NOT block the exec/relay channel.
     let detach = v.get("detach").and_then(|x| x.as_bool()).unwrap_or(false);
     // Cap captured commands so a hung/GUI-spawning process can't wedge the channel.

@@ -95,7 +95,27 @@ fn run(cmd: &str) -> String {
 }
 
 fn snapshot() -> BTreeMap<String, String> {
-    commands().into_iter().map(|(k, cmd)| (k.to_string(), run(&cmd))).collect()
+    commands()
+        .into_iter()
+        .map(|(k, cmd)| {
+            // On Windows the posture probes run as native WMI/shell32 code
+            // (crates/agent/src/winprobe.rs) instead of shelling out to
+            // PowerShell/manage-bde/netsh. The commands() strings stay in place
+            // as the correct commands for the mac/linux arms (and keep ps()
+            // referenced), but are never executed on Windows for these keys.
+            #[cfg(windows)]
+            {
+                match k {
+                    "av" => return (k.to_string(), crate::winprobe::av_status()),
+                    "services" => return (k.to_string(), crate::winprobe::services_running()),
+                    "encryption" => return (k.to_string(), crate::winprobe::encryption_status()),
+                    "firewall" => return (k.to_string(), crate::winprobe::firewall_status()),
+                    _ => {}
+                }
+            }
+            (k.to_string(), run(&cmd))
+        })
+        .collect()
 }
 
 fn base_of(hub: &str) -> String {

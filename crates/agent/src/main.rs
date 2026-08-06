@@ -20,6 +20,8 @@ mod tls;
 mod wayland;
 #[cfg(windows)]
 mod winsession;
+#[cfg(windows)]
+mod winprobe;
 
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
