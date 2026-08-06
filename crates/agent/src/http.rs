@@ -392,7 +392,22 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
     // Report whether the replacement actually launched. Callers must NOT exit the
     // still-running process when this is false — a failed relaunch with no
     // supervisor would otherwise leave the device dead.
-    match std::process::Command::new(&exe).args(&args).spawn() {
+    let mut c = std::process::Command::new(&exe);
+    c.args(&args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // The relaunch MUST be windowless + detached. A plain spawn pops a fresh
+        // console window — the "second terminal" that appears after an update — and
+        // ties the new agent to the old console. CREATE_NO_WINDOW hides the console;
+        // a new process group + null stdio detach it from ours so it lives on after
+        // this process exits.
+        c.creation_flags(0x0800_0000 | 0x0000_0200) // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+    }
+    match c.spawn() {
         Ok(_) => true,
         Err(e) => {
             eprintln!("update: relaunch failed: {e}; staying on the current version");
