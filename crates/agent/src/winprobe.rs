@@ -405,6 +405,58 @@ fn registry_states() -> Option<[bool; 3]> {
     }
 }
 
+// ── cameras (device presence) ─────────────────────────────────────────────────
+
+/// Every camera DEVICE the OS knows about (PNPClass = 'Camera'), paired with its
+/// ConfigManagerErrorCode. Unlike the capture-backend query (nokhwa/MediaFoundation,
+/// which lists only what it can OPEN), this reports a webcam even when it is turned
+/// OFF: a closed privacy shutter / hardware kill-switch surfaces as Code 45 ("not
+/// connected"), a disabled device as Code 22. That lets the dashboard show
+/// "Integrated Camera — off (…)" instead of a misleading "no camera" for a laptop
+/// that plainly has one. Empty on any COM/WMI failure. Never panics.
+pub fn camera_devices() -> Vec<(String, u32)> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct PnpCam {
+        name: Option<String>,
+        config_manager_error_code: Option<u32>,
+    }
+    let conn = match wmi(r"root\cimv2") {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let rows: Vec<PnpCam> = conn
+        .raw_query(
+            "SELECT Name, ConfigManagerErrorCode FROM Win32_PnPEntity WHERE PNPClass = 'Camera'",
+        )
+        .unwrap_or_default();
+    let mut out: Vec<(String, u32)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let name = r.name?;
+            if name.trim().is_empty() {
+                return None;
+            }
+            Some((name.trim().to_string(), r.config_manager_error_code.unwrap_or(0)))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Friendly reason for a non-zero Device-Manager ConfigManagerErrorCode.
+pub fn cm_error_reason(code: u32) -> &'static str {
+    match code {
+        22 => "disabled",
+        45 => "disconnected — privacy shutter or kill-switch",
+        21 => "being removed",
+        28 => "driver not installed",
+        10 | 43 => "device error",
+        _ => "unavailable",
+    }
+}
+
 // ── empty_recycle_bin (fix action) ───────────────────────────────────────────
 
 /// Empty every drive's Recycle Bin silently (no confirmation dialog, no progress

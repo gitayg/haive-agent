@@ -302,7 +302,7 @@ fn collect_sysinfo() -> serde_json::Value {
             interfaces.push(serde_json::json!({"name": name, "addr": ipn.addr.to_string()}));
         }
     }
-    let (cameras, microphones) = media_devices();
+    let (cameras, cameras_present, microphones) = media_devices();
     serde_json::json!({
         "os": os,
         "arch": std::env::consts::ARCH,
@@ -316,6 +316,7 @@ fn collect_sysinfo() -> serde_json::Value {
         "mem_gb": mem_gb,
         "interfaces": interfaces,
         "cameras": cameras,
+        "cameras_present": cameras_present,
         "microphones": microphones,
     })
 }
@@ -347,21 +348,71 @@ pub(crate) fn live_metrics() -> serde_json::Value {
 }
 
 /// Cameras + microphones, enumerated NATIVELY — no shelling out to PowerShell,
-/// system_profiler, or arecord. Cameras come from nokhwa (the SAME backend the
-/// capture path uses: MediaFoundation on Windows, AVFoundation on macOS, v4l2 on
-/// Linux), so the list matches what can actually be captured; microphones come
-/// from cpal's default host (WASAPI / CoreAudio / ALSA).
-fn media_devices() -> (Vec<String>, Vec<String>) {
-    (cameras(), mics())
+/// system_profiler, or arecord. Returns `(capturable, present, microphones)`:
+///
+/// * `capturable` — cameras the capture backend (nokhwa: MediaFoundation on
+///   Windows, AVFoundation on macOS, v4l2 on Linux) can actually OPEN. This is
+///   the index-stable list the snapshot/live path indexes into — do not reorder
+///   or pad it.
+/// * `present` — every physical camera the OS reports, annotated with live state.
+///   A webcam that EXISTS but is turned off (closed privacy shutter / kill-switch
+///   / disabled in Device Manager) is invisible to the capture backend, so
+///   `capturable` is empty and the dashboard would otherwise say "no camera" on a
+///   laptop that plainly has one. This list keeps it visible as "Camera — off (…)".
+///   Windows-only; empty elsewhere (nokhwa already reflects presence there).
+/// * microphones — cpal's default host (WASAPI / CoreAudio / ALSA).
+fn media_devices() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (capturable, present) = cameras();
+    (capturable, present, mics())
 }
 
-fn cameras() -> Vec<String> {
-    let mut names: Vec<String> = nokhwa::query(nokhwa::utils::ApiBackend::Auto)
+/// `(capturable, present)` — see `media_devices`.
+fn cameras() -> (Vec<String>, Vec<String>) {
+    let mut capturable: Vec<String> = nokhwa::query(nokhwa::utils::ApiBackend::Auto)
         .map(|list| list.into_iter().map(|c| c.human_name()).collect())
         .unwrap_or_default();
-    names.retain(|n| !n.trim().is_empty());
-    names.dedup();
-    names
+    capturable.retain(|n| !n.trim().is_empty());
+    capturable.dedup();
+    let present = camera_presence(&capturable);
+    (capturable, present)
+}
+
+/// Display-only list of ALL physical cameras with their live state, so an off
+/// webcam still shows instead of collapsing to "no camera". Pure Windows probe
+/// (Win32_PnPEntity via WMI); empty on other OSes where nokhwa already reflects
+/// presence. Never indexed by the snapshot path — that uses `capturable`.
+#[cfg(windows)]
+fn camera_presence(capturable: &[String]) -> Vec<String> {
+    // Normalise for fuzzy matching between nokhwa's friendly name and the PnP
+    // device name (they differ in spacing/case): keep alphanumerics, lowercase.
+    fn norm(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    }
+    let cap_norm: Vec<String> = capturable.iter().map(|s| norm(s)).collect();
+    let mut out: Vec<String> = Vec::new();
+    for (name, code) in crate::winprobe::camera_devices() {
+        let n = norm(&name);
+        let matched = cap_norm.iter().any(|c| c == &n || c.contains(&n) || n.contains(c));
+        if code == 0 && matched {
+            out.push(name); // present, enabled, and capturable
+        } else if code != 0 {
+            out.push(format!("{name} — off ({})", crate::winprobe::cm_error_reason(code)));
+        } else {
+            // Enabled but the backend can't open it: another app holds it, or
+            // "let desktop apps access your camera" is off.
+            out.push(format!("{name} — unavailable (in use or camera access blocked)"));
+        }
+    }
+    out.dedup();
+    out
+}
+
+#[cfg(not(windows))]
+fn camera_presence(_capturable: &[String]) -> Vec<String> {
+    Vec::new()
 }
 
 fn mics() -> Vec<String> {
