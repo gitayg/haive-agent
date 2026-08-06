@@ -93,13 +93,41 @@ pub fn open_camera(index: u32) -> Option<nokhwa::Camera> {
     use nokhwa::pixel_format::RgbFormat;
     use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
     use nokhwa::Camera;
-    let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
-    let mut cam = Camera::new(CameraIndex::Index(index), requested).ok()?;
-    cam.open_stream().ok()?;
-    for _ in 0..3 {
-        let _ = cam.frame(); // warm up (first frames are often dark)
+    // Some cameras — notably Windows "Camera AI Effect" / Studio-Effects webcam
+    // fronts (Dell/Lenovo laptops) — open but never deliver a frame when asked for
+    // the absolute highest resolution. Try a streamable frame-rate mode first, then
+    // fall back to highest resolution, and only accept a camera that actually yields
+    // a warm frame — so a mode that opens but doesn't stream is rejected, not returned
+    // as a hung "working" camera.
+    // Highest resolution first (preserve quality for cameras that work), then a
+    // more streamable frame-rate mode as a fallback for fronts that open but never
+    // deliver a full-res frame.
+    let attempts = [
+        RequestedFormatType::AbsoluteHighestResolution,
+        RequestedFormatType::AbsoluteHighestFrameRate,
+    ];
+    for rt in attempts {
+        let requested = RequestedFormat::new::<RgbFormat>(rt);
+        let Ok(mut cam) = Camera::new(CameraIndex::Index(index), requested) else {
+            continue;
+        };
+        if cam.open_stream().is_err() {
+            continue;
+        }
+        // First frames are often dark/empty; a working stream produces one within a
+        // few tries. If none arrives, this mode doesn't stream — try the next.
+        let mut streamed = false;
+        for _ in 0..8 {
+            if cam.frame().map(|f| !f.buffer().is_empty()).unwrap_or(false) {
+                streamed = true;
+                break;
+            }
+        }
+        if streamed {
+            return Some(cam);
+        }
     }
-    Some(cam)
+    None
 }
 
 /// One frame from an already-open camera → JPEG. MJPEG frames are already JPEG

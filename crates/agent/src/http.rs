@@ -638,6 +638,32 @@ fn clip_output(b: &[u8]) -> String {
     s
 }
 
+/// Build a shell command that runs `cmd` verbatim.
+///
+/// On Windows this is the subtle part: `cmd.exe` does its OWN quote parsing, but
+/// Rust's normal argument escaping emits backslash-escaped quotes (`\"`) that cmd
+/// does not understand — so any command containing embedded quotes (e.g.
+/// `powershell -Command "…"`) arrives corrupted, which is why quoted PowerShell /
+/// `$_` scripts came back mangled or echoed. We instead hand cmd the whole line via
+/// `raw_arg` (no Rust escaping) as `/S /C "<cmd>"`: `/S` makes cmd strip exactly the
+/// one outer quote pair and execute the remainder verbatim, so the user's inner
+/// quotes survive intact.
+fn shell_command(cmd: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new("cmd");
+        c.raw_arg("/S").raw_arg("/C").raw_arg(format!("\"{cmd}\""));
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    }
+}
+
 fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
     if !cfg.exec_enabled {
         return json_resp(&serde_json::json!({"ok": false, "error": "remote exec disabled"}), 403);
@@ -653,14 +679,13 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
     let detach = v.get("detach").and_then(|x| x.as_bool()).unwrap_or(false);
     // Cap captured commands so a hung/GUI-spawning process can't wedge the channel.
     let timeout = v.get("timeout").and_then(|x| x.as_u64()).unwrap_or(60).clamp(1, 300);
-    let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
 
     if detach {
         // Spawn detached and return immediately — the child is orphaned, not waited
         // on. Redirect stdio to NUL so a launched GUI grandchild can't inherit an
         // exec pipe write-end (which would wedge a captured command's read-to-EOF).
-        let mut c = std::process::Command::new(prog);
-        c.arg(flag).arg(&cmd).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        let mut c = shell_command(&cmd);
+        c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -678,11 +703,8 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
     }
 
     // Run-and-capture, but bounded: wait on a worker thread and time out + kill.
-    let mut capc = std::process::Command::new(prog);
-    capc.arg(flag)
-        .arg(&cmd)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    let mut capc = shell_command(&cmd);
+    capc.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
