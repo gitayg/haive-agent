@@ -344,86 +344,33 @@ pub(crate) fn live_metrics() -> serde_json::Value {
     m
 }
 
-#[cfg(target_os = "macos")]
+/// Cameras + microphones, enumerated NATIVELY — no shelling out to PowerShell,
+/// system_profiler, or arecord. Cameras come from nokhwa (the SAME backend the
+/// capture path uses: MediaFoundation on Windows, AVFoundation on macOS, v4l2 on
+/// Linux), so the list matches what can actually be captured; microphones come
+/// from cpal's default host (WASAPI / CoreAudio / ALSA).
 fn media_devices() -> (Vec<String>, Vec<String>) {
-    (macos_cameras(), macos_mics())
-}
-#[cfg(target_os = "macos")]
-fn sp_json(dtype: &str) -> Option<serde_json::Value> {
-    let out = std::process::Command::new("system_profiler").args(["-json", dtype]).output().ok()?;
-    serde_json::from_slice(&out.stdout).ok()
-}
-#[cfg(target_os = "macos")]
-fn macos_cameras() -> Vec<String> {
-    sp_json("SPCameraDataType")
-        .and_then(|v| v.get("SPCameraDataType").and_then(|x| x.as_array()).cloned())
-        .map(|arr| arr.iter().filter_map(|i| i.get("_name").and_then(|n| n.as_str()).map(String::from)).collect())
-        .unwrap_or_default()
-}
-#[cfg(target_os = "macos")]
-fn macos_mics() -> Vec<String> {
-    let mut mics = Vec::new();
-    if let Some(v) = sp_json("SPAudioDataType") {
-        if let Some(arr) = v.get("SPAudioDataType").and_then(|x| x.as_array()) {
-            for group in arr {
-                if let Some(items) = group.get("_items").and_then(|x| x.as_array()) {
-                    for d in items {
-                        if d.get("coreaudio_device_input").is_some() {
-                            if let Some(n) = d.get("_name").and_then(|n| n.as_str()) {
-                                mics.push(n.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    mics
+    (cameras(), mics())
 }
 
-#[cfg(target_os = "windows")]
-fn media_devices() -> (Vec<String>, Vec<String>) {
-    (
-        ps_lines("Get-PnpDevice -Class Camera -PresentOnly -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FriendlyName"),
-        ps_lines("Get-PnpDevice -Class AudioEndpoint -PresentOnly -ErrorAction SilentlyContinue | Where-Object {$_.FriendlyName -match 'microphone|mic'} | Select-Object -ExpandProperty FriendlyName"),
-    )
+fn cameras() -> Vec<String> {
+    let mut names: Vec<String> = nokhwa::query(nokhwa::utils::ApiBackend::Auto)
+        .map(|list| list.into_iter().map(|c| c.human_name()).collect())
+        .unwrap_or_default();
+    names.retain(|n| !n.trim().is_empty());
+    names.dedup();
+    names
 }
-#[cfg(target_os = "windows")]
-fn ps_lines(cmd: &str) -> Vec<String> {
-    use std::os::windows::process::CommandExt;
-    match std::process::Command::new("powershell").args(["-NoProfile", "-Command", cmd]).creation_flags(0x0800_0000).output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+
+fn mics() -> Vec<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let mut names: Vec<String> = match cpal::default_host().input_devices() {
+        Ok(it) => it.filter_map(|d| d.name().ok()).collect(),
         Err(_) => Vec::new(),
-    }
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn media_devices() -> (Vec<String>, Vec<String>) {
-    let mut cams: Vec<String> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir("/sys/class/video4linux") {
-        for e in rd.flatten() {
-            if let Ok(name) = std::fs::read_to_string(e.path().join("name")) {
-                let n = name.trim().to_string();
-                if !n.is_empty() && !cams.contains(&n) {
-                    cams.push(n);
-                }
-            }
-        }
-    }
-    let mut mics: Vec<String> = Vec::new();
-    if let Ok(o) = std::process::Command::new("arecord").arg("-l").output() {
-        for line in String::from_utf8_lossy(&o.stdout).lines() {
-            if line.starts_with("card ") {
-                if let Some(pos) = line.find(": ") {
-                    let name = line[pos + 2..].split('[').next().unwrap_or("").trim().to_string();
-                    if !name.is_empty() && !mics.contains(&name) {
-                        mics.push(name);
-                    }
-                }
-            }
-        }
-    }
-    (cams, mics)
+    };
+    names.retain(|n| !n.trim().is_empty());
+    names.dedup();
+    names
 }
 
 fn main() {

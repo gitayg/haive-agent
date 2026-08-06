@@ -197,6 +197,10 @@ fn win_install(exe: &Path, args: &[String]) {
         // launch is already windowless; only Windows needs it back.)
         cmd.push_str(" \"--background\"");
         let _ = key.set_value("IT-AI", &cmd);
+        // Migration: installs predating the IT-AI rebrand left a Run key named
+        // "HaiveControl" (pointing at the old airm-*.exe). Remove it so a machine
+        // re-enrolled across the rename doesn't launch TWO agents at every login.
+        let _ = key.delete_value("HaiveControl");
     }
 }
 
@@ -210,6 +214,7 @@ fn win_uninstall() {
         KEY_SET_VALUE,
     ) {
         let _ = key.delete_value("IT-AI");
+        let _ = key.delete_value("HaiveControl"); // legacy name (pre-rebrand)
     }
 }
 

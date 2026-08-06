@@ -53,6 +53,7 @@ jobs:
           libx11-dev libxtst-dev libdbus-1-dev pkg-config
           libwayland-dev libxkbcommon-dev
           libpipewire-0.3-dev libclang-dev
+          libasound2-dev
           libegl-dev libgl-dev libgles-dev libgbm-dev libdrm-dev
 
       - name: Install zig + cargo-zigbuild (Linux — link an older glibc)

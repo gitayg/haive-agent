@@ -27,6 +27,7 @@ base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
 sysinfo = "0.33"
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
+cpal = "0.15"
 self-replace = "1"
 portable-pty = "0.8"
 
