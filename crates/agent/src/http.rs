@@ -309,6 +309,7 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
             Response::from_string("").with_status_code(204)
         }
         (Method::Post, "/exec") => exec_ep(&mut req, cfg),
+        (Method::Get, "/wol") => wol_ep(&url),
         (Method::Post, "/schedule/add") => {
             let mut b = String::new();
             let _ = req.as_reader().read_to_string(&mut b);
@@ -448,6 +449,43 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
             false
         }
     }
+}
+
+/// GET /wol?mac=AA:BB:CC:DD:EE:FF — this (online) agent broadcasts a Wake-on-LAN
+/// magic packet on its LAN, so the hub can wake a SLEEPING peer it can't reach
+/// directly. Pure UDP broadcast; no elevation needed. (#39)
+fn wol_ep(url: &str) -> Resp {
+    let mac = url
+        .split('?')
+        .nth(1)
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("mac=")))
+        .unwrap_or("")
+        .to_string();
+    match send_wol(&mac) {
+        Ok(()) => json_resp(&serde_json::json!({"ok": true, "woke": mac}), 200),
+        Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e}), 400),
+    }
+}
+
+/// Broadcast a Wake-on-LAN magic packet (6× 0xFF then 16× the MAC) to the LAN
+/// broadcast address on UDP/9. Accepts `:` or `-` separated MACs.
+fn send_wol(mac: &str) -> Result<(), String> {
+    let hex: Vec<u8> = mac
+        .split(|c| c == ':' || c == '-')
+        .filter(|s| !s.is_empty())
+        .map(|b| u8::from_str_radix(b, 16).map_err(|_| format!("bad MAC octet '{b}'")))
+        .collect::<Result<Vec<u8>, _>>()?;
+    if hex.len() != 6 {
+        return Err(format!("MAC must have 6 octets, got {}", hex.len()));
+    }
+    let mut packet = vec![0xFFu8; 6];
+    for _ in 0..16 {
+        packet.extend_from_slice(&hex);
+    }
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    sock.set_broadcast(true).map_err(|e| e.to_string())?;
+    sock.send_to(&packet, "255.255.255.255:9").map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn dissolve_ep() -> Resp {
