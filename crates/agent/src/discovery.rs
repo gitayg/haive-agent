@@ -118,7 +118,15 @@ pub fn auto_update_loop(primary: String, fallback_id: Option<String>, asset: Str
         if let Some((ip, port)) = resolve_hub(&primary, &fallback_id) {
             let url = format!("http://{ip}:{port}/bin/{asset}");
             if let Some(newb) = download_agent(&url) {
-                if !newb.is_empty() && newb != self_bytes && crate::http::apply_update(&newb) {
+                // Verify a pinned-key signature before self-replacing — the LAN
+                // `/bin/` fetch is plaintext HTTP and mDNS-resolved, so the bytes are
+                // otherwise trivially MITM/spoofable into a trojan.
+                let sig = download_agent(&format!("{url}.sig"));
+                if !newb.is_empty()
+                    && newb != self_bytes
+                    && sig.as_deref().map(|s| crate::http::verify_update_sig(&newb, s)).unwrap_or(false)
+                    && crate::http::apply_update(&newb)
+                {
                     std::thread::sleep(Duration::from_millis(500));
                     std::process::exit(0);
                 }
@@ -140,7 +148,14 @@ pub fn auto_update_relay(base: String, asset: String) {
         std::thread::sleep(Duration::from_secs(120));
         let url = format!("{b}/bin/{asset}");
         if let Some(newb) = download_agent(&url) {
-            if !newb.is_empty() && newb != self_bytes && crate::http::apply_update(&newb) {
+            // Require a valid pinned-key signature so a compromised/rogue hub can't
+            // trojan the fleet via the auto-update channel.
+            let sig = download_agent(&format!("{url}.sig"));
+            if !newb.is_empty()
+                && newb != self_bytes
+                && sig.as_deref().map(|s| crate::http::verify_update_sig(&newb, s)).unwrap_or(false)
+                && crate::http::apply_update(&newb)
+            {
                 std::thread::sleep(Duration::from_millis(500));
                 std::process::exit(0);
             }

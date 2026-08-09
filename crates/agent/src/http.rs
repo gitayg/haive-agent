@@ -218,17 +218,38 @@ fn header_value(req: &Request, name: &'static str) -> Option<String> {
         .map(|h| h.value.as_str().to_string())
 }
 
+/// Constant-time byte-equality (avoids the early-return timing oracle of `==` on
+/// secrets). The length comparison can leak length, which is not sensitive here.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 fn authorized(req: &Request, cfg: &Config) -> bool {
-    // LAN-direct: a request carrying the hub-issued per-device token is authorized
-    // (lets an MCP the hub trusts drive us directly, even behind a password).
-    if !cfg.direct_token.is_empty() {
+    // A relay-enrolled agent carries a hub-issued per-device token. When set, a
+    // non-loopback (LAN) request MUST present it (or the password) — there is NO
+    // open-access bypass in this mode. This closes the "empty password ⇒ anyone on
+    // the LAN can drive /exec,/update,…" hole: the default password is empty, so
+    // without this gate a relay device would accept unauthenticated LAN commands.
+    let relay_enrolled = !cfg.direct_token.is_empty();
+    if relay_enrolled {
         if let Some(q) = req.url().split('?').nth(1) {
-            if q.split('&').any(|kv| kv.strip_prefix("dtok=").map(|v| v == cfg.direct_token).unwrap_or(false)) {
+            if q.split('&').any(|kv| kv.strip_prefix("dtok=").map(|v| ct_eq(v, &cfg.direct_token)).unwrap_or(false)) {
                 return true;
             }
         }
     }
-    if cfg.password.is_empty() {
+    // Open access ONLY for a pure-LAN agent that is neither relay-enrolled nor
+    // password-protected (local dev / self-serve). Any relay enrollment or a set
+    // password removes the open path.
+    if !relay_enrolled && cfg.password.is_empty() {
         return true;
     }
     if let Some(v) = header_value(req, "Authorization") {
@@ -236,7 +257,7 @@ fn authorized(req: &Request, cfg: &Config) -> bool {
             if let Ok(dec) = base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
                 if let Ok(s) = String::from_utf8(dec) {
                     if let Some((_, pass)) = s.split_once(':') {
-                        return pass == cfg.password;
+                        return !cfg.password.is_empty() && ct_eq(pass, &cfg.password);
                     }
                 }
             }
@@ -339,10 +360,23 @@ fn update_ep(req: &mut Request) -> Resp {
         Some(u) => u,
         None => return Response::from_string("no url").with_status_code(400),
     };
+    // Only accept HTTPS update sources (no plaintext http:// MITM surface).
+    if !url.starts_with("https://") {
+        return Response::from_string("update url must be https").with_status_code(400);
+    }
     let bytes = match download_bytes(&url) {
         Some(b) if !b.is_empty() => b,
         _ => return Response::from_string("download failed").with_status_code(502),
     };
+    // Refuse to self-replace with an unsigned/forged binary: require a detached
+    // ed25519 signature (served as <url>.sig) that verifies against the pinned key.
+    let sig = match download_bytes(&format!("{url}.sig")) {
+        Some(s) if !s.is_empty() => s,
+        _ => return Response::from_string("update signature missing").with_status_code(400),
+    };
+    if !verify_update_sig(&bytes, &sig) {
+        return Response::from_string("update signature invalid").with_status_code(400);
+    }
     if !apply_update(&bytes) {
         return Response::from_string("update failed").with_status_code(500);
     }
@@ -437,6 +471,32 @@ fn download_bytes(url: &str) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).ok()?;
     Some(buf)
+}
+
+/// Ed25519 public key that release binaries are signed with (CI holds the private
+/// half as a repo secret and signs each asset, publishing `<asset>.sig`). A
+/// self-update is applied ONLY if a detached signature over the exact bytes
+/// verifies against this key — so a malicious/compromised hub, a MITM on a
+/// plaintext LAN `/bin/` fetch, or an unauthenticated `/update` caller cannot push
+/// a trojaned binary. This is the primary defense; transport (HTTPS) is secondary.
+const UPDATE_PUBKEY: [u8; 32] = [
+    0x00, 0x50, 0x77, 0x5c, 0x22, 0xeb, 0x07, 0xdc, 0x22, 0xd0, 0xb5, 0x29, 0xb5, 0xf6, 0x80, 0xde,
+    0x6e, 0x80, 0x07, 0xbf, 0x4d, 0x7e, 0x1b, 0xe5, 0xed, 0x37, 0xb6, 0x41, 0xf5, 0xfc, 0x5f, 0x92,
+];
+
+/// Verify a detached ed25519 signature (raw 64 bytes) over `bytes` against the
+/// pinned update key. Returns false on any malformed input — never panics.
+pub(crate) fn verify_update_sig(bytes: &[u8], sig: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let vk = match VerifyingKey::from_bytes(&UPDATE_PUBKEY) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    let raw: [u8; 64] = match sig.try_into() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    vk.verify_strict(bytes, &Signature::from_bytes(&raw)).is_ok()
 }
 
 fn query_index(url: &str) -> u32 {
@@ -838,11 +898,43 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
 
 fn resolve_path(cfg: &Config, path: &str) -> Option<PathBuf> {
     if !cfg.share.is_empty() {
+        // Reject parent-traversal AND absolute paths: `Path::join` REPLACES the base
+        // when the argument is absolute (`share.join("/etc/shadow")` == `/etc/shadow`),
+        // which contains no ".." — the classic share escape. Also block Windows
+        // drive-absolute (`C:\…`) and UNC (`\\host\…`) which `is_absolute` may not
+        // flag on non-Windows builds.
+        let p = std::path::Path::new(path);
+        if path.contains("..")
+            || p.is_absolute()
+            || path.starts_with('/')
+            || path.starts_with('\\')
+            || path.chars().nth(1) == Some(':')
+        {
+            return None;
+        }
+        let root = expand_tilde(&cfg.share);
+        let joined = std::path::Path::new(&root).join(path);
+        // Defense in depth: verify the canonical destination stays under the
+        // canonical share root (a write target may not exist yet, so fall back to
+        // canonicalizing its parent).
+        let root_c = std::fs::canonicalize(&root).ok()?;
+        let target_c = std::fs::canonicalize(&joined).ok().or_else(|| {
+            let parent = joined.parent()?;
+            let name = joined.file_name()?;
+            Some(std::fs::canonicalize(parent).ok()?.join(name))
+        })?;
+        if target_c.starts_with(&root_c) {
+            Some(joined)
+        } else {
+            None
+        }
+    } else {
+        // No share configured: file ops are an authenticated-admin capability of the
+        // RMM (now gated by the LAN-auth fix in `authorized`), so the path is the
+        // operator's choice — but still forbid `..` games for hygiene.
         if path.contains("..") {
             return None;
         }
-        Some(PathBuf::from(expand_tilde(&cfg.share)).join(path))
-    } else {
         Some(PathBuf::from(expand_tilde(path)))
     }
 }

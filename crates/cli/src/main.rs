@@ -54,15 +54,19 @@ type R = Result<(), Box<dyn std::error::Error>>;
 
 fn build_client(cafile: &Option<String>) -> Client {
     let mut b = Client::builder();
-    match cafile {
-        Some(path) => match std::fs::read(path).ok().and_then(|p| reqwest::Certificate::from_pem(&p).ok()) {
+    // Add an explicit hub CA as a trusted root (for self-signed LAN-direct agents).
+    // The public hub endpoint verifies against the system roots with no cafile.
+    if let Some(path) = cafile {
+        match std::fs::read(path).ok().and_then(|p| reqwest::Certificate::from_pem(&p).ok()) {
             Some(cert) => b = b.add_root_certificate(cert),
-            None => eprintln!("warning: could not read cafile {path}; TLS not verified"),
-        },
-        None => {
-            eprintln!("warning: TLS not verified (no --cafile) — LAN use only");
-            b = b.danger_accept_invalid_certs(true);
+            None => eprintln!("warning: could not read cafile {path}; using system roots"),
         }
+    }
+    // TLS verification is ON by default. Insecure mode is an explicit, logged opt-in
+    // (self-signed LAN use only) — it used to be the silent default with no cafile.
+    if std::env::var("HAIVE_INSECURE_TLS").ok().as_deref() == Some("1") {
+        eprintln!("warning: TLS verification DISABLED (HAIVE_INSECURE_TLS=1) — LAN use only");
+        b = b.danger_accept_invalid_certs(true);
     }
     b.build().expect("build http client")
 }

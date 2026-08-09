@@ -81,6 +81,31 @@ jobs:
             cp "${dir}/${b}${{ matrix.ext }}" "out/${b}-${{ matrix.suffix }}${{ matrix.ext }}"
           done
 
+      # Detached ed25519 signatures for the verified self-update path: the agent
+      # only self-replaces with a binary whose <asset>.sig verifies against the
+      # public key pinned in crates/agent/src/http.rs (UPDATE_PUBKEY). The private
+      # half lives ONLY as the UPDATE_SIGNING_KEY repo secret. Fails the build if the
+      # secret is missing — we never publish an unsigned release (agents would reject
+      # it anyway). Rotate the key: re-run scripts + update UPDATE_PUBKEY + secret.
+      - name: Sign binaries (ed25519 detached)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::error::UPDATE_SIGNING_KEY secret is not set — refusing to publish an unsigned release (self-update would reject it). Add the ed25519 private key as the UPDATE_SIGNING_KEY secret."
+            exit 1
+          fi
+          printf '%s' "$UPDATE_SIGNING_KEY" > update_key.pem
+          for f in out/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.sig) continue;; esac
+            openssl pkeyutl -sign -inkey update_key.pem -rawin -in "$f" -out "$f.sig"
+          done
+          rm -f update_key.pem
+          ls -l out
+
       # Signed provenance ties each binary to the exact repo+commit+workflow that
       # built it — the public answer to "who is behind this tool". Verify:
       #   gh attestation verify <file> --repo gitayg/haive-agent

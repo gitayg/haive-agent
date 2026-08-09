@@ -192,11 +192,23 @@ fn urlencode(s: &str) -> String {
 
 impl Srv {
     fn new() -> Self {
-        let cafile = std::env::var("HAIVE_CAFILE").ok();
         let mut b = reqwest::Client::builder();
-        match cafile.and_then(|p| std::fs::read(p).ok()).and_then(|p| reqwest::Certificate::from_pem(&p).ok()) {
-            Some(cert) => b = b.add_root_certificate(cert),
-            None => b = b.danger_accept_invalid_certs(true),
+        // Trust an explicitly-provided hub CA (for LAN-direct connections to an agent
+        // carrying a hub-signed leaf cert). The public hub endpoint has a real,
+        // CA-issued cert and verifies against the system roots with no cafile.
+        if let Some(cert) = std::env::var("HAIVE_CAFILE")
+            .ok()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|p| reqwest::Certificate::from_pem(&p).ok())
+        {
+            b = b.add_root_certificate(cert);
+        }
+        // TLS verification is ON by default now. Previously it was silently DISABLED
+        // whenever no cafile was set — a MITM of the entire control channel. Insecure
+        // mode is now an explicit, logged opt-in for self-signed LAN use only.
+        if std::env::var("HAIVE_INSECURE_TLS").ok().as_deref() == Some("1") {
+            eprintln!("warning: TLS verification DISABLED (HAIVE_INSECURE_TLS=1) — LAN use only");
+            b = b.danger_accept_invalid_certs(true);
         }
         Self {
             tool_router: Self::tool_router(),
