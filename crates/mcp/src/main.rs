@@ -345,7 +345,7 @@ impl Srv {
         Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
-    #[tool(description = "Run a shell command on the named device and return its output.")]
+    #[tool(description = "Run a shell command on the named device and return its output. Windows caveat: the typed-input path can drop `$`, `%`, and quote characters (and cmd.exe expands `%VAR%`), so a PowerShell command with variables or quotes may echo instead of run — wrap it as `powershell -NoProfile -EncodedCommand <base64-UTF16LE-of-the-command>` (base64 contains none of those characters) to run it verbatim.")]
     async fn run_command(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
         let out: serde_json::Value = match self.try_direct_exec(&target, &a.command, a.detach).await {
