@@ -171,14 +171,24 @@ fn appx_runtime_available() -> bool {
 /// HRESULT). Returns `Ok(true)` when the deployment HRESULT is success.
 fn register_app_installer() -> Result<bool, String> {
     use windows::core::HSTRING;
-    use windows::Management::Deployment::{DeploymentOptions, PackageManager};
+    use windows::Foundation::Collections::IIterable;
+    use windows::Management::Deployment::{DeploymentOptions, PackageManager, PackageVolume};
 
     let pm = PackageManager::new().map_err(|e| format!("PackageManager init failed: {e}"))?;
     let family = HSTRING::from(APP_INSTALLER_FAMILY);
 
+    // windows 0.59 exposes this as RegisterPackageByFamilyNameAndOptionalPackagesAsync
+    // (5 args): no dependency families, default options, no app-data volume, no
+    // optional packages. Optional WinRT params are passed as typed `None`.
     let op = pm
-        .RegisterPackageByFamilyNameAsync(&family, None, DeploymentOptions::default())
-        .map_err(|e| format!("RegisterPackageByFamilyNameAsync call failed: {e}"))?;
+        .RegisterPackageByFamilyNameAndOptionalPackagesAsync(
+            &family,
+            None::<&IIterable<HSTRING>>,
+            DeploymentOptions::default(),
+            None::<&PackageVolume>,
+            None::<&IIterable<HSTRING>>,
+        )
+        .map_err(|e| format!("RegisterPackageByFamilyName… call failed: {e}"))?;
     let result = op
         .get()
         .map_err(|e| format!("awaiting registration failed: {e}"))?;
@@ -204,6 +214,7 @@ fn register_app_installer() -> Result<bool, String> {
 /// success HRESULT.
 fn install_app_installer() -> Result<bool, String> {
     use windows::core::HSTRING;
+    use windows::Foundation::Collections::IIterable;
     use windows::Foundation::Uri;
     use windows::Management::Deployment::{DeploymentOptions, PackageManager};
 
@@ -219,7 +230,7 @@ fn install_app_installer() -> Result<bool, String> {
         .map_err(|e| format!("building file:// URI failed: {e}"))?;
 
     let op = pm
-        .AddPackageAsync(&uri, None, DeploymentOptions::default())
+        .AddPackageAsync(&uri, None::<&IIterable<Uri>>, DeploymentOptions::default())
         .map_err(|e| format!("AddPackageAsync call failed: {e}"))?;
     let result = op
         .get()
