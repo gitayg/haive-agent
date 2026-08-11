@@ -861,6 +861,10 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
             "it-ai:probe/encryption" => Some(crate::winprobe::encryption_status()),
             "it-ai:probe/firewall" => Some(crate::winprobe::firewall_status()),
             "it-ai:probe/empty_recycle_bin" => Some(crate::winprobe::empty_recycle_bin()),
+            // Native OS-update (Windows Update Agent) check/install — winget does
+            // apps, not OS patches, so these use the WUA COM API instead.
+            "it-ai:os-updates/check" => Some(crate::winupdate::check_updates()),
+            "it-ai:os-updates/install" => Some(crate::winupdate::install_updates()),
             _ => None,
         };
         if let Some(stdout) = native {
@@ -868,6 +872,17 @@ fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
                 &serde_json::json!({"ok": true, "code": 0, "stdout": stdout, "stderr": "", "truncated": false}),
                 200,
             );
+        }
+        // Bootstrap winget on demand: if the hub asks us to run a `winget …` command
+        // and winget isn't installed (Server / LTSC / freshly-imaged), install it
+        // natively (AppX API, per-user, no elevation) before running the command.
+        if cmd.split_whitespace().next() == Some("winget") && !crate::winbootstrap::have_winget() {
+            if let Err(e) = crate::winbootstrap::ensure_winget() {
+                return json_resp(
+                    &serde_json::json!({"ok": true, "code": 1, "stdout": "", "stderr": e, "truncated": false}),
+                    200,
+                );
+            }
         }
     }
     // Fire-and-forget launch (e.g. a GUI app) must NOT block the exec/relay channel.

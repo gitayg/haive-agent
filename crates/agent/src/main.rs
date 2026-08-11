@@ -22,6 +22,10 @@ mod wayland;
 mod winsession;
 #[cfg(windows)]
 mod winprobe;
+#[cfg(windows)]
+mod winbootstrap;
+#[cfg(windows)]
+mod winupdate;
 
 use std::sync::{mpsc, Arc};
 use std::time::Duration;

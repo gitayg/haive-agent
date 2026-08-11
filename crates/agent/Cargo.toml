@@ -68,6 +68,18 @@ windows-sys = { version = "0.59", features = [
     # winprobe.rs: SHEmptyRecycleBinW + SHERB_* flags (empty-Recycle-Bin fix)
     "Win32_UI_Shell",
 ] }
+# winbootstrap.rs (native winget bootstrap via the WinRT AppX PackageManager) +
+# winupdate.rs (native OS-update check/install via the Windows Update Agent COM
+# API). Pinned to 0.59 to match the `windows` bindings `wmi` already pulls in
+# (avoids a second copy in the tree).
+windows = { version = "0.59", features = [
+    "Management_Deployment",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_UpdateAgent",
+] }
 
 # Wayland screen capture on GNOME/KDE (no wlr-screencopy): the xdg-desktop-portal
 # ScreenCast API (D-Bus, via zbus blocking) hands us a PipeWire fd + node, which
