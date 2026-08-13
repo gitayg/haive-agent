@@ -48,14 +48,18 @@ fn icon() -> Option<Icon> {
 }
 
 fn run(port: u16) {
-    let url = format!("http://127.0.0.1:{port}/chat");
+    let chat_url = format!("http://127.0.0.1:{port}/chat");
+    let admin_url = format!("http://127.0.0.1:{port}/request-admin");
 
     let menu = Menu::new();
     let open_item = MenuItem::new("Ask AI…", true, None);
+    let admin_item = MenuItem::new("Request Admin…", true, None);
     let quit_item = MenuItem::new("Quit IT-AI", true, None);
     let _ = menu.append(&open_item);
+    let _ = menu.append(&admin_item);
     let _ = menu.append(&quit_item);
     let open_id = open_item.id().clone();
+    let admin_id = admin_item.id().clone();
     let quit_id = quit_item.id().clone();
 
     let event_loop = EventLoopBuilder::new().with_any_thread(true).build();
@@ -71,50 +75,64 @@ fn run(port: u16) {
     let menu_rx = MenuEvent::receiver();
     let tray_rx = TrayIconEvent::receiver();
 
-    let mut win: Option<(Window, WebView)> = None;
+    let mut chat_win: Option<(Window, WebView)> = None;
+    let mut admin_win: Option<(Window, WebView)> = None;
 
     event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
-        // Clicking the window's X fires CloseRequested. Without handling it the X
-        // does nothing. Hide instead of destroy so "Ask AI" reopens with the
-        // conversation intact.
-        if let tao::event::Event::WindowEvent { event: tao::event::WindowEvent::CloseRequested, .. } = &event {
-            if let Some((w, _)) = &win {
-                w.set_visible(false);
+        // Clicking a window's X fires CloseRequested. Without handling it the X
+        // does nothing. Hide instead of destroy so reopening keeps the window's
+        // state intact. The event carries the window id, so hide whichever matches.
+        if let tao::event::Event::WindowEvent { window_id, event: tao::event::WindowEvent::CloseRequested, .. } = &event {
+            for slot in [&chat_win, &admin_win] {
+                if let Some((w, _)) = slot {
+                    if w.id() == *window_id {
+                        w.set_visible(false);
+                    }
+                }
             }
         }
 
         while let Ok(ev) = menu_rx.try_recv() {
             if ev.id == open_id {
-                open_chat(&mut win, target, &url);
+                open_window(&mut chat_win, target, &chat_url, "IT-AI — IT Assistant", 420.0, 640.0);
+            } else if ev.id == admin_id {
+                open_window(&mut admin_win, target, &admin_url, "IT-AI — Request Admin", 400.0, 480.0);
             } else if ev.id == quit_id {
                 tray.take();
                 std::process::exit(0);
             }
         }
         while let Ok(_ev) = tray_rx.try_recv() {
-            open_chat(&mut win, target, &url);
+            open_window(&mut chat_win, target, &chat_url, "IT-AI — IT Assistant", 420.0, 640.0);
         }
     });
 }
 
-fn open_chat(win: &mut Option<(Window, WebView)>, target: &EventLoopWindowTarget<()>, url: &str) {
-    if let Some((w, _)) = win {
-        w.set_visible(true);
-        w.set_focus();
+fn open_window(
+    slot: &mut Option<(Window, WebView)>,
+    target: &EventLoopWindowTarget<()>,
+    url: &str,
+    title: &str,
+    w: f64,
+    h: f64,
+) {
+    if let Some((win, _)) = slot {
+        win.set_visible(true);
+        win.set_focus();
         return;
     }
     let window = match WindowBuilder::new()
-        .with_title("IT-AI — IT Assistant")
-        .with_inner_size(LogicalSize::new(420.0, 640.0))
+        .with_title(title)
+        .with_inner_size(LogicalSize::new(w, h))
         .build(target)
     {
-        Ok(w) => w,
+        Ok(win) => win,
         Err(_) => return,
     };
     match wry::WebViewBuilder::new(&window).with_url(url).build() {
-        Ok(webview) => *win = Some((window, webview)),
+        Ok(webview) => *slot = Some((window, webview)),
         Err(_) => {}
     }
 }

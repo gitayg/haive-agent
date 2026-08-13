@@ -42,6 +42,12 @@ fn ai_apply_forward(req: &mut Request) -> Resp {
     ai_forward(req, "ai-apply")
 }
 
+/// Forward a user-initiated local-admin request up to the hub. The agent only
+/// carries the request; the hub decides whether to grant/deny (out of scope here).
+fn request_admin_forward(req: &mut Request) -> Resp {
+    ai_forward(req, "request-elevation")
+}
+
 /// Forward a tray-chat request out through the relay to the hub's cloud AI. The hub
 /// owns the API key and the tool loop; the endpoint never sees the key. `endpoint`
 /// picks the hub route: `ai-chat` (diagnose) or `ai-apply` (run an approved fix).
@@ -119,6 +125,57 @@ add('bot',md(j.reply||'(no answer)'));if(j.proposals&&j.proposals.length){j.prop
 function proposal(p){var card=add('bot fix','');var t=document.createElement('div');t.className='fx-t';t.innerHTML='&#128295; '+esc(p.title||'Proposed fix');var x=document.createElement('div');x.className='fx-x';x.textContent=p.explanation||'';var c=document.createElement('div');c.className='fx-c';c.textContent=p.command||'';var row=document.createElement('div');row.className='fx-row';var ap=document.createElement('button');ap.className='fx-ap';ap.textContent='Apply';var sk=document.createElement('button');sk.className='fx-sk';sk.textContent='Skip';ap.onclick=function(){apply(p,ap,sk,row);};sk.onclick=function(){row.innerHTML='<span class="fx-sk-d">Skipped</span>';};row.appendChild(ap);row.appendChild(sk);card.appendChild(t);card.appendChild(x);card.appendChild(c);card.appendChild(row);log.scrollTop=log.scrollHeight;}
 function apply(p,ap,sk,row){ap.disabled=true;sk.disabled=true;ap.textContent='Applying…';fetch('/ai/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:p.kind,arg:p.arg||''})}).then(function(r){return r.json();}).then(function(j){var res=document.createElement('div');if(!j.ok){res.className='fx-res bad';res.textContent='⚠ '+(j.error||'failed');}else{res.className='fx-res ok';res.innerHTML='✓ Applied'+(j.output&&j.output.trim()?('<pre class="fx-out">'+esc(j.output)+'</pre>'):'');}row.replaceWith(res);log.scrollTop=log.scrollHeight;}).catch(function(e){ap.disabled=false;sk.disabled=false;ap.textContent='Apply';add('bot err','apply error: '+esc(''+e));});}
 send.onclick=go;inp.addEventListener('keydown',function(e){if(e.key==='Enter')go();});
+</script></body></html>"#;
+
+const REQUEST_ADMIN_PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>IT-AI — Request Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#0b0d13;color:#e7ebf2;min-height:100vh;padding:22px 20px}
+h1{font-size:18px;font-weight:600;margin-bottom:8px}
+.intro{font-size:13px;line-height:1.55;color:#9fb0c8;margin-bottom:20px}
+label{display:block;font-size:12px;color:#8a93a6;margin:0 0 6px}
+.field{margin-bottom:16px}
+select,textarea{width:100%;background:#0b0d13;border:1px solid #212836;border-radius:10px;padding:10px 12px;color:#e7ebf2;font-size:14px;font-family:inherit}
+select:focus,textarea:focus{outline:none;border-color:#5b9dff}
+textarea{min-height:96px;resize:vertical;line-height:1.5}
+#send{width:100%;background:#5b9dff;color:#fff;border:none;border-radius:10px;padding:11px 18px;font-size:14px;font-weight:600;cursor:pointer}
+#send:disabled{opacity:.5;cursor:default}
+.note{font-size:13px;margin-top:14px;line-height:1.5}
+.note.err{color:#f0a0a0}
+.done{font-size:14px;line-height:1.6;color:#7bd88f}
+.done .sub{display:block;margin-top:8px;color:#9fb0c8;font-size:13px}
+</style></head><body>
+<div id="wrap">
+<h1>&#128272; Request Admin Rights</h1>
+<div class="intro">Ask an administrator for temporary local-admin on this computer. They'll approve or deny it &mdash; nothing changes until they do.</div>
+<div class="field">
+<label for="mins">How long do you need it?</label>
+<select id="mins">
+<option value="15">15 minutes</option>
+<option value="30" selected>30 minutes</option>
+<option value="60">1 hour</option>
+<option value="120">2 hours</option>
+</select>
+</div>
+<div class="field">
+<label for="reason">Reason</label>
+<textarea id="reason" placeholder="Why do you need admin? (e.g. install a printer driver)"></textarea>
+</div>
+<button id="send">Send request</button>
+<div id="note" class="note"></div>
+</div>
+<script>
+var wrap=document.getElementById('wrap'),send=document.getElementById('send'),mins=document.getElementById('mins'),reason=document.getElementById('reason'),note=document.getElementById('note');
+function esc(t){return (t+'').replace(/[&<>]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;'}[c];});}
+send.onclick=function(){
+note.className='note';note.textContent='';
+send.disabled=true;send.textContent='Sending…';
+fetch('/request-admin',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({minutes:parseInt(mins.value,10),reason:reason.value})}).then(function(r){return r.json();}).then(function(j){
+if(j&&j.ok){wrap.innerHTML='<h1>&#128272; Request Admin Rights</h1><div class="done">&#10003; Request sent &mdash; waiting for an administrator to approve.<span class="sub">You can close this window.</span></div>';return;}
+send.disabled=false;send.textContent='Send request';
+note.className='note err';note.textContent='⚠ '+esc((j&&j.error)||'Request failed. Please try again.');
+}).catch(function(e){send.disabled=false;send.textContent='Send request';note.className='note err';note.textContent='⚠ '+esc(''+e);});
+};
 </script></body></html>"#;
 
 pub struct Config {
@@ -300,6 +357,8 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
     let resp = match (&method, path.as_str()) {
         (Method::Get, "/") => Response::from_string(PAGE).with_header(hdr("Content-Type", "text/html")),
         (Method::Get, "/chat") => Response::from_string(CHAT_PAGE).with_header(hdr("Content-Type", "text/html")),
+        (Method::Get, "/request-admin") => Response::from_string(REQUEST_ADMIN_PAGE).with_header(hdr("Content-Type", "text/html")),
+        (Method::Post, "/request-admin") => request_admin_forward(&mut req),
         (Method::Post, "/ai/chat") => ai_chat_forward(&mut req),
         (Method::Post, "/ai/apply") => ai_apply_forward(&mut req),
         (Method::Get, "/frame") => frame_ep(cfg),
