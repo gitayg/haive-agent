@@ -419,12 +419,42 @@ fn camera_presence(_capturable: &[String]) -> Vec<String> {
     Vec::new()
 }
 
+/// Microphone names via cpal's default host (WASAPI on Windows, CoreAudio on
+/// macOS). NOT compiled on Linux — cpal links libasound.so.2 there, a hard
+/// load-time dependency that breaks minimal hosts; see the Linux variant below.
+#[cfg(not(target_os = "linux"))]
 fn mics() -> Vec<String> {
     use cpal::traits::{DeviceTrait, HostTrait};
     let mut names: Vec<String> = match cpal::default_host().input_devices() {
         Ok(it) => it.filter_map(|d| d.name().ok()).collect(),
         Err(_) => Vec::new(),
     };
+    names.retain(|n| !n.trim().is_empty());
+    names.dedup();
+    names
+}
+
+/// Microphone names on Linux WITHOUT cpal, so the binary carries no
+/// libasound.so.2 dependency and starts on WSL/containers/headless hosts. Reads
+/// the kernel's ALSA proc interface (populated by the snd driver, independent of
+/// the userspace libasound package): each `/proc/asound/pcm` line is
+/// `NN-MM: <id> : <name> : playback P : capture C` — we keep the capture-capable
+/// ones. No sound driver (typical WSL) → the file is absent → empty list, and the
+/// agent runs fine with no microphones reported.
+#[cfg(target_os = "linux")]
+fn mics() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(pcm) = std::fs::read_to_string("/proc/asound/pcm") {
+        for line in pcm.lines() {
+            if !line.contains("capture") {
+                continue;
+            }
+            let fields: Vec<&str> = line.split(':').map(|s| s.trim()).collect();
+            if let Some(name) = fields.get(1).filter(|s| !s.is_empty()) {
+                names.push((*name).to_string());
+            }
+        }
+    }
     names.retain(|n| !n.trim().is_empty());
     names.dedup();
     names

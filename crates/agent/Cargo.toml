@@ -28,7 +28,6 @@ ureq = { version = "2", features = ["json"] }
 ed25519-dalek = "2"
 sysinfo = "0.33"
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
-cpal = "0.15"
 self-replace = "1"
 portable-pty = "0.8"
 
@@ -36,6 +35,15 @@ portable-pty = "0.8"
 # closing (the Unix analog of the Windows job-breakaway below).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# cpal (microphone enumeration) links the platform audio lib: WASAPI/CoreAudio on
+# Windows/macOS (fine), but ALSA's libasound.so.2 on Linux — a hard load-time
+# dependency that makes the binary fail to even start on minimal hosts (WSL,
+# containers, headless servers) that lack the ALSA runtime. So cpal is non-Linux
+# only; Linux enumerates mics from the kernel's /proc/asound interface instead,
+# which needs no userspace lib. Same reasoning as the enigo/libxdo note above.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+cpal = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
