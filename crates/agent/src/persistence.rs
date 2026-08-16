@@ -233,6 +233,11 @@ fn win_install_service(exe: &Path, args: &[String]) {
     let _ = std::process::Command::new("schtasks")
         .args(["/Create", "/TN", "IT-AI", "/TR", &tr, "/SC", "ONLOGON", "/RL", "HIGHEST", "/F"])
         .status();
+    // Start it now so the agent runs immediately (elevated, in the current user
+    // session), not only after the next logon. Best-effort.
+    let _ = std::process::Command::new("schtasks")
+        .args(["/Run", "/TN", "IT-AI"])
+        .status();
 }
 
 #[cfg(windows)]

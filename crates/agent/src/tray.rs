@@ -10,7 +10,7 @@ use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopWindowTarget};
 use tao::platform::windows::EventLoopBuilderExtWindows;
 use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, TrayIconBuilder};
 use wry::WebView;
 
 /// Start the tray on a background thread. Waits for the loopback server to bind so
@@ -65,15 +65,18 @@ fn run(port: u16) {
     let event_loop = EventLoopBuilder::new().with_any_thread(true).build();
 
     // Keep the tray alive for the loop's lifetime.
+    // Both left- AND right-click open the context menu, so clicking the icon lets
+    // the user pick an action (Ask AI / Request Admin / Quit) instead of a click
+    // firing one hardcoded action.
     let mut tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("IT-AI — Ask AI")
+        .with_menu_on_left_click(true)
+        .with_tooltip("IT-AI — click for actions")
         .with_icon(icon().unwrap_or_else(|| Icon::from_rgba(vec![91, 157, 255, 255], 1, 1).unwrap()))
         .build()
         .ok();
 
     let menu_rx = MenuEvent::receiver();
-    let tray_rx = TrayIconEvent::receiver();
 
     let mut chat_win: Option<(Window, WebView)> = None;
     let mut admin_win: Option<(Window, WebView)> = None;
@@ -103,9 +106,6 @@ fn run(port: u16) {
                 tray.take();
                 std::process::exit(0);
             }
-        }
-        while let Ok(_ev) = tray_rx.try_recv() {
-            open_window(&mut chat_win, target, &chat_url, "IT-AI — IT Assistant", 420.0, 640.0);
         }
     });
 }

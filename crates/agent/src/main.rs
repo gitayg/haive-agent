@@ -520,10 +520,16 @@ fn main() {
     let grabber = capture::Grabber { index: monitor };
     let geo = grabber.geometry();
 
-    let lifetime = if args.install {
+    if args.install {
+        // Install the elevated logon task, start it now (so it's running without
+        // waiting for the next logon), then EXIT — the task owns the long-running
+        // agent from here. Staying to also run in the foreground blocked the shell
+        // and left two instances fighting over the tunnel.
         persistence::install_service(&persist_args());
-        "installed (service — starts at logon/boot, self-restarting)".to_string()
-    } else if args.persist {
+        println!("IT-AI installed as an elevated service — starts at logon, self-restarting, and started now. You can close this window.");
+        return;
+    }
+    let lifetime = if args.persist {
         persistence::install(&persist_args());
         "persistent (autostart at login)".to_string()
     } else if let Some(mins) = args.ttl {
