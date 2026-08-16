@@ -81,6 +81,37 @@ jobs:
             cp "${dir}/${b}${{ matrix.ext }}" "out/${b}-${{ matrix.suffix }}${{ matrix.ext }}"
           done
 
+      # A .deb so `apt install ./it-ai-linux.deb` pulls the agent's runtime libs
+      # automatically (the screen-capture stack: libgbm/libwayland/libpipewire/
+      # libxcb) instead of failing at load with "cannot open shared object file"
+      # on a box that lacks them. Depends mirror the binary's ELF NEEDED entries.
+      - name: Package .deb (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          dir="target/${{ matrix.triple }}/release"
+          arch="amd64"; [ "${{ matrix.suffix }}" = "linux-arm64" ] && arch="arm64"
+          ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          root="debpkg"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin"
+          cp "${dir}/it-ai" "$root/usr/bin/it-ai"
+          chmod 755 "$root/usr/bin/it-ai"
+          {
+            echo "Package: it-ai"
+            echo "Version: ${ver}"
+            echo "Architecture: ${arch}"
+            echo "Maintainer: gitayg <gitayg@gmail.com>"
+            echo "Depends: libc6, libgbm1, libwayland-client0, libpipewire-0.3-0, libxcb1"
+            echo "Section: admin"
+            echo "Priority: optional"
+            echo "Homepage: https://github.com/gitayg/haive-agent"
+            echo "Description: IT-AI endpoint agent"
+            echo " Self-hosted, LAN-first + reverse-tunnel remote administration agent."
+          } > "$root/DEBIAN/control"
+          dpkg-deb --build --root-owner-group "$root" "out/it-ai-${{ matrix.suffix }}.deb"
+          dpkg-deb -I "out/it-ai-${{ matrix.suffix }}.deb"
+          ls -l out
+
       # Detached ed25519 signatures for the verified self-update path: the agent
       # only self-replaces with a binary whose <asset>.sig verifies against the
       # public key pinned in crates/agent/src/http.rs (UPDATE_PUBKEY). The private
