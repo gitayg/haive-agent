@@ -32,6 +32,28 @@ fn wmi(namespace: &str) -> Option<WMIConnection> {
     WMIConnection::with_namespace_path(namespace, com).ok()
 }
 
+// ── display ──────────────────────────────────────────────────────────────────
+
+/// True when Windows reports NO physical display attached — a closed laptop lid,
+/// a powered-off panel, or a headless box. Desktop Duplication then has nothing
+/// to duplicate and every screen grab fails, so this turns an opaque capture
+/// error into an actionable one.
+///
+/// Measured on two live machines before choosing this signal: a lid-closed laptop
+/// reports 0 `WmiMonitorID` instances while a working box reports 1. Two
+/// tempting alternatives were REJECTED because they don't discriminate:
+/// `Win32_DesktopMonitor.Availability` was 8 ("Off Line") on BOTH, and
+/// `GetSystemMetrics(SM_CMONITORS)` still counts a logical monitor with the panel
+/// off. Conservative on failure: if the query itself fails we return false, so a
+/// WMI hiccup never invents a wrong diagnosis.
+pub fn no_display() -> bool {
+    let Some(conn) = wmi(r"root\wmi") else { return false };
+    match conn.raw_query::<std::collections::HashMap<String, Variant>>("SELECT InstanceName FROM WmiMonitorID") {
+        Ok(rows) => rows.is_empty(),
+        Err(_) => false,
+    }
+}
+
 // ── av ───────────────────────────────────────────────────────────────────────
 
 /// Antivirus posture. Matches the retired

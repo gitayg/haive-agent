@@ -17,14 +17,13 @@ pub struct Grabber {
 /// service, so the operator sees THIS instead of "helper exited 1".
 pub const NO_DISPLAY: &str = "no active display — the screen is off, the laptop lid is closed, or no monitor is attached, so Windows has no desktop image to capture. Open the lid or attach a display, then retry. (Everything else on this device still works.)";
 
-/// True when the session has zero display monitors. MUST be called from the
-/// session that owns the desktop: a session-0 service always sees 0, which would
-/// be a false positive — hence it's only consulted on a failed grab in the
-/// capturing session (the `--capture-once` helper, or a user-session agent).
+/// True when no physical display is attached (see `winprobe::no_display`). WMI is
+/// machine-wide, so this is valid from any session — including a session-0
+/// service, unlike the desktop-scoped GetSystemMetrics(SM_CMONITORS), which still
+/// counts a logical monitor when the panel is off and so missed this case.
 #[cfg(windows)]
 pub fn no_display() -> bool {
-    // SM_CMONITORS: number of display monitors on the desktop.
-    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows_sys::Win32::UI::WindowsAndMessaging::SM_CMONITORS) == 0 }
+    crate::winprobe::no_display()
 }
 
 /// Run a capture-stack call, turning a PANIC into None.

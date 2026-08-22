@@ -177,8 +177,10 @@ unsafe fn run_in_active_session(cmdline: &str) -> Result<(), String> {
         let mut code: u32 = 1;
         GetExitCodeProcess(pi.hProcess, &mut code);
         // 2 = the helper reached the user's session fine but there is no display
-        // to capture (lid closed / screen off / headless). Report the real cause.
-        if code == 2 {
+        // to capture. Also ask directly (WMI is machine-wide, so this works from
+        // session 0) — that way ANY helper failure on a screenless box reports the
+        // real cause rather than a bare exit code.
+        if code == 2 || (code != 0 && crate::capture::no_display()) {
             result = Err(crate::capture::NO_DISPLAY.to_string());
         } else if code != 0 {
             result = Err(format!("helper exited {code} (capture failed in session {session})"));
