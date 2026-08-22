@@ -112,6 +112,50 @@ jobs:
           dpkg-deb -I "out/it-ai-${{ matrix.suffix }}.deb"
           ls -l out
 
+      # Developer-ID sign + notarize the macOS binaries BEFORE the ed25519 step,
+      # so the self-update signature is computed over the FINAL (Apple-signed)
+      # bytes and still verifies. No-op unless the signing secrets are present, so
+      # a build without them still succeeds (unsigned, exactly as before). To turn
+      # it on, add these repo secrets: MACOS_CERT_P12_BASE64 (base64 of the
+      # Developer ID Application .p12), MACOS_CERT_PASSWORD, MACOS_NOTARY_KEY_BASE64
+      # (base64 of the App Store Connect API .p8), MACOS_NOTARY_KEY_ID,
+      # MACOS_NOTARY_ISSUER_ID, and optionally MACOS_SIGN_IDENTITY.
+      - name: Sign + notarize (macOS Developer ID)
+        if: startsWith(matrix.os, 'macos') && startsWith(github.ref, 'refs/tags/')
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          if [ -z "$MACOS_CERT_P12_BASE64" ] || [ -z "$MACOS_NOTARY_KEY_BASE64" ]; then
+            echo "::warning::macOS signing secrets not set — publishing UNSIGNED mac binaries (Gatekeeper will not trust them)."
+            exit 0
+          fi
+          IDENTITY="${MACOS_SIGN_IDENTITY:-Developer ID Application: Itay Glick (DA4PX65QXV)}"
+          KC="$RUNNER_TEMP/sign.keychain-db"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p ci "$KC"
+          echo "$MACOS_CERT_P12_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" login.keychain-db
+          for b in out/it-ai-macos out/itai-macos out/it-ai-mcp-macos; do
+            [ -f "$b" ] || continue
+            codesign --force --timestamp --options runtime --sign "$IDENTITY" "$b"
+            codesign --verify --strict --verbose=2 "$b"
+          done
+          # Notarize (bare CLI binaries can't be stapled — the ticket is checked
+          # online; zip is only the upload transport).
+          echo "$MACOS_NOTARY_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/notary.p8"
+          ( cd out && zip -q mac-notarize.zip it-ai-macos itai-macos it-ai-mcp-macos )
+          xcrun notarytool submit out/mac-notarize.zip \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" --wait
+          rm -f out/mac-notarize.zip "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
+
       # Detached ed25519 signatures for the verified self-update path: the agent
       # only self-replaces with a binary whose <asset>.sig verifies against the
       # public key pinned in crates/agent/src/http.rs (UPDATE_PUBKEY). The private
