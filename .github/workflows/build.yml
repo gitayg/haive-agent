@@ -115,26 +115,28 @@ jobs:
       # Developer-ID sign + notarize the macOS binaries BEFORE the ed25519 step,
       # so the self-update signature is computed over the FINAL (Apple-signed)
       # bytes and still verifies. No-op unless the signing secrets are present, so
-      # a build without them still succeeds (unsigned, exactly as before). To turn
-      # it on, add these repo secrets: MACOS_CERT_P12_BASE64 (base64 of the
-      # Developer ID Application .p12), MACOS_CERT_PASSWORD, MACOS_NOTARY_KEY_BASE64
-      # (base64 of the App Store Connect API .p8), MACOS_NOTARY_KEY_ID,
-      # MACOS_NOTARY_ISSUER_ID, and optionally MACOS_SIGN_IDENTITY.
+      # a build without them still succeeds (unsigned, exactly as before). Uses the
+      # SAME notarization method + creds as MoorAI's local `npm run release`
+      # (APPLE_ID + app-specific APPLE_PASSWORD + APPLE_TEAM_ID), so you reuse the
+      # exact values you already have. To turn it on, add these repo secrets:
+      # MACOS_CERT_P12_BASE64 (base64 of the Developer ID Application .p12),
+      # MACOS_CERT_PASSWORD, APPLE_ID, APPLE_PASSWORD (app-specific), APPLE_TEAM_ID,
+      # and optionally APPLE_SIGNING_IDENTITY (defaults to the Developer ID below).
       - name: Sign + notarize (macOS Developer ID)
         if: startsWith(matrix.os, 'macos') && startsWith(github.ref, 'refs/tags/')
         env:
           MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
-          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          if [ -z "$MACOS_CERT_P12_BASE64" ] || [ -z "$MACOS_NOTARY_KEY_BASE64" ]; then
+          if [ -z "$MACOS_CERT_P12_BASE64" ] || [ -z "$APPLE_ID" ] || [ -z "$APPLE_PASSWORD" ]; then
             echo "::warning::macOS signing secrets not set — publishing UNSIGNED mac binaries (Gatekeeper will not trust them)."
             exit 0
           fi
-          IDENTITY="${MACOS_SIGN_IDENTITY:-Developer ID Application: Itay Glick (DA4PX65QXV)}"
+          IDENTITY="${APPLE_SIGNING_IDENTITY:-Developer ID Application: Itay Glick (DA4PX65QXV)}"
           KC="$RUNNER_TEMP/sign.keychain-db"
           security create-keychain -p ci "$KC"
           security set-keychain-settings -lut 21600 "$KC"
@@ -150,11 +152,10 @@ jobs:
           done
           # Notarize (bare CLI binaries can't be stapled — the ticket is checked
           # online; zip is only the upload transport).
-          echo "$MACOS_NOTARY_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/notary.p8"
           ( cd out && zip -q mac-notarize.zip it-ai-macos itai-macos it-ai-mcp-macos )
           xcrun notarytool submit out/mac-notarize.zip \
-            --key "$RUNNER_TEMP/notary.p8" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" --wait
-          rm -f out/mac-notarize.zip "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          rm -f out/mac-notarize.zip "$RUNNER_TEMP/cert.p12"
 
       # Detached ed25519 signatures for the verified self-update path: the agent
       # only self-replaces with a binary whose <asset>.sig verifies against the
