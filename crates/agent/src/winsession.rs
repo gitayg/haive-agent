@@ -176,7 +176,11 @@ unsafe fn run_in_active_session(cmdline: &str) -> Result<(), String> {
         WaitForSingleObject(pi.hProcess, 15_000);
         let mut code: u32 = 1;
         GetExitCodeProcess(pi.hProcess, &mut code);
-        if code != 0 {
+        // 2 = the helper reached the user's session fine but there is no display
+        // to capture (lid closed / screen off / headless). Report the real cause.
+        if code == 2 {
+            result = Err(crate::capture::NO_DISPLAY.to_string());
+        } else if code != 0 {
             result = Err(format!("helper exited {code} (capture failed in session {session})"));
         }
         CloseHandle(pi.hThread);

@@ -75,6 +75,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     # winprobe.rs: SHEmptyRecycleBinW + SHERB_* flags (empty-Recycle-Bin fix)
     "Win32_UI_Shell",
+    # capture.rs: GetSystemMetrics(SM_CMONITORS) — distinguishes "no display to
+    # capture" (lid closed / screen off / headless) from a real capture failure.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # winbootstrap.rs (native winget bootstrap via the WinRT AppX PackageManager) +
 # winupdate.rs (native OS-update check/install via the Windows Update Agent COM

@@ -8,6 +8,25 @@ pub struct Grabber {
     pub index: usize,
 }
 
+/// Why a capture failed when the machine simply has no screen to copy. Windows
+/// composes the desktop through a display output; with the lid shut, the panel
+/// powered off, or no monitor attached at all, Desktop Duplication has nothing to
+/// duplicate and every grab fails — while the rest of the agent (telemetry, shell,
+/// files) keeps working, which otherwise looks like a baffling "screen is broken".
+/// Exit code 2 from `--capture-once` carries this same case up to a session-0
+/// service, so the operator sees THIS instead of "helper exited 1".
+pub const NO_DISPLAY: &str = "no active display — the screen is off, the laptop lid is closed, or no monitor is attached, so Windows has no desktop image to capture. Open the lid or attach a display, then retry. (Everything else on this device still works.)";
+
+/// True when the session has zero display monitors. MUST be called from the
+/// session that owns the desktop: a session-0 service always sees 0, which would
+/// be a false positive — hence it's only consulted on a failed grab in the
+/// capturing session (the `--capture-once` helper, or a user-session agent).
+#[cfg(windows)]
+pub fn no_display() -> bool {
+    // SM_CMONITORS: number of display monitors on the desktop.
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows_sys::Win32::UI::WindowsAndMessaging::SM_CMONITORS) == 0 }
+}
+
 /// Run a capture-stack call, turning a PANIC into None.
 ///
 /// xcap's Wayland backend (libwayshot) panics instead of returning Err on
@@ -74,6 +93,10 @@ impl Grabber {
                 }
                 Err(e) => Err(e.message()),
             };
+        }
+        #[cfg(windows)]
+        if no_display() {
+            return Err(NO_DISPLAY.to_string());
         }
         Err("capture failed".to_string())
     }

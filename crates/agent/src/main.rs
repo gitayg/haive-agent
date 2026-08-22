@@ -486,7 +486,13 @@ fn main() {
                 let _ = std::fs::write(&file, bytes);
                 std::process::exit(0);
             }
-            Err(_) => std::process::exit(1),
+            // Exit 2 = "there is no display to capture", so the session-0 service
+            // that spawned us can report that precisely instead of a bare
+            // "helper exited 1". Any other failure stays exit 1.
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(if e == capture::NO_DISPLAY { 2 } else { 1 });
+            }
         }
     }
 

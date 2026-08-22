@@ -661,6 +661,9 @@ fn frame_ep(cfg: &Config) -> Resp {
     if crate::winsession::is_session0() {
         return match crate::winsession::capture_once() {
             Ok(bytes) => Response::from_data(bytes).with_header(hdr("Content-Type", "image/jpeg")),
+            // The no-display case isn't a session-0 problem — surface it verbatim
+            // rather than burying the real cause behind a delegation prefix.
+            Err(reason) if reason == crate::capture::NO_DISPLAY => Response::from_string(reason).with_status_code(500),
             Err(reason) => Response::from_string(format!("Windows session 0 capture: {reason}")).with_status_code(500),
         };
     }
