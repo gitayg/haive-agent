@@ -17,6 +17,69 @@ pub struct Grabber {
 /// service, so the operator sees THIS instead of "helper exited 1".
 pub const NO_DISPLAY: &str = "no active display — the screen is off, the laptop lid is closed, or no monitor is attached, so Windows has no desktop image to capture. Open the lid or attach a display, then retry. (Everything else on this device still works.)";
 
+/// Last-resort Windows capture: a plain GDI BitBlt of the screen DC.
+///
+/// xcap uses DXGI Desktop Duplication, which refuses to produce frames in cases
+/// GDI still copes with (drivers that drop duplication when the panel powers off,
+/// some RDP/virtual-display setups). It's slower and misses hardware overlays, so
+/// it runs ONLY after the fast path fails — it can add a working screenshot, never
+/// downgrade one. An all-black result is treated as failure: on a truly screenless
+/// box GDI returns a black rectangle, and a clear "no display" message beats
+/// silently showing the operator a black screen that looks like a working capture.
+#[cfg(windows)]
+fn gdi_grab() -> Option<image::RgbImage> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, GetDeviceCaps, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        DIB_RGB_COLORS, HORZRES, SRCCOPY, VERTRES,
+    };
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return None;
+        }
+        let (w, h) = (GetDeviceCaps(screen, HORZRES), GetDeviceCaps(screen, VERTRES));
+        let mut out = None;
+        if w > 0 && h > 0 {
+            let mem = CreateCompatibleDC(screen);
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            if !mem.is_null() && !bmp.is_null() {
+                let old = SelectObject(mem, bmp as _);
+                if BitBlt(mem, 0, 0, w, h, screen, 0, 0, SRCCOPY) != 0 {
+                    let mut bi: BITMAPINFO = std::mem::zeroed();
+                    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                    bi.bmiHeader.biWidth = w;
+                    bi.bmiHeader.biHeight = -h; // negative = top-down rows
+                    bi.bmiHeader.biPlanes = 1;
+                    bi.bmiHeader.biBitCount = 32;
+                    bi.bmiHeader.biCompression = BI_RGB as u32;
+                    let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
+                    if GetDIBits(mem, bmp, 0, h as u32, buf.as_mut_ptr() as *mut c_void, &mut bi, DIB_RGB_COLORS) != 0
+                        && buf.iter().any(|&b| b != 0)
+                    {
+                        // GDI hands back BGRA; drop alpha and reorder to RGB.
+                        let mut rgb = Vec::with_capacity((w as usize) * (h as usize) * 3);
+                        for px in buf.chunks_exact(4) {
+                            rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+                        }
+                        out = image::RgbImage::from_raw(w as u32, h as u32, rgb);
+                    }
+                }
+                SelectObject(mem, old);
+            }
+            if !bmp.is_null() {
+                DeleteObject(bmp as _);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
+        }
+        ReleaseDC(std::ptr::null_mut(), screen);
+        out
+    }
+}
+
 /// True when no physical display is attached (see `winprobe::no_display`). WMI is
 /// machine-wide, so this is valid from any session — including a session-0
 /// service, unlike the desktop-scoped GetSystemMetrics(SM_CMONITORS), which still
@@ -92,6 +155,12 @@ impl Grabber {
                 }
                 Err(e) => Err(e.message()),
             };
+        }
+        // Windows: DXGI (via xcap) just failed — try the older GDI path, which
+        // still works on some setups DXGI gives up on.
+        #[cfg(windows)]
+        if let Some(img) = no_panic(gdi_grab) {
+            return Ok(encode_rgb(img, quality, max_width));
         }
         #[cfg(windows)]
         if no_display() {

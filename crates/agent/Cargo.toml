@@ -75,6 +75,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     # winprobe.rs: SHEmptyRecycleBinW + SHERB_* flags (empty-Recycle-Bin fix)
     "Win32_UI_Shell",
+    # capture.rs: GDI BitBlt fallback for when DXGI Desktop Duplication refuses.
+    "Win32_Graphics_Gdi",
 ] }
 # winbootstrap.rs (native winget bootstrap via the WinRT AppX PackageManager) +
 # winupdate.rs (native OS-update check/install via the Windows Update Agent COM
