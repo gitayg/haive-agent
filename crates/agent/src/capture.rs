@@ -39,7 +39,7 @@ fn gdi_grab() -> Option<image::RgbImage> {
         if screen.is_null() {
             return None;
         }
-        let (w, h) = (GetDeviceCaps(screen, HORZRES), GetDeviceCaps(screen, VERTRES));
+        let (w, h) = (GetDeviceCaps(screen, HORZRES as i32), GetDeviceCaps(screen, VERTRES as i32));
         let mut out = None;
         if w > 0 && h > 0 {
             let mem = CreateCompatibleDC(screen);
