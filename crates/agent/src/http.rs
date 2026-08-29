@@ -236,7 +236,7 @@ pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
         Some(s) => Arc::new(s),
         None => {
             eprintln!(
-                "warn: could not bind 0.0.0.0:{} (port in use?) — continuing with relay + loopback only",
+                "warn: could not bind port {} (port in use?) — continuing with relay + loopback only",
                 cfg.port
             );
             // Park the main thread so the process stays alive for the relay loop.
@@ -263,7 +263,18 @@ pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
 /// Bind the public LAN listener, or None if it can't be bound. Never panics —
 /// the caller degrades to relay + loopback rather than killing the agent.
 fn build_server(cfg: &Config) -> Option<Server> {
-    let addr = format!("0.0.0.0:{}", cfg.port);
+    // A relay-enrolled device is driven entirely through the outbound tunnel, so
+    // this public listener is unused attack surface — and it is served by
+    // tiny_http 0.12's `ssl-rustls`, which pins rustls 0.20.9. That has NO fixed
+    // release (RUSTSEC-2024-0336: a peer can wedge `complete_io` in an infinite
+    // loop, burning a thread per connection), and tiny_http 0.12 is the latest
+    // version, so there is nothing to upgrade to. Binding loopback-only in relay
+    // mode keeps that stack off the network entirely. Set HIVE_LAN=1 to restore
+    // the 0.0.0.0 bind for genuine LAN-direct use.
+    let lan_ok = cfg.direct_token.is_empty()
+        || std::env::var("HIVE_LAN").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+    let host = if lan_ok { "0.0.0.0" } else { "127.0.0.1" };
+    let addr = format!("{host}:{}", cfg.port);
     if cfg.tls {
         let (c, k) = cfg.cert.clone()?;
         Server::https(
@@ -341,10 +352,49 @@ fn json_resp(v: &serde_json::Value, code: u16) -> Resp {
         .with_header(hdr("Content-Type", "application/json"))
 }
 
+/// Endpoints that run code, read or write files, drive input, or change the
+/// agent's own lifetime — the ones an attacker actually wants.
+///
+/// Loopback is NOT a credential. Every local process, running as ANY user, can
+/// reach 127.0.0.1, while this agent may itself be running as SYSTEM (service /
+/// `--install`) — so trusting loopback let an unprivileged local user drive
+/// `/exec` at the agent's privilege, i.e. a local privilege escalation. A
+/// relay-enrolled agent already holds a token, so it is required for these paths
+/// even locally. The tray UI is unaffected: it only uses the static pages and the
+/// hub forwarders (`/chat`, `/ai/*`, `/request-admin`), none of which execute
+/// anything on this machine — the work they trigger comes back through the relay,
+/// which presents the token. Screen/camera reads stay loopback-reachable so the
+/// built-in local viewer keeps working.
+fn privileged_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/exec"
+            | "/input"
+            | "/wol"
+            | "/update"
+            | "/dissolve"
+            | "/persist"
+            | "/download"
+            | "/list"
+            | "/upload"
+            | "/fetch-file"
+            | "/file-status"
+            | "/schedule/add"
+            | "/schedule/del"
+            | "/schedule/list"
+    ) || path.starts_with("/shell/")
+}
+
 fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
-    // Loopback (the relay self-call and local tools) is implicitly trusted.
+    let method = req.method().clone();
+    let url = req.url().to_string();
+    let path = url.split('?').next().unwrap_or("/").to_string();
+    // See `privileged_path`: loopback alone authorizes only the harmless local
+    // surface. A LAN-only agent (no relay enrollment, so no token to present)
+    // keeps the old behaviour so local dev is not broken.
     let is_local = req.remote_addr().map(|a| a.ip().is_loopback()).unwrap_or(false);
-    if !is_local && !authorized(&req, cfg) {
+    let local_exempt = is_local && (cfg.direct_token.is_empty() || !privileged_path(&path));
+    if !local_exempt && !authorized(&req, cfg) {
         let _ = req.respond(
             Response::from_string("Authentication required")
                 .with_status_code(401)
@@ -352,9 +402,6 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         );
         return;
     }
-    let method = req.method().clone();
-    let url = req.url().to_string();
-    let path = url.split('?').next().unwrap_or("/").to_string();
     // Live MJPEG streams have their own body type (a Read that never ends), so
     // they can't flow through the `Resp` (Cursor) match below — respond directly.
     if method == Method::Get && path == "/stream" {

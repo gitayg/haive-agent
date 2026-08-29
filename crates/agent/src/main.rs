@@ -176,7 +176,7 @@ fn relaunch_detached() -> bool {
 /// restart keeps the SAME relay id — the hub reuses the device's entry (and its
 /// retained analysis) instead of piling up a new ghost per launch. DefaultHasher
 /// uses fixed keys, so this is stable across runs.
-fn agent_direct_token(relay_token: &str, relay_id: &str) -> String {
+pub(crate) fn agent_direct_token(relay_token: &str, relay_id: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(relay_token.as_bytes());

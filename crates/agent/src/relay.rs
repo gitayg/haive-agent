@@ -132,7 +132,12 @@ fn handle_req(base: &str, relay_id: &str, token: &str, body: &str) {
         return;
     }
 
-    let url = format!("http://127.0.0.1:{lp}{path}");
+    // Present the agent's own direct token: loopback no longer authorizes the
+    // privileged endpoints by itself (see http::privileged_path). It is derived
+    // from the relay credentials we already hold, so no new secret is needed.
+    let dtok = crate::agent_direct_token(token, relay_id);
+    let sep = if path.contains('?') { '&' } else { '?' };
+    let url = format!("http://127.0.0.1:{lp}{path}{sep}dtok={}", urlencode(&dtok));
     let r = ureq::request(&method, &url);
     let sent = match &reqbody {
         Some(b) if ct.is_empty() => r.send_bytes(b),
