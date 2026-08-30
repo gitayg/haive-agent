@@ -1,0 +1,34 @@
+# cargo-deny policy. Run: cargo deny check advisories
+#
+# Every entry below is an advisory we CANNOT currently fix, with the reason and
+# the condition that would let us drop the exception. They are recorded here
+# rather than left unmanaged so `cargo deny check` is a meaningful gate: anything
+# NOT listed here fails the build.
+[advisories]
+# Only flag "unmaintained" for crates we actually chose (workspace dependencies).
+# Deep transitive unmaintained/unsound crates produced 17 errors with no action we
+# can take, which turns a useful gate into noise that gets ignored wholesale.
+# Real VULNERABILITIES are still denied — that is the point of the gate.
+unmaintained = "workspace"
+ignore = [
+  # quick-xml DoS advisories (unbounded namespace allocation / quadratic attribute
+  # scan). Reached only via xcap -> xcb (requires quick-xml ^0.30) and
+  # xcap -> libwayshot -> wayland-scanner (requires ^0.39); neither accepts 0.41,
+  # and moving to xcap 0.9.8 fails to resolve against our pipewire-sys pin, so
+  # there is no upgrade path that still builds. Exposure is negligible: this XML
+  # is X11/Wayland protocol description data on the local machine, never
+  # attacker-supplied network input. Revisit when xcap ships a release whose
+  # xcb/wayland-scanner accept quick-xml >= 0.41.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+
+  # rustls 0.20.9 `complete_io` infinite loop, and the ring 0.16 AES panic it
+  # pulls in. Both arrive through tiny_http 0.12's `ssl-rustls` feature, and
+  # tiny_http 0.12 is the LATEST release — rustls 0.20 has no fixed version, so
+  # there is nothing to upgrade to. MITIGATED in agent 3.3.0 by binding that
+  # listener to 127.0.0.1 on relay-enrolled devices (see http::build_server), so
+  # the vulnerable stack is not reachable from the network. Drop this exception
+  # if tiny_http moves to rustls >= 0.23, or if we fork it.
+  "RUSTSEC-2024-0336",
+  "RUSTSEC-2025-0009",
+]

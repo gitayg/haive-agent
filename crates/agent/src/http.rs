@@ -363,12 +363,19 @@ fn json_resp(v: &serde_json::Value, code: u16) -> Resp {
 /// even locally. The tray UI is unaffected: it only uses the static pages and the
 /// hub forwarders (`/chat`, `/ai/*`, `/request-admin`), none of which execute
 /// anything on this machine — the work they trigger comes back through the relay,
-/// which presents the token. Screen/camera reads stay loopback-reachable so the
-/// built-in local viewer keeps working.
+/// which presents the token. Screen and camera reads are included too: a frame of
+/// someone's desktop is exactly the kind of thing another local user should not be
+/// able to take silently. The built-in viewer page still works over the LAN (the
+/// browser authenticates), and over the relay (which presents the token); only an
+/// unauthenticated local browser hitting 127.0.0.1 loses its live image.
 fn privileged_path(path: &str) -> bool {
     matches!(
         path,
         "/exec"
+            | "/frame"
+            | "/camera"
+            | "/stream"
+            | "/camstream"
             | "/input"
             | "/wol"
             | "/update"
