@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Mouse + keyboard injection on a dedicated thread (enigo is not Send).
 use std::sync::mpsc::Receiver;
 

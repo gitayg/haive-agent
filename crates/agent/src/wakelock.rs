@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Runtime wake lock: while the agent runs, the host must stay reachable, so we
 // tell the OS "don't sleep the system." Unlike the powercfg/pmset scheme changes
 // in persistence.rs, this needs no elevation, applies on every run (even a plain

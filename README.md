@@ -10,7 +10,7 @@ hub itself is separate and private):
 | `it-ai-mcp` | `crates/mcp` | an MCP server your coding agent (Claude Code, etc.) talks to, to drive the fleet |
 | `itai` | `crates/cli` | a small command-line client for the hub |
 
-Everything here is **AGPL-3.0** and built in public CI. Nothing phones home to a hardcoded host:
+Everything here is **MIT** and built in public CI. Nothing phones home to a hardcoded host:
 the hub URL and any token are runtime parameters (`--relay <url>`, `--relay-token <tok>` /
 `HAIVE_HUB`, `HIVE_RELAY_TOKEN`) — there are no embedded endpoints or secrets.
 
@@ -68,4 +68,4 @@ Linux release binaries are cross-linked against glibc 2.31 via `cargo-zigbuild` 
 
 ## License
 
-AGPL-3.0-or-later. See `LICENSE`.
+MIT. See `LICENSE`.

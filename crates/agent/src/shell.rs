@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Interactive shell sessions over a real PTY. A pipe-based shell block-buffers
 // its output (programs only line-buffer when stdout is a TTY), so nothing streams
 // until the buffer fills — useless for interactivity. A PTY makes the shell think

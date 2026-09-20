@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Server-driven agent config: keep the enrollment command minimal and pull the
 // rest (e.g. whether to show the tray icon) from the hub, refreshed periodically.
 use std::sync::atomic::{AtomicBool, Ordering};

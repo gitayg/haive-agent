@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
 // Copyright (C) 2026 The IT-AI Authors.
 // SPDX-License-Identifier: AGPL-3.0-or-later
@@ -428,9 +431,23 @@ impl Srv {
         Ok(CallToolResult::success(vec![ContentBlock::text(format!("saved to {local}"))]))
     }
 
-    #[tool(description = "Upload a local file to the device. Returns the saved remote path.")]
+    #[tool(description = "Upload a local file (up to 100 MB) to the device. Returns the saved remote path. For files larger than 100 MB use push_file instead — this direct path is capped and will reject them.")]
     async fn upload_file(&self, Parameters(a): Parameters<UploadArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
+        // The hub caps direct /upload at 100 MB (it buffers the whole body in RAM and
+        // the relay ships it as one message). Reject oversize files HERE, before a
+        // doomed transfer — on a flaky tunnel the upload would otherwise die with an
+        // opaque network error instead of this actionable guidance.
+        const MAX_DIRECT_UPLOAD: u64 = 100 * 1024 * 1024;
+        let size = std::fs::metadata(&a.local_path).map_err(err)?.len();
+        if size > MAX_DIRECT_UPLOAD {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "[error] {} is {:.1} MB, over the {} MB direct-upload limit. Use push_file (stage-and-pull) instead — it streams to disk and handles multi-GB files: push_file(device, local_path, remote_dir).",
+                a.local_path,
+                size as f64 / 1_048_576.0,
+                MAX_DIRECT_UPLOAD / 1_048_576
+            ))]));
+        }
         let data = std::fs::read(&a.local_path).map_err(err)?;
         let name = std::path::Path::new(&a.local_path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "upload.bin".to_string());
         let part = reqwest::multipart::Part::bytes(data).file_name(name);

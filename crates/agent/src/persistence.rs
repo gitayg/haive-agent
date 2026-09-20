@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Standard, visible autostart per OS. Nothing hidden; uninstall removes it.
 use std::env;
 #[allow(unused_imports)]

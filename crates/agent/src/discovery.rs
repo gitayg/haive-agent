@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Resolve the Mac hub by its Bonjour id and (re)register this agent every 15s.
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Wayland screen capture for compositors without wlr-screencopy (GNOME, KDE),
 // where xcap can't help. We drive the xdg-desktop-portal ScreenCast API over
 // D-Bus (zbus, blocking) to get a PipeWire node + fd, then pull a single frame

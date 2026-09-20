@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Agent-owned scheduling: the hub pushes a resolved command + a recurrence to
 // the agent, which persists it locally and fires it at the set time — so a
 // schedule runs even while the device is disconnected from the hub.

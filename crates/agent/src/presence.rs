@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Who's at the machine right now: is a user logged into a graphical session, and
 // have they touched it recently. Sampled every heartbeat (it changes over time),
 // so it lives alongside the live CPU/RAM metrics rather than the static sysinfo.

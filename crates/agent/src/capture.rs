@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Screen capture → JPEG. Origin is assumed (0,0) (primary/single monitor);
 // dimensions come from a real capture so coordinate mapping stays exact.
 use image::codecs::jpeg::JpegEncoder;

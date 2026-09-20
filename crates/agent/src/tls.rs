@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Persistent self-signed certificate (generated once, reused across restarts).
 use std::fs;
 use std::path::PathBuf;

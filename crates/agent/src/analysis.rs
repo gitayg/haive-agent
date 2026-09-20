@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Periodic full-device analysis. Every INTERVAL the agent runs its whole set of
 // report + security commands, diffs the result against the previous snapshot,
 // and pushes ONLY the changed sections to the hub — so the dashboard always has

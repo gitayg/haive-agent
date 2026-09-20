@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Reverse tunnel client. Instead of holding a socket, the agent talks to the
 // hub over ordinary HTTP long-poll — so it traverses NAT and rides a single
 // HTTPS endpoint (PaaS bypass path):

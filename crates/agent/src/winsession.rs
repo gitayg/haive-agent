@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Windows Session 0 isolation: a service runs as SYSTEM in session 0, walled off
 // from the interactive desktop — so it can't screen-capture. We keep the service
 // running normally (always connected, self-updating, exec/reports/presence all

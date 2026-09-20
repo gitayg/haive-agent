@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2024-2026 Itay Glick
+
 // Windows tray icon + embedded chat window (Phase 2). Windows-only. Runs its own
 // event loop on a dedicated thread (tao's with_any_thread), so the agent's main
 // thread keeps serving. Best-effort: any GUI init failure (Session 0 service, no
