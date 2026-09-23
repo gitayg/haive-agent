@@ -17,3 +17,4 @@ schemars = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 base64 = "0.22"
 anyhow = "1"
+it-ai-direct = { path = "../direct" }

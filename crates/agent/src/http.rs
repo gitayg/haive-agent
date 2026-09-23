@@ -28,6 +28,62 @@ static AI_HUB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static AI_RID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static AI_TOK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// The hub's ed25519 capability public key and this agent's own relay id, both
+/// set once at startup (relay mode only) from `main`. A LAN-direct request must
+/// carry a capability this key signed, naming this id.
+///
+/// `OnceLock` rather than a refreshable cell on purpose: the key is the root of
+/// trust for the direct path, so a later fetch must not be able to replace it. If
+/// the startup fetch failed nothing is stored, and `capability_ok` refuses every
+/// privileged LAN request — fail closed. Those callers fall back to the relay,
+/// which authorizes on the hub, so the agent stays fully usable meanwhile.
+static CAP_PUBKEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+static CAP_DEV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_capability_key(relay_id: &str, pubkey_hex: &str) -> bool {
+    match it_ai_cap::pubkey_from_hex(pubkey_hex) {
+        Some(k) => {
+            let _ = CAP_DEV.set(relay_id.to_string());
+            CAP_PUBKEY.set(k).is_ok()
+        }
+        None => false,
+    }
+}
+
+/// Nonces spent by already-served capabilities. Bounded by `ReplayCache` itself
+/// (expiry sweep plus a hard ceiling) — it cannot grow without limit.
+fn replay_cache() -> &'static std::sync::Mutex<it_ai_cap::ReplayCache> {
+    static C: std::sync::OnceLock<std::sync::Mutex<it_ai_cap::ReplayCache>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a request that arrived on the LAN listener carries a hub-issued
+/// capability for exactly this endpoint and argument.
+///
+/// This is an ADDITIONAL gate, layered on top of `authorized`: the per-device
+/// `dtok` proves the caller got the device's token from the hub at some point,
+/// which is a long-lived secret and says nothing about whether this particular
+/// command is allowed. The capability is what carries the hub's decision about
+/// *this* call — the authorization check, the deny-list and the audit entry all
+/// happened on the hub before it was signed.
+fn capability_ok(req: &Request, path: &str, body: Option<&serde_json::Value>) -> Result<(), it_ai_cap::CapError> {
+    let (Some(pubkey), Some(dev)) = (CAP_PUBKEY.get(), CAP_DEV.get()) else {
+        return Err(it_ai_cap::CapError::Missing);
+    };
+    let (op, arg) = it_ai_cap::op_for(path, body).ok_or(it_ai_cap::CapError::WrongOp)?;
+    let token = header_value(req, it_ai_cap::HEADER).ok_or(it_ai_cap::CapError::Missing)?;
+    let now = unix_now();
+    let p = it_ai_cap::parse_and_verify(token.trim(), pubkey, dev, op, &arg, now)?;
+    replay_cache().lock().unwrap().claim(&p.nonce, p.exp, now)
+}
+
 pub fn set_ai_relay(hub: &str, rid: &str, tok: &str) {
     let _ = AI_HUB.set(hub.trim_end_matches('/').to_string());
     let _ = AI_RID.set(rid.to_string());
@@ -266,16 +322,24 @@ pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
 /// Bind the public LAN listener, or None if it can't be bound. Never panics —
 /// the caller degrades to relay + loopback rather than killing the agent.
 fn build_server(cfg: &Config) -> Option<Server> {
-    // A relay-enrolled device is driven entirely through the outbound tunnel, so
-    // this public listener is unused attack surface — and it is served by
-    // tiny_http 0.12's `ssl-rustls`, which pins rustls 0.20.9. That has NO fixed
-    // release (RUSTSEC-2024-0336: a peer can wedge `complete_io` in an infinite
-    // loop, burning a thread per connection), and tiny_http 0.12 is the latest
-    // version, so there is nothing to upgrade to. Binding loopback-only in relay
-    // mode keeps that stack off the network entirely. Set HIVE_LAN=1 to restore
-    // the 0.0.0.0 bind for genuine LAN-direct use.
+    // LAN-direct: a relay-enrolled device now binds 0.0.0.0 too, so a controller
+    // that shares the LAN can skip the cloud round trip entirely. The listener
+    // serves the hub-signed leaf cert fetched at startup (SANs = our LAN IPs), so
+    // the controller validates us against the hub CA — no self-signed exception.
+    // `authorized`/`privileged_path` are unchanged and still apply to every LAN
+    // request: reachability is not authentication, the per-device token is.
+    //
+    // The tradeoff this re-opens: the listener is served by tiny_http 0.12's
+    // `ssl-rustls`, which pins rustls 0.20.9. That has NO fixed release
+    // (RUSTSEC-2024-0336: a peer can wedge `complete_io` in an infinite loop,
+    // burning a thread per connection) and tiny_http 0.12 is the latest version,
+    // so there is nothing to upgrade to. It is acceptable here only because this
+    // listener is a separate threadpool from the outbound relay client: an
+    // attacker who exhausts these 8 threads takes down the LAN shortcut, not the
+    // agent — controllers just fall back to the relay, which never touches this
+    // stack. Set HIVE_LAN=0 to opt back out and bind loopback-only.
     let lan_ok = cfg.direct_token.is_empty()
-        || std::env::var("HIVE_LAN").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        || std::env::var("HIVE_LAN").map(|v| v != "0").unwrap_or(true);
     let host = if lan_ok { "0.0.0.0" } else { "127.0.0.1" };
     let addr = format!("{host}:{}", cfg.port);
     if cfg.tls {
@@ -412,6 +476,33 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         );
         return;
     }
+    // LAN-direct capability gate. A non-loopback request can only have arrived on
+    // the public listener: the relay drives this agent by self-calling the
+    // loopback twin, so relay traffic and local traffic are both `is_local` and
+    // neither reaches this check. Nothing above it changed — `authorized` and
+    // `privileged_path` still decide exactly what they decided before, and this
+    // only ever REMOVES access from the one path that previously had none of the
+    // hub's per-call controls applied to it.
+    //
+    // Two endpoints bind their capability to the request body, so it is read here
+    // and handed down rather than re-read (tiny_http's reader is one-shot). Only
+    // those two — an `/upload` body must not be pulled into memory to authorize it.
+    let lan_direct = !is_local && !cfg.direct_token.is_empty() && privileged_path(&path);
+    let prebody: Option<String> = if method == Method::Post && matches!(path.as_str(), "/exec" | "/input") {
+        let mut s = String::new();
+        let _ = req.as_reader().read_to_string(&mut s);
+        Some(s)
+    } else {
+        None
+    };
+    if lan_direct {
+        let parsed = prebody.as_deref().and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok());
+        if let Err(e) = capability_ok(&req, &path, parsed.as_ref()) {
+            let _ = req.respond(Response::from_string(e.as_str()).with_status_code(403));
+            return;
+        }
+    }
+    let prebody = prebody.unwrap_or_default();
     // Live MJPEG streams have their own body type (a Read that never ends), so
     // they can't flow through the `Resp` (Cursor) match below — respond directly.
     if method == Method::Get && path == "/stream" {
@@ -433,10 +524,10 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         (Method::Get, "/frame") => frame_ep(cfg),
         (Method::Get, "/camera") => camera_ep(&url, cfg),
         (Method::Post, "/input") => {
-            input_ep(&mut req, tx);
+            input_ep(&prebody, tx);
             Response::from_string("").with_status_code(204)
         }
-        (Method::Post, "/exec") => exec_ep(&mut req, cfg),
+        (Method::Post, "/exec") => exec_ep(&prebody, cfg),
         (Method::Get, "/wol") => wol_ep(&url),
         (Method::Post, "/schedule/add") => {
             let mut b = String::new();
@@ -909,10 +1000,10 @@ fn camera_ep(url: &str, cfg: &Config) -> Resp {
     }
 }
 
-fn input_ep(req: &mut Request, tx: &Sender<Ev>) {
-    let mut body = String::new();
-    let _ = req.as_reader().read_to_string(&mut body);
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+/// `body` is read by `handle` rather than here: the LAN-direct capability binds to
+/// the event kind inside it, and tiny_http's request reader can only be drained once.
+fn input_ep(body: &str, tx: &Sender<Ev>) {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(ev) = parse_ev(&v) {
             let _ = tx.send(ev);
         }
@@ -992,13 +1083,13 @@ fn shell_command(cmd: &str) -> std::process::Command {
     }
 }
 
-fn exec_ep(req: &mut Request, cfg: &Config) -> Resp {
+/// `body` is read by `handle` rather than here: the LAN-direct capability binds to
+/// the command inside it, and tiny_http's request reader can only be drained once.
+fn exec_ep(body: &str, cfg: &Config) -> Resp {
     if !cfg.exec_enabled {
         return json_resp(&serde_json::json!({"ok": false, "error": "remote exec disabled"}), 403);
     }
-    let mut body = String::new();
-    let _ = req.as_reader().read_to_string(&mut body);
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let cmd = v.get("cmd").and_then(|c| c.as_str()).unwrap_or_default().trim().to_string();
     if cmd.is_empty() {
         return json_resp(&serde_json::json!({"ok": false, "error": "empty command"}), 400);

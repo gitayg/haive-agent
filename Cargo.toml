@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/agent", "crates/cli", "crates/mcp"]
+members = ["crates/agent", "crates/cap", "crates/cli", "crates/direct", "crates/mcp"]
 
 [workspace.package]
-version = "3.4.0"
+version = "3.5.0"
 edition = "2021"
 license = "MIT"

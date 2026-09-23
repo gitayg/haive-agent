@@ -58,6 +58,30 @@ shasum -a 256 it-ai-mcp-macos    # compare against the matching line
 gh attestation verify it-ai-mcp-macos --repo gitayg/haive-agent
 ```
 
+## LAN-direct
+
+When a controller and an agent share a network, traffic goes **straight over the LAN** instead of
+round-tripping through the cloud hub — screen frames, file transfer, shell, input and exec all ride
+the same shortcut, because it is chosen once at the transport layer rather than per feature.
+
+It is automatic. The agent listens on `0.0.0.0:8765` serving the hub-signed leaf cert whose SANs are
+its own LAN IPs, so the controller validates it against the hub CA — no self-signed exception. The
+controller probes that address and **the probe succeeding is the detection**; any failure (no LAN
+route, refused, TLS, timeout) falls back to the relay, so nothing breaks off-LAN.
+
+**A direct call is still governed.** Reaching an agent over the LAN does not bypass the hub: before
+each direct call the controller mints a short-lived (60 s) ed25519 **capability** from the hub, and
+the hub issues it only after running the same authorization, command deny-list and audit it runs on
+the relay path. The agent verifies the capability — bound to the device, the operation, and a hash of
+the arguments — in addition to its own token gate, and refuses the call without one. So the audit
+trail and policy apply wherever the command came from. The cost is one hub round-trip per operation,
+which is why the win here is bandwidth (screen, files) rather than latency on tiny commands.
+
+Set `HIVE_LAN=0` on the agent to opt out and bind loopback only.
+
+`itai` talks to the hub's `/m/*` API, so it needs a token: `--mtok` / `HIVE_MCP_TOKEN`, plus
+`--owner` / `HIVE_OWNER` when a hub serves several users.
+
 ## Build from source
 
 ```sh

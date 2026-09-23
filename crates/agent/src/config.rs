@@ -31,6 +31,26 @@ pub fn start_poll(hub: String, token: Option<String>) {
     });
 }
 
+/// Fetch the hub's ed25519 capability public key (64 lowercase hex characters),
+/// which is what the agent verifies LAN-direct capability tokens against.
+///
+/// Taken over `/relay/*` — the channel `relay_ok` already authenticates with the
+/// enrollment token — because the agent holds no MCP token and so cannot reach
+/// the `/m/cap-key` copy the controllers use. Both serve the same key.
+///
+/// There is no fallback and no retry: None means the direct path stays closed
+/// (see `http::CAP_PUBKEY`), and the agent runs on the relay as it always has.
+pub fn fetch_cap_key(hub: &str, token: &str) -> Option<String> {
+    let base = hub.trim_end_matches('/');
+    let mut url = format!("{base}/relay/cap-key");
+    if !token.is_empty() {
+        url.push_str(&format!("?tok={token}"));
+    }
+    let body = ureq::get(&url).timeout(std::time::Duration::from_secs(10)).call().ok()?.into_string().ok()?;
+    let key = body.trim().to_string();
+    (key.len() == 64).then_some(key)
+}
+
 /// Ask the hub to sign a leaf cert for this agent (SANs = our LAN IPs + a stable
 /// name), so a same-LAN controller can validate a direct connection against the
 /// hub CA. Returns (cert_pem, key_pem) bytes, or None to fall back to self-signed.

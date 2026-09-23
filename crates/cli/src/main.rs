@@ -7,10 +7,16 @@
 //
 // itai — run commands and transfer files against a registered device by
 // its hub name. The device is resolved through the hub, so no IP is needed.
+//
+// Transport is the shared LAN-direct hybrid (`it-ai-direct`): when the device
+// answers on its LAN address it is driven directly, otherwise through the hub's
+// relay. That is the same module and the same per-device route cache the MCP
+// server uses — neither binary carries its own copy of the decision.
 use std::process::exit;
 
 use clap::{Parser, Subcommand};
-use reqwest::blocking::Client;
+use it_ai_direct::{Controller, Op};
+use reqwest::Client;
 
 #[derive(Parser)]
 #[command(name = "itai", version = "2.3.0",
@@ -19,6 +25,12 @@ struct Cli {
     /// hub URL
     #[arg(long, env = "HAIVE_HUB", default_value = "http://localhost:8770")]
     hub: String,
+    /// token for the hub's /m API (matches the hub's MCP_TOKEN)
+    #[arg(long, env = "HIVE_MCP_TOKEN", default_value = "")]
+    mtok: String,
+    /// owner id to act as (per-user hub scoping)
+    #[arg(long, env = "HIVE_OWNER", default_value = "")]
+    owner: String,
     /// agent password, if one was set
     #[arg(long, env = "SCREEN_PW")]
     password: Option<String>,
@@ -74,69 +86,18 @@ fn build_client(cafile: &Option<String>) -> Client {
     b.build().expect("build http client")
 }
 
-fn resolve(client: &Client, hub: &str, name: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let v: serde_json::Value = client
-        .get(format!("{}/agents", hub.trim_end_matches('/')))
-        .send()?
-        .json()?;
-    let agents = v["agents"].as_array().cloned().unwrap_or_default();
-    let matches: Vec<&serde_json::Value> = {
-        let exact: Vec<_> = agents
-            .iter()
-            .filter(|a| {
-                a["name"].as_str().map(|n| n.eq_ignore_ascii_case(name)).unwrap_or(false)
-                    || a["ip"].as_str() == Some(name)
-            })
-            .collect();
-        if exact.is_empty() {
-            agents
-                .iter()
-                .filter(|a| a["name"].as_str().map(|n| n.to_lowercase().contains(&name.to_lowercase())).unwrap_or(false))
-                .collect()
-        } else {
-            exact
-        }
-    };
-    if matches.is_empty() {
-        return Err(format!("no device matching '{name}' (try: itai list)").into());
-    }
-    if matches.len() > 1 {
-        let names: Vec<_> = matches.iter().filter_map(|a| a["name"].as_str()).collect();
-        return Err(format!("'{name}' is ambiguous: {}", names.join(", ")).into());
-    }
-    let a = matches[0];
-    Ok(format!(
-        "{}://{}:{}",
-        a["scheme"].as_str().unwrap_or("http"),
-        a["ip"].as_str().unwrap_or(""),
-        a["port"].as_u64().unwrap_or(8765)
-    ))
-}
-
-fn auth<'a>(rb: reqwest::blocking::RequestBuilder, pw: &Option<String>) -> reqwest::blocking::RequestBuilder {
-    match pw {
-        Some(p) => rb.basic_auth("admin", Some(p)),
-        None => rb,
-    }
-}
-
-fn cmd_list(client: &Client, hub: &str) -> R {
-    let v: serde_json::Value = client.get(format!("{}/agents", hub.trim_end_matches('/'))).send()?.json()?;
-    for a in v["agents"].as_array().cloned().unwrap_or_default() {
-        println!(
-            "{:24} {}://{}:{}",
-            a["name"].as_str().unwrap_or("?"),
-            a["scheme"].as_str().unwrap_or("http"),
-            a["ip"].as_str().unwrap_or(""),
-            a["port"].as_u64().unwrap_or(0)
-        );
+async fn cmd_list(ctl: &Controller) -> R {
+    for a in ctl.agents().await? {
+        println!("{:24} {}", a.name, a.target());
     }
     Ok(())
 }
 
-fn cmd_exec(client: &Client, base: &str, pw: &Option<String>, command: &[String]) -> R {
-    let body = serde_json::json!({"cmd": command.join(" ")});
-    let out: serde_json::Value = auth(client.post(format!("{base}/exec")), pw).json(&body).send()?.json()?;
+async fn cmd_exec(ctl: &Controller, target: &str, command: &[String]) -> R {
+    let op = Op::post_json("exec", serde_json::json!({"cmd": command.join(" ")}))
+        .target_in_body()
+        .timeout(std::time::Duration::from_secs(65));
+    let out: serde_json::Value = ctl.call_device(target, op).await?.json().await?;
     if !out["ok"].as_bool().unwrap_or(false) {
         return Err(out["error"].as_str().unwrap_or("failed").into());
     }
@@ -145,9 +106,12 @@ fn cmd_exec(client: &Client, base: &str, pw: &Option<String>, command: &[String]
     exit(out["code"].as_i64().unwrap_or(0) as i32);
 }
 
-fn cmd_get(client: &Client, base: &str, pw: &Option<String>, remote: &str, local: &Option<String>) -> R {
-    let url = format!("{base}/download?path={}", urlencode(remote));
-    let bytes = auth(client.get(url), pw).send()?.bytes()?;
+async fn cmd_get(ctl: &Controller, target: &str, remote: &str, local: &Option<String>) -> R {
+    let bytes = ctl
+        .call_device(target, Op::get("download").query("path", remote))
+        .await?
+        .bytes()
+        .await?;
     let local = local.clone().unwrap_or_else(|| {
         std::path::Path::new(remote)
             .file_name()
@@ -159,12 +123,16 @@ fn cmd_get(client: &Client, base: &str, pw: &Option<String>, remote: &str, local
     Ok(())
 }
 
-fn cmd_put(client: &Client, base: &str, pw: &Option<String>, local: &str, remote_dir: &Option<String>) -> R {
-    let mut form = reqwest::blocking::multipart::Form::new().file("file", local)?;
+async fn cmd_put(ctl: &Controller, target: &str, local: &str, remote_dir: &Option<String>) -> R {
+    let name = std::path::Path::new(local)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "upload.bin".to_string());
+    let mut op = Op::post_file("upload", name, std::fs::read(local)?);
     if let Some(dir) = remote_dir {
-        form = form.text("dir", dir.clone());
+        op = op.field("dir", dir.clone());
     }
-    let out: serde_json::Value = auth(client.post(format!("{base}/upload")), pw).multipart(form).send()?.json()?;
+    let out: serde_json::Value = ctl.call_device(target, op).await?.json().await?;
     if out["ok"].as_bool().unwrap_or(false) {
         println!("{}", out["saved"].as_str().unwrap_or(""));
     } else {
@@ -173,31 +141,24 @@ fn cmd_put(client: &Client, base: &str, pw: &Option<String>, local: &str, remote
     Ok(())
 }
 
-fn urlencode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
-}
-
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
     let cli = Cli::parse();
-    let client = build_client(&cli.cafile);
+    let ctl = Controller::new(cli.hub, cli.mtok, cli.owner, build_client(&cli.cafile))
+        .with_password(cli.password);
     let result = match &cli.cmd {
-        Cmd::List => cmd_list(&client, &cli.hub),
-        Cmd::Exec { device, command } => match resolve(&client, &cli.hub, device) {
-            Ok(base) => cmd_exec(&client, &base, &cli.password, command),
-            Err(e) => Err(e),
+        Cmd::List => cmd_list(&ctl).await,
+        Cmd::Exec { device, command } => match ctl.resolve(device).await {
+            Ok(t) => cmd_exec(&ctl, &t, command).await,
+            Err(e) => Err(e.into()),
         },
-        Cmd::Get { device, remote, local } => match resolve(&client, &cli.hub, device) {
-            Ok(base) => cmd_get(&client, &base, &cli.password, remote, local),
-            Err(e) => Err(e),
+        Cmd::Get { device, remote, local } => match ctl.resolve(device).await {
+            Ok(t) => cmd_get(&ctl, &t, remote, local).await,
+            Err(e) => Err(e.into()),
         },
-        Cmd::Put { device, local, remote_dir } => match resolve(&client, &cli.hub, device) {
-            Ok(base) => cmd_put(&client, &base, &cli.password, local, remote_dir),
-            Err(e) => Err(e),
+        Cmd::Put { device, local, remote_dir } => match ctl.resolve(device).await {
+            Ok(t) => cmd_put(&ctl, &t, local, remote_dir).await,
+            Err(e) => Err(e.into()),
         },
     };
     if let Err(e) = result {

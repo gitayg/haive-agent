@@ -9,6 +9,8 @@ name = "itai"
 path = "src/main.rs"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
+it-ai-direct = { path = "../direct" }
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }

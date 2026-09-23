@@ -26,6 +26,9 @@ clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
 ed25519-dalek = "2"
+# Capability tokens for the LAN-direct path — the op/argument canonicalization
+# and token format shared with the controller side (crates/direct).
+it-ai-cap = { path = "../cap" }
 sysinfo = "0.33"
 nokhwa = { version = "0.10", default-features = false, features = ["input-native"] }
 self-replace = "1"

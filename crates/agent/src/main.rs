@@ -601,6 +601,19 @@ fn main() {
             std::process::exit(2);
         }
         direct_token = agent_direct_token(&token, &rid);
+        // LAN-direct authorization: the hub's capability public key. Without it
+        // every privileged request arriving on the LAN listener is refused (the
+        // controller then uses the relay, where the hub applies the same checks
+        // itself), so a fetch failure costs the shortcut, never correctness.
+        match config::fetch_cap_key(&relay_addr, &token) {
+            Some(k) if http::set_capability_key(&rid, &k) => {
+                println!("   lan-direct: capability key loaded");
+            }
+            _ => eprintln!(
+                "warn: could not fetch the hub capability key — LAN-direct requests will be refused; \
+                 controllers fall back to the relay"
+            ),
+        }
         // LAN-direct: get a hub-signed leaf cert (SANs = our LAN IPs + a stable
         // name) so a same-LAN controller can validate a direct connection to us
         // against the hub CA. Falls back to the self-signed cert on failure.
