@@ -2,8 +2,6 @@
 // Copyright (c) 2024-2026 Itay Glick
 
 // IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
-// Copyright (C) 2026 The IT-AI Authors.
-// SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // On-demand `winget` bootstrap for the Windows endpoint agent, done with the
 // NATIVE Windows AppX deployment API (WinRT `PackageManager`) — NO PowerShell,

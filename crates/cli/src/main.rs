@@ -2,8 +2,6 @@
 // Copyright (c) 2024-2026 Itay Glick
 
 // IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
-// Copyright (C) 2026 The IT-AI Authors.
-// SPDX-License-Identifier: AGPL-3.0-or-later
 //
 // itai — run commands and transfer files against a registered device by
 // its hub name. The device is resolved through the hub, so no IP is needed.

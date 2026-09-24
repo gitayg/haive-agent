@@ -632,32 +632,10 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
     }
     let replaced = self_replace::self_replace(&tmp).is_ok();
     let _ = std::fs::remove_file(&tmp);
-    // POST-CONDITION: the launch path (`exe` — what the scheduled task / service /
-    // autostart entry invokes) MUST end up holding the new binary. self_replace
-    // renames the running exe ASIDE and then writes the new one in its place; if
-    // that second step fails partway (AV grabs the file, a lock, disk), the path is
-    // left EMPTY while this process keeps running from the now-unlinked inode. The
-    // device stays up until the next reboot/logon — then the launcher hits
-    // ERROR_FILE_NOT_FOUND (0x80070002) and the agent never comes back (observed on
-    // DESKTOP-JOL2MB8). Verify and self-heal before we hand off.
-    let ok_now = std::fs::metadata(&exe).map(|m| m.len() as usize == bytes.len()).unwrap_or(false);
-    if !ok_now {
-        // The path is now free (the old exe was moved aside, or was already gone),
-        // so write the new binary straight to it. If even this fails, DO NOT exit —
-        // returning false keeps the current process alive on the old version, so the
-        // device survives rather than going dark on next restart.
-        if !replaced {
-            eprintln!("update: self_replace failed; restoring binary directly at {}", exe.display());
-        }
-        if std::fs::write(&exe, bytes).is_err() {
-            eprintln!("update: could not restore binary at {} — staying on current version", exe.display());
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
-        }
+    // POST-CONDITION: the launch path must end up holding the new binary, or we
+    // must not exit. See `selfheal` for why, and for the tests.
+    if !crate::selfheal::ensure_installed(&exe, bytes, replaced) {
+        return false;
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(unix)]

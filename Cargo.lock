@@ -2368,7 +2368,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "it-ai-agent"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "it-ai-cap"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2413,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "it-ai-cli"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "clap",
  "it-ai-direct",
@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "it-ai-direct"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "it-ai-cap",
  "reqwest",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "it-ai-mcp"
-version = "3.5.0"
+version = "3.5.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
