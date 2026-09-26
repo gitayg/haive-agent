@@ -116,9 +116,13 @@ pub fn auto_update_loop(primary: String, fallback_id: Option<String>, asset: Str
         Some(b) => b,
         None => return,
     };
+    let own_hash = crate::updatecheck::sha256_hex(&self_bytes);
     loop {
         std::thread::sleep(Duration::from_secs(120));
         if let Some((ip, port)) = resolve_hub(&primary, &fallback_id) {
+            if unchanged_upstream(&format!("http://{ip}:{port}/bin"), &asset, &own_hash) {
+                continue;
+            }
             let url = format!("http://{ip}:{port}/bin/{asset}");
             if let Some(newb) = download_agent(&url) {
                 // Verify a pinned-key signature before self-replacing — the LAN
@@ -146,9 +150,13 @@ pub fn auto_update_relay(base: String, asset: String) {
         Some(b) => b,
         None => return,
     };
+    let own_hash = crate::updatecheck::sha256_hex(&self_bytes);
     let b = base.trim_end_matches('/').to_string();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(120));
+        if unchanged_upstream(&format!("{b}/bin"), &asset, &own_hash) {
+            continue;
+        }
         let url = format!("{b}/bin/{asset}");
         if let Some(newb) = download_agent(&url) {
             // Require a valid pinned-key signature so a compromised/rogue hub can't
@@ -164,6 +172,15 @@ pub fn auto_update_relay(base: String, asset: String) {
             }
         }
     });
+}
+
+/// True when the hub's published checksum says `asset` is the binary we already
+/// run, so the ~10 MB download can be skipped. False when it differs OR the hub
+/// publishes nothing usable — the caller then downloads and compares bytes as
+/// before, so older hubs keep working.
+fn unchanged_upstream(bin_base: &str, asset: &str, own_hash: &str) -> bool {
+    let sums = download_agent(&format!("{bin_base}/SHA256SUMS")).map(|b| String::from_utf8_lossy(&b).into_owned());
+    crate::updatecheck::is_current(own_hash, sums.as_deref(), asset) == Some(true)
 }
 
 fn download_agent(url: &str) -> Option<Vec<u8>> {

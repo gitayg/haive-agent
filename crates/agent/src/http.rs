@@ -588,6 +588,13 @@ fn update_ep(req: &mut Request) -> Resp {
         Some(b) if !b.is_empty() => b,
         _ => return Response::from_string("download failed").with_status_code(502),
     };
+    // Already running exactly this build: installing it again would only restart
+    // the agent and drop its tunnel. A hub that keeps pushing the same binary must
+    // not be able to turn that into a restart loop. Nothing is installed on this
+    // path, so there is nothing for the signature check below to protect.
+    if crate::updatecheck::is_running_binary(&bytes) {
+        return Response::from_string(format!("already running this build ({} bytes); nothing to do", bytes.len()));
+    }
     // Refuse to self-replace with an unsigned/forged binary: require a detached
     // ed25519 signature (served as <url>.sig) that verifies against the pinned key.
     let sig = match download_bytes(&format!("{url}.sig")) {

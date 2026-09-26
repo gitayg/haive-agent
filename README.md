@@ -58,6 +58,17 @@ shasum -a 256 it-ai-mcp-macos    # compare against the matching line
 gh attestation verify it-ai-mcp-macos --repo gitayg/haive-agent
 ```
 
+## Updates
+
+An enrolled agent keeps itself on the build its hub serves. Every two minutes it fetches the hub's
+small `/bin/SHA256SUMS` and compares the published hash for its platform with its own executable;
+only when they differ does it download the binary, check its ed25519 signature against the pinned
+key, and replace itself. A hub that publishes no checksum file gets the older behaviour (download
+and compare bytes). A hub can also push an update (`POST /update`); if the pushed binary is
+byte-identical to the one running, the agent answers "already running this build" instead of
+reinstalling and restarting. The checksum file is not signed — a hub lying about it can only
+delay an update, never install one, because every installed binary must carry a valid signature.
+
 ## LAN-direct
 
 When a controller and an agent share a network, traffic goes **straight over the LAN** instead of

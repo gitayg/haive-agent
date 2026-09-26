@@ -13,6 +13,7 @@ mod wakelock;
 mod presence;
 mod relay;
 mod selfheal;
+mod updatecheck;
 #[cfg(windows)]
 mod tray;
 mod schedule;
