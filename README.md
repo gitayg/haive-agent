@@ -46,6 +46,30 @@ claude mcp add-json itai '{
 ```
 `/mcp` → approve once. The agent then calls the tools and downloads nothing at runtime.
 
+**`itai` CLI on macOS / Linux, one command** (from a checkout of this repo):
+```sh
+export HAIVE_HUB=https://your-hub.example.com
+export HIVE_MCP_TOKEN=...          # from your secret manager; the script never prompts for it
+sh scripts/setup-itai.sh
+```
+`scripts/setup-itai.sh` fails before downloading anything if `HAIVE_HUB` or `HIVE_MCP_TOKEN` is
+unset, and warns when `HAIVE_HUB` is not `https://` (localhost excepted). It picks the asset for
+the machine (`itai-linux`, `itai-linux-arm64`, or `itai-macos` on Apple Silicon, including a shell
+under Rosetta; Intel macOS and Windows are refused), downloads it with the release `SHA256SUMS`,
+and refuses to install on a missing, malformed or mismatched checksum. It installs `itai` into
+`$INSTALL_DIR`, notes when that directory is not on `PATH`, then runs `itai list` as a read-only
+connectivity check with any `mtok=` value in its output replaced by `REDACTED`. The token is read
+from the environment only: never put on a command line, printed, or written to disk.
+
+| Variable | Default | |
+|---|---|---|
+| `HAIVE_HUB` | *(required)* | hub URL |
+| `HIVE_MCP_TOKEN` | *(required)* | token for the hub's `/m` API |
+| `HIVE_OWNER` | *(unset)* | owner id, when the hub serves several users |
+| `ITAI_VERSION` | latest | release tag to install, with or without the leading `v` |
+| `INSTALL_DIR` | `$HOME/.local/bin` | install directory |
+| `ITAI_BASE_URL` | `https://github.com/gitayg/haive-agent/releases` | releases base URL |
+
 ## Verify what you downloaded
 
 **Integrity** — every release ships a `SHA256SUMS`:
@@ -92,6 +116,68 @@ Set `HIVE_LAN=0` on the agent to opt out and bind loopback only.
 
 `itai` talks to the hub's `/m/*` API, so it needs a token: `--mtok` / `HIVE_MCP_TOKEN`, plus
 `--owner` / `HIVE_OWNER` when a hub serves several users.
+
+The token travels as `?mtok=` in the request URL, and transport errors quote that URL. `itai`
+and `it-ai-mcp` mask the value (`mtok=***`) in every error they print or return.
+
+## Background jobs
+
+A job is a long-running command on a device (a dev server, a build) that outlives the ~65 s
+limit of a single exec. Start it, read its output as it grows, stop it; each is a separate short
+call. The wire contract is [`docs/JOBS-API.md`](docs/JOBS-API.md).
+
+```sh
+itai job start <device> [--cwd DIR] -- <command…>   # prints the job id
+itai job logs  <device> <id> [--offset N] [--follow]
+itai job stop  <device> <id>
+itai job list  <device>
+```
+- The words after `--` are joined with spaces and run by the device's shell, so inner quoting
+  is lost: `-- sh -c 'a; b'` does not work. Pass a compound command as one quoted argument:
+  `itai job start dev -- 'for i in 1 2 3; do echo $i; sleep 1; done'`. (`itai exec` behaves the same.)
+- `job logs` prints the output from `--offset` (default 0), then `[next offset N · running]` or
+  `[next offset N · exited <code>]` on stderr; pass that offset back to read only what is new.
+- `--follow` keeps reading from the returned offset, waiting 2 s whenever it has caught up,
+  until the job has exited and all output is read, then prints `exit code: <n>`.
+- `job stop` ends the job **and its child processes**.
+
+MCP tools, same operations:
+
+| Tool | Returns |
+|---|---|
+| `job_start(device, command, cwd?)` | job id, pid and log path |
+| `job_logs(device, id, offset?)` | a JSON line with the next `offset`, `running`, `exit_code`, `eof`, `size`, then the output text |
+| `job_stop(device, id)` | whether it was running, and the exit code |
+| `job_list(device)` | id, running or exit code, pid, start time (unix secs), command |
+
+On the agent:
+
+- Four endpoints, `POST /jobs/start` (body `{"cmd","cwd"?}`), `GET /jobs/logs?id=&offset=&max=`,
+  `POST /jobs/stop?id=`, `GET /jobs/list`. All are privileged like `/exec`, and `/jobs/start`
+  answers 403 `remote exec disabled` when the agent runs with `SCREEN_EXEC=0`.
+- The command runs through the same shell as `/exec` (`sh -c` / `cmd /S /C`) in its own process
+  group, stdin closed, stdout and stderr appended to one file, `~/.it-ai/jobs/<id>.log`.
+- Ids are `j` + unix milliseconds + 4 hex chars; anything outside `[a-z0-9]` gets 400, an unknown
+  id 404 `unknown job`.
+- A logs read returns at most `max` bytes (default 64 KiB, capped at 1 MiB). `eof` is true only
+  once the job has exited and the read reached the end of the log.
+- Stop: unix sends SIGTERM to the process group and SIGKILL after 5 s; Windows runs
+  `taskkill /T /F /PID`.
+- The job list is in memory. It keeps the 50 most recent jobs, dropping the oldest finished ones
+  (running jobs are never dropped); an agent restart forgets it. Log files stay on disk.
+
+The hub authorizes, deny-list-checks (as a `launch`) and audits `job/start` exactly like an exec;
+a read-only MCP token cannot start or stop a job. Jobs are **relay-only** in this version: the CLI
+and MCP call the hub's `/m/job/*` routes, not the LAN-direct path. A device needs agent 3.6.0 or
+later; for an older one the hub returns `the agent does not support jobs — update it`.
+
+## Operator skill
+
+[`skills/it-ai/SKILL.md`](skills/it-ai/SKILL.md) is a Claude Code skill for operating a fleet
+through `it-ai-mcp` or `itai`: which tool fits which task (short command vs job, `upload_file` vs
+`push_file`), how to treat hub refusals (report them, never route around the deny-list), which
+actions to confirm first, reading `update_agent` replies, and keeping the token out of command
+lines and output. Install it by copying `skills/it-ai` into `~/.claude/skills/`.
 
 ## Build from source
 

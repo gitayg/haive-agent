@@ -8,6 +8,7 @@ mod config;
 mod discovery;
 mod http;
 mod input;
+mod jobs;
 mod persistence;
 mod wakelock;
 mod presence;

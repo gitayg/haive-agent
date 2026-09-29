@@ -456,6 +456,10 @@ fn privileged_path(path: &str) -> bool {
             | "/schedule/add"
             | "/schedule/del"
             | "/schedule/list"
+            | "/jobs/start"
+            | "/jobs/logs"
+            | "/jobs/stop"
+            | "/jobs/list"
     ) || path.starts_with("/shell/")
 }
 
@@ -565,7 +569,31 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         (Method::Post, "/upload") => upload_ep(&mut req, cfg),
         (Method::Post, "/fetch-file") => fetch_file_ep(&mut req, cfg),
         (Method::Get, "/file-status") => file_status_ep(&url),
-        _ => Response::from_string("not found").with_status_code(404),
+        (Method::Post, "/jobs/start") => {
+            if !cfg.exec_enabled {
+                json_resp(&serde_json::json!({"ok": false, "error": "remote exec disabled"}), 403)
+            } else {
+                let mut b = String::new();
+                let _ = req.as_reader().read_to_string(&mut b);
+                let (v, code) = crate::jobs::start_ep(&b, shell_command);
+                json_resp(&v, code)
+            }
+        }
+        (Method::Get, "/jobs/logs") => {
+            let id = query_val(&url, "id").unwrap_or_default();
+            let (off, max) = (query_val(&url, "offset"), query_val(&url, "max"));
+            let (v, code) = crate::jobs::logs_ep(&id, off.as_deref(), max.as_deref());
+            json_resp(&v, code)
+        }
+        (Method::Post, "/jobs/stop") => {
+            let (v, code) = crate::jobs::stop_ep(&query_val(&url, "id").unwrap_or_default());
+            json_resp(&v, code)
+        }
+        (Method::Get, "/jobs/list") => {
+            let (v, code) = crate::jobs::list_ep();
+            json_resp(&v, code)
+        }
+        _ =>Response::from_string("not found").with_status_code(404),
     };
     let _ = req.respond(resp);
 }

@@ -12,6 +12,8 @@
 //   HIVE_MCP_TOKEN  token for the hub's /m API (matches the hub's MCP_TOKEN)
 //   HIVE_OWNER      owner id to act as (per-user hub scoping)
 //   HAIVE_CAFILE    optional PEM to verify a self-signed hub cert
+mod jobs;
+
 use base64::Engine;
 use it_ai_direct::{Controller, Op};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -148,7 +150,6 @@ struct RunPluginArgs {
 
 #[derive(Clone)]
 struct Srv {
-    #[allow(dead_code)]
     tool_router: ToolRouter<Srv>,
     owner: String,
     /// Shared LAN-direct/relay transport. Owns the hub client, the per-device
@@ -157,7 +158,7 @@ struct Srv {
 }
 
 fn err(e: impl ToString) -> ErrorData {
-    ErrorData::internal_error(e.to_string(), None)
+    ErrorData::internal_error(jobs::redact_token(&e.to_string()), None)
 }
 
 fn urlencode(s: &str) -> String {
@@ -196,7 +197,7 @@ impl Srv {
             owner.clone(),
             b.build().expect("build http client"),
         );
-        Self { tool_router: Self::tool_router(), owner, ctl: std::sync::Arc::new(ctl) }
+        Self { tool_router: Self::tool_router() + Self::job_router(), owner, ctl: std::sync::Arc::new(ctl) }
     }
 
     /// The hub client, for the `/m` actions the hub composes itself (fleet
@@ -623,13 +624,13 @@ impl Srv {
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Srv {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), camera_snapshot, update_agent, dissolve_agent.".to_string(),
+            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), camera_snapshot, update_agent, dissolve_agent, job_start/job_logs/job_stop/job_list (background commands past run_command's ~65s limit).".to_string(),
         );
         info
     }

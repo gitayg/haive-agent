@@ -12,12 +12,14 @@
 // server uses — neither binary carries its own copy of the decision.
 use std::process::exit;
 
+mod jobs;
+
 use clap::{Parser, Subcommand};
 use it_ai_direct::{Controller, Op};
 use reqwest::Client;
 
 #[derive(Parser)]
-#[command(name = "itai", version = "2.3.0",
+#[command(name = "itai", version = "2.4.0",
     about = "Drive a IT-AI device from the Mac (resolved by hub name).")]
 struct Cli {
     /// hub URL
@@ -60,6 +62,11 @@ enum Cmd {
         device: String,
         local: String,
         remote_dir: Option<String>,
+    },
+    /// background jobs that outlive one exec: start, logs, stop, list
+    Job {
+        #[command(subcommand)]
+        cmd: jobs::JobCmd,
     },
 }
 
@@ -158,9 +165,13 @@ async fn main() {
             Ok(t) => cmd_put(&ctl, &t, local, remote_dir).await,
             Err(e) => Err(e.into()),
         },
+        Cmd::Job { cmd } => match ctl.resolve(cmd.device()).await {
+            Ok(t) => jobs::run(&ctl, &t, cmd).await,
+            Err(e) => Err(e.into()),
+        },
     };
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        eprintln!("error: {}", jobs::redact_token(&e.to_string()));
         exit(1);
     }
 }
