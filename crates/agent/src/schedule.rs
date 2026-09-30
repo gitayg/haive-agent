@@ -89,7 +89,7 @@ fn run_cmd(command: &str) {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0800_0000 | 0x0000_0200);
     }
-    let _ = c.spawn();
+    let _ = crate::reap::spawn_detached(&mut c);
 }
 
 /// Background tick: fire due schedules, re-arm recurring, drop one-shots.

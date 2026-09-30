@@ -1151,9 +1151,10 @@ fn exec_ep(body: &str, cfg: &Config) -> Resp {
     let timeout = v.get("timeout").and_then(|x| x.as_u64()).unwrap_or(60).clamp(1, 300);
 
     if detach {
-        // Spawn detached and return immediately — the child is orphaned, not waited
-        // on. Redirect stdio to NUL so a launched GUI grandchild can't inherit an
-        // exec pipe write-end (which would wedge a captured command's read-to-EOF).
+        // Spawn detached and return immediately; a background thread reaps it on
+        // exit (see `reap`). Redirect stdio to NUL so a launched GUI grandchild can't
+        // inherit an exec pipe write-end (which would wedge a captured command's
+        // read-to-EOF).
         let mut c = shell_command(&cmd);
         c.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         #[cfg(windows)]
@@ -1166,8 +1167,8 @@ fn exec_ep(body: &str, cfg: &Config) -> Resp {
             // needs, and a GUI app opens its own window regardless.)
             c.creation_flags(0x0800_0000 | 0x0000_0200);
         }
-        return match c.spawn() {
-            Ok(child) => json_resp(&serde_json::json!({"ok": true, "detached": true, "pid": child.id()}), 200),
+        return match crate::reap::spawn_detached(&mut c) {
+            Ok(pid) => json_resp(&serde_json::json!({"ok": true, "detached": true, "pid": pid}), 200),
             Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
         };
     }
@@ -1188,7 +1189,7 @@ fn exec_ep(body: &str, cfg: &Config) -> Resp {
     let id = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+        let _ = tx.send(crate::reap::wait_with_output(child));
     });
     match rx.recv_timeout(std::time::Duration::from_secs(timeout)) {
         Ok(Ok(o)) => json_resp(

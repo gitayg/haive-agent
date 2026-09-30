@@ -12,6 +12,7 @@ mod jobs;
 mod persistence;
 mod wakelock;
 mod presence;
+mod reap;
 mod relay;
 mod selfheal;
 mod updatecheck;
