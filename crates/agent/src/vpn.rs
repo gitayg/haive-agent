@@ -260,21 +260,21 @@ pub fn start(device: String) {
 fn ticker() {
     loop {
         std::thread::sleep(Duration::from_secs(15));
-        let Some(d) = state().lock().unwrap().desired.clone() else { continue };
+        let Some(d) = state().lock().unwrap_or_else(|e| e.into_inner()).desired.clone() else { continue };
         let live = live_peers(&d.peers, now_secs());
         if live.len() != d.peers.len() {
             let mut next = d.clone();
             next.peers = live;
             reconcile_peers(&next.peers);
             save_desired(&next);
-            state().lock().unwrap().desired = Some(next);
+            state().lock().unwrap_or_else(|e| e.into_inner()).desired = Some(next);
         }
         if let Some(wan) = wan_iface() {
-            let old = state().lock().unwrap().wan.clone();
+            let old = state().lock().unwrap_or_else(|e| e.into_inner()).wan.clone();
             if wan != old {
                 remove_rules(&old);
                 if ensure_rules(&wan).is_ok() {
-                    state().lock().unwrap().wan = wan;
+                    state().lock().unwrap_or_else(|e| e.into_inner()).wan = wan;
                 }
             }
         }
@@ -456,7 +456,7 @@ fn apply_desired(d: Desired) -> Result<Value, String> {
     ensure_iface()?;
     let wan = wan_iface().ok_or("no default route — is the device online?")?;
     {
-        let old = state().lock().unwrap().wan.clone();
+        let old = state().lock().unwrap_or_else(|e| e.into_inner()).wan.clone();
         if old != wan {
             remove_rules(&old);
         }
@@ -468,7 +468,7 @@ fn apply_desired(d: Desired) -> Result<Value, String> {
     shim_ensure(&d.relay, hex_decode(&d.secret).unwrap_or_default());
     save_desired(&d);
     {
-        let mut s = state().lock().unwrap();
+        let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
         s.desired = Some(d);
         s.wan = wan;
         s.last_error = None;
@@ -498,7 +498,7 @@ fn shim() -> &'static Mutex<Option<Shim>> {
 }
 
 fn shim_ensure(relay: &str, secret: Vec<u8>) {
-    let mut g = shim().lock().unwrap();
+    let mut g = shim().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = g.as_ref() {
         if s.relay == relay && s.secret == secret {
             return;
@@ -518,7 +518,7 @@ fn shim_ensure(relay: &str, secret: Vec<u8>) {
 }
 
 fn shim_stop() {
-    if let Some(s) = shim().lock().unwrap().take() {
+    if let Some(s) = shim().lock().unwrap_or_else(|e| e.into_inner()).take() {
         s.stop.store(true, Ordering::SeqCst);
     }
 }
@@ -549,13 +549,13 @@ fn shim_loop(relay: String, secret: Vec<u8>, stop: Arc<AtomicBool>, ack: Arc<Ato
             }
             let now = now_ms();
             // HELLO every 10s keeps the CGNAT mapping open and tells the relay where we are.
-            if now - last_hello >= 10_000 {
+            if now.saturating_sub(last_hello) >= 10_000 {
                 let _ = up.send_to(&encode_hello(now, &device, &secret), addr);
                 last_hello = now;
             }
             // No ACK for 60s: rebuild the socket (new NAT mapping, fresh DNS).
             let last = ack.load(Ordering::SeqCst).max(started);
-            if now - last > 60_000 {
+            if now.saturating_sub(last) > 60_000 {
                 println!("[vpn] relay silent for 60s; reconnecting");
                 break;
             }
@@ -575,16 +575,17 @@ fn shim_loop(relay: String, secret: Vec<u8>, stop: Arc<AtomicBool>, ack: Arc<Ato
                 _ => {}
             }
             // Idle sessions go after 3 minutes (a phone that left).
-            let mut g = sessions.lock().unwrap();
+            let mut g = sessions.lock().unwrap_or_else(|e| e.into_inner());
             g.retain(|_, s| {
-                let keep = now - s.last_ms.load(Ordering::SeqCst) < 180_000;
+                // Saturating: a reader thread may stamp last_ms after `now` was taken.
+                let keep = now.saturating_sub(s.last_ms.load(Ordering::SeqCst)) < 180_000;
                 if !keep {
                     s.stop.store(true, Ordering::SeqCst);
                 }
                 keep
             });
         }
-        for (_, s) in sessions.lock().unwrap().drain() {
+        for (_, s) in sessions.lock().unwrap_or_else(|e| e.into_inner()).drain() {
             s.stop.store(true, Ordering::SeqCst);
         }
     }
@@ -593,7 +594,7 @@ fn shim_loop(relay: String, secret: Vec<u8>, stop: Arc<AtomicBool>, ack: Arc<Ato
 /// The loopback socket standing in for `client`, created on first sight, with a
 /// reader thread that frames whatever WireGuard sends back and ships it to the relay.
 fn session_for(sessions: &Arc<Mutex<HashMap<SocketAddr, Arc<Session>>>>, client: SocketAddr, up: &Arc<UdpSocket>, relay: SocketAddr) -> Option<Arc<Session>> {
-    let mut g = sessions.lock().unwrap();
+    let mut g = sessions.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(s) = g.get(&client) {
         return Some(s.clone());
     }
@@ -623,7 +624,7 @@ fn session_for(sessions: &Arc<Mutex<HashMap<SocketAddr, Arc<Session>>>>, client:
 
 pub fn status() -> Value {
     let supported = cfg!(target_os = "linux");
-    let s = state().lock().unwrap();
+    let s = state().lock().unwrap_or_else(|e| e.into_inner());
     let enabled = s.desired.is_some();
     let (public_key, peers) = if supported && iface_up() {
         let pk = server_key().map(|(_, p)| p).unwrap_or_default();
@@ -649,7 +650,7 @@ pub fn status() -> Value {
         .lock()
         .unwrap()
         .as_ref()
-        .map(|sh| (now_ms().saturating_sub(sh.last_ack_ms.load(Ordering::SeqCst)) < 30_000, sh.sessions.lock().unwrap().len()))
+        .map(|sh| (now_ms().saturating_sub(sh.last_ack_ms.load(Ordering::SeqCst)) < 30_000, sh.sessions.lock().unwrap_or_else(|e| e.into_inner()).len()))
         .unwrap_or((false, 0));
     json!({
         "supported": supported,
@@ -677,7 +678,7 @@ pub fn apply_ep(body: &str) -> (Value, u16) {
     match apply_desired(d) {
         Ok(st) => (json!({"ok": true, "status": st}), 200),
         Err(e) => {
-            state().lock().unwrap().last_error = Some(e.clone());
+            state().lock().unwrap_or_else(|e| e.into_inner()).last_error = Some(e.clone());
             (json!({"ok": false, "error": e}), 500)
         }
     }
@@ -686,7 +687,7 @@ pub fn apply_ep(body: &str) -> (Value, u16) {
 pub fn disable_ep() -> (Value, u16) {
     shim_stop();
     let wan = {
-        let mut s = state().lock().unwrap();
+        let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
         s.desired = None;
         std::mem::take(&mut s.wan)
     };
