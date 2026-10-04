@@ -14,6 +14,7 @@ mod presence;
 mod relay;
 mod selfheal;
 mod updatecheck;
+mod vpn;
 #[cfg(windows)]
 mod tray;
 mod schedule;
@@ -643,6 +644,9 @@ fn main() {
         // Give the loopback /ai/chat handler what it needs to reach the hub's
         // relay AI endpoint on the user's behalf (the tray chat talks to this).
         http::set_ai_relay(&relay_addr, &rid, &token);
+        // VPN exit: names itself to the hub's UDP relay by this id, and brings a
+        // previously enabled exit back after a reboot.
+        vpn::start(rid.clone());
         std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si, token));
     }
 
