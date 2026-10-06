@@ -11,8 +11,9 @@ hub itself is separate and private):
 | `itai` | `crates/cli` | a small command-line client for the hub |
 
 Everything here is **MIT** and built in public CI. Nothing phones home to a hardcoded host:
-the hub URL and any token are runtime parameters (`--relay <url>`, `--relay-token <tok>` /
-`HAIVE_HUB`, `HIVE_RELAY_TOKEN`) — there are no embedded endpoints or secrets.
+the hub URL and any token are runtime parameters (`--relay <url>` with `--relay-token htok_…`
+or `HIVE_RELAY_TOKEN` for the agent, `HAIVE_HUB` for the MCP and CLI) — there are no embedded
+endpoints or secrets.
 
 ## Why this is public
 
@@ -69,6 +70,47 @@ from the environment only: never put on a command line, printed, or written to d
 | `ITAI_VERSION` | latest | release tag to install, with or without the leading `v` |
 | `INSTALL_DIR` | `$HOME/.local/bin` | install directory |
 | `ITAI_BASE_URL` | `https://github.com/gitayg/haive-agent/releases` | releases base URL |
+
+## Enroll a device
+
+The hub dashboard's *Register a device* panel shows the exact command. Its shape:
+```sh
+HIVE_RELAY_TOKEN=htok_… ./it-ai --relay https://your-hub.example.com --name <device> --persist
+```
+`--relay-token htok_…` works too, but the environment variable keeps the token off the command
+line. `--persist` adds a per-user autostart entry; `--install` (run as root/admin) installs a boot
+service instead.
+
+From agent 3.7.0, with hub 3.16.0 or later:
+- **The enrollment token is used only to enroll.** On its first hello the agent asks the hub for
+  its own credential, a device secret (`hdev_…`), logs `relay: device credential issued`, and
+  uses that secret for every relay call from then on. The enrollment token is dropped.
+- **Where it lives:** `~/.it-ai/relay.cred` (`%USERPROFILE%\.it-ai\relay.cred` on Windows), mode
+  0600 in a 0700 directory; on Windows it inherits the profile's ACL. It is tied to the hub URL,
+  and a file written for another hub is ignored. For `--install` on macOS and Linux the file goes
+  in the home directory of the service user from the passwd entry (`/var/root`, `/root`), not the
+  `HOME` of the `sudo` that ran it, and that `HOME` is pinned in the LaunchDaemon plist / systemd
+  unit.
+- **The token is not kept on any command line.** Autostart and service entries written by
+  `--persist`, `--install` or `POST /persist` no longer contain `--relay-token`. Until the device
+  has its own secret, the enrollment token is saved in `relay.cred` instead, so the entry still
+  enrolls after a reboot. `--background` and the restart after a self-update pass the token to the
+  new process in `HIVE_RELAY_TOKEN`, not in its arguments.
+- **At startup** the agent uses the device secret in `relay.cred` if there is one for this hub;
+  otherwise `--relay-token`, then `HIVE_RELAY_TOKEN`, then an enrollment token saved in
+  `relay.cred`. With none of these it exits with `relay mode requires an enrollment token`.
+- **Existing installs keep working.** An entry written by an older agent still carries
+  `--relay-token`; the agent enrolls with it and gets its own secret on the first hello. Re-run
+  `--persist` / `--install` (or `POST /persist`) to rewrite the entry without the token. Against a
+  hub older than 3.16.0 the agent simply stays on the enrollment token.
+- **After a revoke.** When the hub refuses the device secret, the agent logs
+  `relay: device credential rejected — re-enroll this device` and retries every 60 s; it never
+  exits. If an enrollment token was passed on this start (flag or `HIVE_RELAY_TOKEN`), it
+  re-enrolls with it at once. Otherwise re-run the enrollment command (`--persist` or
+  `--install` with a current `--relay-token`): a token given on the command line replaces the
+  stored credential, and the next hello issues a fresh secret. A self-update restart and
+  `POST /persist` never do this — they keep a working secret even though they carry the
+  original start's arguments.
 
 ## Verify what you downloaded
 

@@ -6,8 +6,10 @@
 // and pushes ONLY the changed sections to the hub — so the dashboard always has
 // current data with no manual clicks, and the wire only carries deltas.
 use std::collections::BTreeMap;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
+
+use crate::relaycred::{auth_query, RelayCred};
 
 use base64::Engine;
 
@@ -132,11 +134,13 @@ fn base_of(hub: &str) -> String {
 
 /// POST the given sections to the hub. Returns whether the hub wants a full
 /// snapshot (it has no record for us — e.g. it restarted).
-fn post(base: &str, relay_id: &str, token: &str, sections: &BTreeMap<String, String>, full: bool) -> bool {
-    let mut url = format!("{base}/relay/analysis?id={relay_id}");
-    if !token.is_empty() {
-        url.push_str(&format!("&tok={token}"));
-    }
+pub(crate) fn analysis_url(base: &str, relay_id: &str, token: &str) -> String {
+    format!("{base}/relay/analysis?{}", auth_query(relay_id, token))
+}
+
+fn post(base: &str, cred: &RelayCred, sections: &BTreeMap<String, String>, full: bool) -> bool {
+    let relay_id = cred.relay_id();
+    let url = analysis_url(base, relay_id, &cred.token());
     let body = serde_json::json!({ "relay_id": relay_id, "sections": sections, "full": full });
     match ureq::post(&url).timeout(Duration::from_secs(20)).send_json(body) {
         Ok(r) => r
@@ -149,7 +153,7 @@ fn post(base: &str, relay_id: &str, token: &str, sections: &BTreeMap<String, Str
 }
 
 /// Spawn the analysis loop: full snapshot now, then every INTERVAL push deltas.
-pub fn start(hub: String, relay_id: String, token: String) {
+pub fn start(hub: String, cred: Arc<RelayCred>) {
     std::thread::spawn(move || {
         let base = base_of(&hub);
         let mut last: BTreeMap<String, String> = BTreeMap::new();
@@ -167,9 +171,9 @@ pub fn start(hub: String, relay_id: String, token: String) {
             };
             // Always POST at least once (an empty ping still lets the hub ask for
             // a full resync if it lost our record); resend full if it does.
-            let want_full = post(&base, &relay_id, &token, &changed, full_due);
+            let want_full = post(&base, &cred, &changed, full_due);
             if want_full && !full_due {
-                post(&base, &relay_id, &token, &snap, true);
+                post(&base, &cred, &snap, true);
             }
             last = snap;
             cycle = cycle.wrapping_add(1);

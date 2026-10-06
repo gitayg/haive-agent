@@ -14,6 +14,7 @@ mod wakelock;
 mod presence;
 mod reap;
 mod relay;
+mod relaycred;
 mod selfheal;
 mod updatecheck;
 #[cfg(windows)]
@@ -113,9 +114,9 @@ fn relaunch_detached() -> bool {
     }
     let Ok(exe) = std::env::current_exe() else { return false };
     let rest: Vec<String> = std::env::args().skip(1).collect();
-    let mut c = std::process::Command::new(exe);
-    c.args(&rest)
-        .env("HAIVE_DETACHED", "1")
+    // The relay token rides in the child's environment, not its argv.
+    let mut c = relaycred::child_command(&exe, rest);
+    c.env("HAIVE_DETACHED", "1")
         .stdin(std::process::Stdio::null());
     // Detached output used to go to /dev/null, so an agent that died right after
     // printing "running in the background" left NO trace — a panic, a failed bind
@@ -267,11 +268,31 @@ fn agent_asset() -> String {
     .to_string()
 }
 
+/// The relay token is never persisted into the entry: see `prepare_persist_cred`.
 pub(crate) fn persist_args() -> Vec<String> {
-    std::env::args()
-        .skip(1)
-        .filter(|a| !matches!(a.as_str(), "--install" | "--persist" | "--background" | "--uninstall"))
-        .collect()
+    relaycred::strip_persist_args(std::env::args().skip(1))
+}
+
+/// Whether this process is the restart after a self-update (`relaycred::ENV_RESTART`),
+/// read and cleared from the environment at startup so shells it spawns don't inherit it.
+static SELF_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called before any autostart/service entry is written. The entry no longer
+/// carries the relay token, so store `{hub, enroll}` in `relay.cred` for a reboot
+/// before the first hello. `cli` = `--persist`/`--install` on this invocation:
+/// with an enrollment token supplied, that re-enrolls, replacing a stored device
+/// secret. A self-update restart (same argv + env as the original start) and
+/// POST /persist never do. `home` is the home the ENTRY will run with: the
+/// user's for an autostart, the service account's for a service.
+pub(crate) fn prepare_persist_cred(home: &std::path::Path, cli: bool) {
+    let Ok(args) = Args::try_parse_from(std::env::args()) else { return };
+    let Some(hub) = args.relay else { return };
+    let enroll = args.relay_token.or_else(|| std::env::var(relaycred::ENV_TOKEN).ok());
+    let path = relaycred::path_in(home);
+    let reenroll = cli && !SELF_RESTART.load(std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = relaycred::save_enroll_for_persist(&path, &hub, enroll.as_deref(), reenroll) {
+        eprintln!("warn: could not save the relay credential to {} ({e}) — the autostart entry will not be able to enroll", path.display());
+    }
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -466,6 +487,10 @@ fn mics() -> Vec<String> {
 }
 
 fn main() {
+    if std::env::var_os(relaycred::ENV_RESTART).is_some() {
+        SELF_RESTART.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::env::remove_var(relaycred::ENV_RESTART);
+    }
     let args = Args::parse();
 
     if args.background && relaunch_detached() {
@@ -541,7 +566,7 @@ fn main() {
         return;
     }
     let lifetime = if args.persist {
-        persistence::install(&persist_args());
+        persistence::install(&persist_args(), true);
         "persistent (autostart at login)".to_string()
     } else if let Some(mins) = args.ttl {
         std::thread::spawn(move || {
@@ -590,24 +615,36 @@ fn main() {
     if let Some(relay_addr) = args.relay.clone() {
         let rid = relay_id();
         let (nm, si) = (name.clone(), sysinfo.clone());
-        let token = args.relay_token.clone().or_else(|| std::env::var("HIVE_RELAY_TOKEN").ok()).unwrap_or_default();
+        let cred_path = relaycred::default_path();
+        let resolved = relaycred::resolve(
+            &relay_addr,
+            args.relay_token.as_deref(),
+            std::env::var(relaycred::ENV_TOKEN).ok().as_deref(),
+            relaycred::load(&cred_path).as_ref(),
+        );
         // A token is mandatory: the agent will not enroll un-owned. The hub also
         // rejects a tokenless /relay/hello, but refuse up front so it fails loudly
         // here instead of silently never appearing on the hub.
-        if token.is_empty() {
+        let Some(resolved) = resolved else {
             eprintln!(
                 "error: relay mode requires an enrollment token.\n\
                  pass --relay-token htok_… (or set HIVE_RELAY_TOKEN). Mint one from the\n\
                  hub dashboard's \"Register a device\" panel — the device enrolls under your account."
             );
             std::process::exit(2);
+        };
+        if resolved.is_device {
+            println!("   relay: using this device's own credential");
         }
-        direct_token = agent_direct_token(&token, &rid);
+        // ONE credential for every relay caller, so a device secret issued
+        // mid-run reaches all of them at once.
+        let cred = Arc::new(relaycred::RelayCred::new(&relay_addr, &rid, cred_path, resolved));
+        direct_token = cred.direct_token().to_string();
         // LAN-direct authorization: the hub's capability public key. Without it
         // every privileged request arriving on the LAN listener is refused (the
         // controller then uses the relay, where the hub applies the same checks
         // itself), so a fetch failure costs the shortcut, never correctness.
-        match config::fetch_cap_key(&relay_addr, &token) {
+        match config::fetch_cap_key(&relay_addr, &cred) {
             Some(k) if http::set_capability_key(&rid, &k) => {
                 println!("   lan-direct: capability key loaded");
             }
@@ -632,20 +669,20 @@ fn main() {
                 })
                 .unwrap_or_default();
             sans.push(format!("{rid}.it-ai.lan"));
-            if let Some(c) = config::fetch_hub_cert(&relay_addr, &rid, &token, sans) {
+            if let Some(c) = config::fetch_hub_cert(&relay_addr, &cred, sans) {
                 println!("   lan-direct: using hub-signed cert");
                 cert = Some(c);
             }
         }
         println!("   relay: dialing {relay_addr} as {rid}");
-        config::start_poll(relay_addr.clone(), if token.is_empty() { None } else { Some(token.clone()) });
-        analysis::start(relay_addr.clone(), rid.clone(), token.clone());
+        config::start_poll(relay_addr.clone(), Arc::clone(&cred));
+        analysis::start(relay_addr.clone(), Arc::clone(&cred));
         let asset = agent_asset();
         discovery::auto_update_relay(relay_addr.clone(), asset);
         // Give the loopback /ai/chat handler what it needs to reach the hub's
         // relay AI endpoint on the user's behalf (the tray chat talks to this).
-        http::set_ai_relay(&relay_addr, &rid, &token);
-        std::thread::spawn(move || relay::relay_loop(relay_addr, rid, nm, si, token));
+        http::set_ai_relay(&relay_addr, Arc::clone(&cred));
+        std::thread::spawn(move || relay::relay_loop(relay_addr, nm, si, cred));
     }
 
     let registering = if mac_id.is_some() { format!("registering to '{mac_id_disp}'") } else { "relay-only".to_string() };

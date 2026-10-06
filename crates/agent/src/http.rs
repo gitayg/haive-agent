@@ -25,8 +25,7 @@ pub fn loopback_port() -> u16 {
 // Set once at startup (relay mode only) so the loopback /ai/chat handler can reach
 // the hub's relay AI endpoint on the user's behalf — the tray chat posts here.
 static AI_HUB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-static AI_RID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-static AI_TOK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static AI_CRED: std::sync::OnceLock<std::sync::Arc<crate::relaycred::RelayCred>> = std::sync::OnceLock::new();
 
 /// The hub's ed25519 capability public key and this agent's own relay id, both
 /// set once at startup (relay mode only) from `main`. A LAN-direct request must
@@ -84,10 +83,13 @@ fn capability_ok(req: &Request, path: &str, body: Option<&serde_json::Value>) ->
     replay_cache().lock().unwrap().claim(&p.nonce, p.exp, now)
 }
 
-pub fn set_ai_relay(hub: &str, rid: &str, tok: &str) {
+pub fn set_ai_relay(hub: &str, cred: std::sync::Arc<crate::relaycred::RelayCred>) {
     let _ = AI_HUB.set(hub.trim_end_matches('/').to_string());
-    let _ = AI_RID.set(rid.to_string());
-    let _ = AI_TOK.set(tok.to_string());
+    let _ = AI_CRED.set(cred);
+}
+
+pub(crate) fn ai_url(hub: &str, endpoint: &str, relay_id: &str, token: &str) -> String {
+    format!("{hub}/relay/{endpoint}?{}", crate::relaycred::auth_query(relay_id, token))
 }
 
 /// Forward the local chat message up to the hub, which runs the cloud AI loop
@@ -111,12 +113,12 @@ fn request_admin_forward(req: &mut Request) -> Resp {
 /// owns the API key and the tool loop; the endpoint never sees the key. `endpoint`
 /// picks the hub route: `ai-chat` (diagnose) or `ai-apply` (run an approved fix).
 fn ai_forward(req: &mut Request, endpoint: &str) -> Resp {
-    let (Some(hub), Some(rid), Some(tok)) = (AI_HUB.get(), AI_RID.get(), AI_TOK.get()) else {
+    let (Some(hub), Some(cred)) = (AI_HUB.get(), AI_CRED.get()) else {
         return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs relay mode (this agent was started without --relay)."}), 200);
     };
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
-    let url = format!("{hub}/relay/{endpoint}?tok={tok}&id={rid}");
+    let url = ai_url(hub, endpoint, cred.relay_id(), &cred.token());
     match ureq::post(&url)
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(150))
@@ -672,20 +674,21 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
     if !crate::selfheal::ensure_installed(&exe, bytes, replaced) {
         return false;
     }
+    // Same args, except a relay token moves from argv to HIVE_RELAY_TOKEN so the
+    // restarted agent doesn't carry it on its command line.
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         // exec() replaces the process on success and never returns; if it returns,
         // it failed — fall through and spawn a fresh process instead.
-        let e = std::process::Command::new(&exe).args(&args).exec();
+        let e = crate::relaycred::restart_command(&exe, args.clone()).exec();
         eprintln!("update: exec failed ({e}); spawning a replacement instead");
     }
     // Report whether the replacement actually launched. Callers must NOT exit the
     // still-running process when this is false — a failed relaunch with no
     // supervisor would otherwise leave the device dead.
-    let mut c = std::process::Command::new(&exe);
-    c.args(&args);
+    let mut c = crate::relaycred::restart_command(&exe, args);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -757,7 +760,7 @@ fn dissolve_ep() -> Resp {
 /// POST /persist — promote this running agent to a persistent autostart install
 /// (per-user autostart with the current relay args), and keep it awake on AC.
 fn persist_ep() -> Resp {
-    crate::persistence::install(&crate::persist_args());
+    crate::persistence::install(&crate::persist_args(), false);
     Response::from_string(format!("made persistent — {} (keep-awake on AC enabled)", crate::persistence::current_mode()))
 }
 

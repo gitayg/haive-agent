@@ -6,7 +6,8 @@ use std::env;
 #[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 
-pub fn install(args: &[String]) {
+pub fn install(args: &[String], cli: bool) {
+    crate::prepare_persist_cred(&PathBuf::from(home()), cli);
     let exe = env::current_exe().unwrap_or_default();
     #[cfg(windows)]
     win_install(&exe, args);
@@ -24,13 +25,15 @@ pub fn install(args: &[String]) {
 /// key / LaunchAgent): survives reboots and restarts the agent if it dies.
 /// Requires elevation to create; run the enrollment command as admin/root.
 pub fn install_service(args: &[String]) {
+    let svc_home = service_home();
+    crate::prepare_persist_cred(&svc_home, true);
     let exe = env::current_exe().unwrap_or_default();
     #[cfg(windows)]
     win_install_service(&exe, args);
     #[cfg(target_os = "macos")]
-    mac_install_service(&exe, args);
+    mac_install_service(&exe, args, &svc_home);
     #[cfg(all(unix, not(target_os = "macos")))]
-    linux_install_service(&exe, args);
+    linux_install_service(&exe, args, &svc_home);
     let _ = (&exe, args);
     keep_awake_on_ac();
 }
@@ -114,6 +117,46 @@ pub(crate) fn home() -> String {
     env::var("HOME")
         .or_else(|_| env::var("USERPROFILE"))
         .unwrap_or_default()
+}
+
+/// The home a boot/logon SERVICE runs with, which is also where its relay.cred
+/// goes. A root service may start with no HOME at all (systemd without `User=`)
+/// or a different one from the `sudo` that installed it, so on unix this is the
+/// passwd entry of the effective uid; the inherited HOME is only a fallback if
+/// that lookup fails. Windows: schtasks runs as the installing user — `home()`.
+pub(crate) fn service_home() -> PathBuf {
+    #[cfg(unix)]
+    {
+        let inherited = env::var("HOME").ok();
+        let pw = passwd_home(unsafe { libc::geteuid() });
+        if pw.is_none() {
+            eprintln!("warn: no passwd entry for this uid — using the inherited HOME for the service");
+        }
+        pick_service_home(inherited.as_deref(), pw)
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(home())
+    }
+}
+
+#[cfg(unix)]
+fn pick_service_home(inherited: Option<&str>, passwd: Option<PathBuf>) -> PathBuf {
+    passwd.unwrap_or_else(|| PathBuf::from(inherited.unwrap_or_default()))
+}
+
+#[cfg(unix)]
+fn passwd_home(uid: libc::uid_t) -> Option<PathBuf> {
+    // SAFETY: getpwuid returns a pointer into static storage (or null); we copy
+    // pw_dir out before any other passwd call can overwrite it.
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned();
+        (!dir.is_empty()).then(|| PathBuf::from(dir))
+    }
 }
 
 // ---- macOS: LaunchAgent ----
@@ -256,15 +299,22 @@ fn daemon_path() -> PathBuf {
     PathBuf::from("/Library/LaunchDaemons/com.itai.agent.plist")
 }
 
-#[cfg(target_os = "macos")]
-fn mac_install_service(exe: &Path, args: &[String]) {
+/// The LaunchDaemon plist, with HOME pinned to the service home (see `service_home`).
+#[cfg(any(target_os = "macos", test))]
+fn daemon_plist(exe: &Path, args: &[String], home: &Path) -> String {
     let mut pa = format!("      <string>{}</string>\n", exe.display());
     for a in args {
         pa.push_str(&format!("      <string>{a}</string>\n"));
     }
-    let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.itai.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n</dict></plist>\n"
-    );
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.itai.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>EnvironmentVariables</key><dict>\n    <key>HOME</key><string>{}</string>\n  </dict>\n</dict></plist>\n",
+        home.display()
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn mac_install_service(exe: &Path, args: &[String], home: &Path) {
+    let plist = daemon_plist(exe, args, home);
     let p = daemon_path();
     let _ = std::fs::write(&p, plist);
     let _ = std::process::Command::new("launchctl").args(["load", &p.to_string_lossy()]).status();
@@ -283,16 +333,25 @@ fn unit_path() -> PathBuf {
     PathBuf::from("/etc/systemd/system/it-ai.service")
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-fn linux_install_service(exe: &Path, args: &[String]) {
+/// The systemd unit, with HOME pinned to the service home (see `service_home`).
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn service_unit(exe: &Path, args: &[String], home: &Path) -> String {
     let mut ex = format!("{}", exe.display());
     for a in args {
         ex.push(' ');
         ex.push_str(a);
     }
-    let unit = format!(
-        "[Unit]\nDescription=IT-AI agent\nAfter=network.target\n\n[Service]\nExecStart={ex}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
-    );
+    // Quoted only when needed: systemd splits an unquoted Environment= on spaces.
+    let home = home.display().to_string();
+    let env = if home.contains(char::is_whitespace) { format!("\"HOME={home}\"") } else { format!("HOME={home}") };
+    format!(
+        "[Unit]\nDescription=IT-AI agent\nAfter=network.target\n\n[Service]\nEnvironment={env}\nExecStart={ex}\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_install_service(exe: &Path, args: &[String], home: &Path) {
+    let unit = service_unit(exe, args, home);
     let _ = std::fs::write(unit_path(), unit);
     let _ = std::process::Command::new("systemctl").arg("daemon-reload").status();
     let _ = std::process::Command::new("systemctl").args(["enable", "--now", "it-ai.service"]).status();
@@ -438,4 +497,45 @@ fn pmset_ac_sleep() -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod service_home_tests {
+    use super::*;
+
+    fn args() -> Vec<String> {
+        vec!["--relay".into(), "https://hub.example".into()]
+    }
+
+    #[test]
+    fn systemd_unit_pins_home() {
+        let u = service_unit(Path::new("/usr/local/bin/it-ai"), &args(), Path::new("/root"));
+        assert!(u.lines().any(|l| l == "Environment=HOME=/root"), "unit has no pinned HOME:\n{u}");
+        assert!(u.contains("ExecStart=/usr/local/bin/it-ai --relay https://hub.example\n"));
+    }
+
+    #[test]
+    fn launchdaemon_plist_pins_home() {
+        let p = daemon_plist(Path::new("/usr/local/bin/it-ai"), &args(), Path::new("/var/root"));
+        let compact: String = p.split_whitespace().collect();
+        assert!(
+            compact.contains("<key>EnvironmentVariables</key><dict><key>HOME</key><string>/var/root</string></dict>"),
+            "plist has no pinned HOME:\n{p}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_home_ignores_an_inherited_home() {
+        let real = PathBuf::from("/var/root");
+        assert_eq!(pick_service_home(Some("/home/sudo-user"), Some(real.clone())), real);
+        assert_eq!(pick_service_home(None, Some(real.clone())), real);
+        // Lookup failure is the only time the inherited HOME is used.
+        assert_eq!(pick_service_home(Some("/fallback"), None), PathBuf::from("/fallback"));
+        // And the real lookup works for this uid.
+        let me = passwd_home(unsafe { libc::geteuid() }).expect("passwd entry for the test uid");
+        assert!(me.is_absolute(), "{me:?}");
+        // The real entry point agrees, whatever HOME this process inherited.
+        assert_eq!(service_home(), me, "inherited HOME={:?}", env::var("HOME"));
+    }
 }
