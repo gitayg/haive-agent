@@ -165,15 +165,45 @@ fn plist_path() -> PathBuf {
     PathBuf::from(home()).join("Library/LaunchAgents/com.itai.agent.plist")
 }
 
+/// stdout+stderr of a launchd job go nowhere unless the plist names a file, so an
+/// agent that dies at startup under launchd left no trace. Both go to the same
+/// `<home>/.it-ai/agent.log` the `--background` relaunch uses.
+#[cfg(any(target_os = "macos", test))]
+fn plist_log_keys(home: &Path) -> String {
+    let log = crate::logfile::path_in(home);
+    format!(
+        "  <key>StandardOutPath</key><string>{0}</string>\n  <key>StandardErrorPath</key><string>{0}</string>\n",
+        log.display()
+    )
+}
+
+/// launchd would create a missing log 0644 in a 0744 dir; make both owner-only first.
 #[cfg(target_os = "macos")]
-fn mac_install(exe: &Path, args: &[String]) {
+fn prepare_plist_log(home: &Path) {
+    let log = crate::logfile::path_in(home);
+    if let Err(e) = crate::logfile::prepare(&log) {
+        eprintln!("warn: could not create {} ({e}) — launchd will create it", log.display());
+    }
+}
+
+/// The LaunchAgent plist; `home` is the user's, where its log goes.
+#[cfg(any(target_os = "macos", test))]
+fn agent_plist(exe: &Path, args: &[String], home: &Path) -> String {
     let mut pa = format!("      <string>{}</string>\n", exe.display());
     for a in args {
         pa.push_str(&format!("      <string>{a}</string>\n"));
     }
-    let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.itai.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n</dict></plist>\n"
-    );
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.itai.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n{}</dict></plist>\n",
+        plist_log_keys(home)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn mac_install(exe: &Path, args: &[String]) {
+    let home = PathBuf::from(home());
+    prepare_plist_log(&home);
+    let plist = agent_plist(exe, args, &home);
     let p = plist_path();
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -299,7 +329,8 @@ fn daemon_path() -> PathBuf {
     PathBuf::from("/Library/LaunchDaemons/com.itai.agent.plist")
 }
 
-/// The LaunchDaemon plist, with HOME pinned to the service home (see `service_home`).
+/// The LaunchDaemon plist, with HOME pinned to the service home (see `service_home`)
+/// and its log in that home.
 #[cfg(any(target_os = "macos", test))]
 fn daemon_plist(exe: &Path, args: &[String], home: &Path) -> String {
     let mut pa = format!("      <string>{}</string>\n", exe.display());
@@ -307,13 +338,15 @@ fn daemon_plist(exe: &Path, args: &[String], home: &Path) -> String {
         pa.push_str(&format!("      <string>{a}</string>\n"));
     }
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.itai.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>EnvironmentVariables</key><dict>\n    <key>HOME</key><string>{}</string>\n  </dict>\n</dict></plist>\n",
-        home.display()
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>com.itai.agent</string>\n  <key>ProgramArguments</key><array>\n{pa}  </array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>EnvironmentVariables</key><dict>\n    <key>HOME</key><string>{}</string>\n  </dict>\n{}</dict></plist>\n",
+        home.display(),
+        plist_log_keys(home)
     )
 }
 
 #[cfg(target_os = "macos")]
 fn mac_install_service(exe: &Path, args: &[String], home: &Path) {
+    prepare_plist_log(home);
     let plist = daemon_plist(exe, args, home);
     let p = daemon_path();
     let _ = std::fs::write(&p, plist);
@@ -522,6 +555,48 @@ mod service_home_tests {
             compact.contains("<key>EnvironmentVariables</key><dict><key>HOME</key><string>/var/root</string></dict>"),
             "plist has no pinned HOME:\n{p}"
         );
+    }
+
+    /// A launchd job with no StandardOutPath/StandardErrorPath logs nowhere.
+    fn assert_logs_to(plist: &str, log: &str) {
+        let compact: String = plist.split_whitespace().collect();
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            assert!(
+                compact.contains(&format!("<key>{key}</key><string>{log}</string>")),
+                "plist has no {key} → {log}:\n{plist}"
+            );
+        }
+    }
+
+    #[test]
+    fn launchagent_plist_logs_to_the_users_agent_log() {
+        let p = agent_plist(Path::new("/usr/local/bin/it-ai"), &args(), Path::new("/Users/someone"));
+        assert_logs_to(&p, "/Users/someone/.it-ai/agent.log");
+    }
+
+    #[test]
+    fn launchdaemon_plist_logs_to_the_service_homes_agent_log() {
+        let p = daemon_plist(Path::new("/usr/local/bin/it-ai"), &args(), Path::new("/var/root"));
+        assert_logs_to(&p, "/var/root/.it-ai/agent.log");
+    }
+
+    /// Both plists must still parse as property lists once the keys are added.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn plists_pass_plutil_lint() {
+        let d = std::env::temp_dir().join(format!("it-ai-plist-lint-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let exe = Path::new("/usr/local/bin/it-ai");
+        for (name, body) in [
+            ("agent.plist", agent_plist(exe, &args(), Path::new("/Users/someone"))),
+            ("daemon.plist", daemon_plist(exe, &args(), Path::new("/var/root"))),
+        ] {
+            let f = d.join(name);
+            std::fs::write(&f, body).unwrap();
+            let out = std::process::Command::new("/usr/bin/plutil").arg("-lint").arg(&f).output().unwrap();
+            assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stdout));
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[cfg(unix)]

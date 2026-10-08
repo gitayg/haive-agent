@@ -614,6 +614,11 @@ fn update_ep(req: &mut Request) -> Resp {
     if !url.starts_with("https://") {
         return Response::from_string("update url must be https").with_status_code(400);
     }
+    // One update at a time (see `updatelock`). Refuse rather than wait: this is the
+    // HTTP thread, and the other update may be mid-download for minutes.
+    let Some(slot) = crate::updatelock::try_begin() else {
+        return Response::from_string("an update is already in progress; try again shortly").with_status_code(409);
+    };
     let bytes = match download_bytes(&url) {
         Some(b) if !b.is_empty() => b,
         _ => return Response::from_string("download failed").with_status_code(502),
@@ -634,7 +639,7 @@ fn update_ep(req: &mut Request) -> Resp {
     if !verify_update_sig(&bytes, &sig) {
         return Response::from_string("update signature invalid").with_status_code(400);
     }
-    if !apply_update(&bytes) {
+    if !apply_update(slot, &bytes) {
         return Response::from_string("update failed").with_status_code(500);
     }
     std::thread::spawn(|| {
@@ -649,7 +654,10 @@ fn update_ep(req: &mut Request) -> Resp {
 /// socket closes on exec) — which avoids the spawn-then-exit race where the new
 /// process tried to bind :8765 before the old one released it and panicked with
 /// AddrInUse. On Windows it spawns a fresh process; the caller then exits.
-pub(crate) fn apply_update(bytes: &[u8]) -> bool {
+///
+/// `slot` proves the caller holds the one-update-at-a-time lock. It is released
+/// if the update fails and held for good once the replacement has launched.
+pub(crate) fn apply_update(slot: crate::updatelock::UpdateSlot, bytes: &[u8]) -> bool {
     // Resolve our own path BEFORE self_replace. Afterwards, on Linux, the running
     // binary's inode is unlinked and current_exe() returns a stale
     // ".../it-ai (deleted)" path — exec/spawn against that fail with ENOENT, so we'd
@@ -663,7 +671,18 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
             return false;
         }
     };
-    let tmp = std::env::temp_dir().join("it-ai-update.bin");
+    // A UNIQUE temp path per call. A fixed "it-ai-update.bin" was shared by the two
+    // updaters a relay agent runs at once — the auto_update_relay loop and a
+    // hub-pushed POST /update. `std::fs::write` opens with O_TRUNC, so it zeroes the
+    // file before writing; if the other updater's self_replace copied it during that
+    // window it copied 0 bytes and renamed a 0-byte file over the launch path. That
+    // is the LMmOS-AHGQCQ0G6CR brick (2026-09-01, during the hub's OOM restart loop
+    // re-pushing /update). A per-call name means the two never touch the same file.
+    let tmp = std::env::temp_dir().join(format!(
+        "it-ai-update-{}-{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    ));
     if std::fs::write(&tmp, bytes).is_err() {
         return false;
     }
@@ -703,7 +722,10 @@ pub(crate) fn apply_update(bytes: &[u8]) -> bool {
             .stderr(std::process::Stdio::null());
     }
     match c.spawn() {
-        Ok(_) => true,
+        Ok(_) => {
+            slot.hold_until_exit();
+            true
+        }
         Err(e) => {
             eprintln!("update: relaunch failed: {e}; staying on the current version");
             false
@@ -1639,6 +1661,32 @@ async function run(c){if(!c)return;out.style.display='block';out.textContent='$ 
     :('[error] '+(j.error||'failed')));}
   catch(err){out.textContent='$ '+c+'\n[error] '+err;}}
 </script></body></html>"####;
+
+#[cfg(test)]
+mod update_ep_tests {
+    use super::update_ep;
+
+    /// A hub-pushed /update that arrives while another update holds the slot is
+    /// refused at once, before it downloads anything.
+    #[test]
+    fn update_is_refused_while_another_is_in_progress() {
+        let _serial = crate::updatelock::TEST_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let held = crate::updatelock::try_begin().expect("slot free at test start");
+        // Port 1 on loopback: if the lock let this through, the download would fail
+        // fast with a 502 rather than reach anything real.
+        let mut req: tiny_http::Request = tiny_http::TestRequest::new()
+            .with_method(tiny_http::Method::Post)
+            .with_path("/update")
+            .with_body(r#"{"url":"https://127.0.0.1:1/it-ai"}"#)
+            .into();
+        let resp = update_ep(&mut req);
+        drop(held);
+        assert_eq!(resp.status_code().0, 409, "a second update must be refused, not run");
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut resp.into_reader(), &mut body).unwrap();
+        assert!(body.contains("already in progress"), "{body}");
+    }
+}
 
 #[cfg(test)]
 mod fetch_tests {

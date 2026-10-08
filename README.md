@@ -135,6 +135,19 @@ byte-identical to the one running, the agent answers "already running this build
 reinstalling and restarting. The checksum file is not signed — a hub lying about it can only
 delay an update, never install one, because every installed binary must carry a valid signature.
 
+From agent 3.7.1 only one update runs at a time. A pushed `POST /update` that arrives while the
+two-minute check is installing (or the other way round) answers `409 an update is already in
+progress` and the check skips that cycle. Each update writes its own temp file, and the agent
+refuses to install a 0-byte binary or one whose size on disk does not match what it downloaded.
+It stays on the current version instead. Before 3.7.1 the two updaters shared one temp file and
+could install an empty binary, which left the device dead until it was reinstalled by hand.
+
+On macOS, an agent started by launchd (`--persist` LaunchAgent or `--install` LaunchDaemon) now
+writes stdout and stderr to `~/.it-ai/agent.log`. For the LaunchDaemon that is the service account's
+home, `/var/root/.it-ai/agent.log`. A `--background` agent already logged there. The installer
+creates the file as 0600 in a 0700 directory. At startup the agent empties it in place if it has passed 1 MB.
+Re-run `--persist` or `--install` to add logging to an existing install.
+
 ## LAN-direct
 
 When a controller and an agent share a network, traffic goes **straight over the LAN** instead of

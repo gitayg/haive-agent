@@ -9,6 +9,7 @@ mod discovery;
 mod http;
 mod input;
 mod jobs;
+mod logfile;
 mod persistence;
 mod wakelock;
 mod presence;
@@ -17,6 +18,7 @@ mod relay;
 mod relaycred;
 mod selfheal;
 mod updatecheck;
+mod updatelock;
 #[cfg(windows)]
 mod tray;
 mod schedule;
@@ -89,20 +91,15 @@ struct Args {
 /// Where a detached agent's stdout/stderr land, so "it just vanished" is always
 /// answerable. Lives beside the agent's certs in ~/.it-ai.
 fn log_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(persistence::home()).join(".it-ai").join("agent.log")
+    logfile::path_in(std::path::Path::new(&persistence::home()))
 }
 
-/// Append handle to the log, creating ~/.it-ai as needed. Truncated once past
-/// ~1 MB so an agent that restart-loops for months can't fill the disk.
+/// Append handle to the log, creating ~/.it-ai (0700) and the file (0600) as
+/// needed and trimming it past ~1 MB (see `logfile`).
 fn log_file() -> Option<std::fs::File> {
     let p = log_path();
-    if let Some(dir) = p.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    if std::fs::metadata(&p).map(|m| m.len() > 1_000_000).unwrap_or(false) {
-        let _ = std::fs::remove_file(&p);
-    }
-    std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
+    logfile::prepare(&p).ok()?;
+    std::fs::OpenOptions::new().append(true).open(&p).ok()
 }
 
 /// If `--background` was given, re-spawn ourselves detached (no console, stdio to
@@ -492,6 +489,9 @@ fn main() {
         std::env::remove_var(relaycred::ENV_RESTART);
     }
     let args = Args::parse();
+    // A launchd-started agent logs into agent.log through launchd's own handle and
+    // never goes through `log_file`, so trim it here too.
+    logfile::cap(&log_path());
 
     if args.background && relaunch_detached() {
         return;

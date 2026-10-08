@@ -123,6 +123,8 @@ pub fn auto_update_loop(primary: String, fallback_id: Option<String>, asset: Str
             if unchanged_upstream(&format!("http://{ip}:{port}/bin"), &asset, &own_hash) {
                 continue;
             }
+            // One update at a time: if a hub-pushed /update is running, skip this cycle.
+            let Some(slot) = crate::updatelock::try_begin() else { continue };
             let url = format!("http://{ip}:{port}/bin/{asset}");
             if let Some(newb) = download_agent(&url) {
                 // Verify a pinned-key signature before self-replacing — the LAN
@@ -132,7 +134,7 @@ pub fn auto_update_loop(primary: String, fallback_id: Option<String>, asset: Str
                 if !newb.is_empty()
                     && newb != self_bytes
                     && sig.as_deref().map(|s| crate::http::verify_update_sig(&newb, s)).unwrap_or(false)
-                    && crate::http::apply_update(&newb)
+                    && crate::http::apply_update(slot, &newb)
                 {
                     std::thread::sleep(Duration::from_millis(500));
                     std::process::exit(0);
@@ -157,6 +159,8 @@ pub fn auto_update_relay(base: String, asset: String) {
         if unchanged_upstream(&format!("{b}/bin"), &asset, &own_hash) {
             continue;
         }
+        // One update at a time: if a hub-pushed /update is running, skip this cycle.
+        let Some(slot) = crate::updatelock::try_begin() else { continue };
         let url = format!("{b}/bin/{asset}");
         if let Some(newb) = download_agent(&url) {
             // Require a valid pinned-key signature so a compromised/rogue hub can't
@@ -165,7 +169,7 @@ pub fn auto_update_relay(base: String, asset: String) {
             if !newb.is_empty()
                 && newb != self_bytes
                 && sig.as_deref().map(|s| crate::http::verify_update_sig(&newb, s)).unwrap_or(false)
-                && crate::http::apply_update(&newb)
+                && crate::http::apply_update(slot, &newb)
             {
                 std::thread::sleep(Duration::from_millis(500));
                 std::process::exit(0);

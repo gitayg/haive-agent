@@ -30,6 +30,19 @@ use std::path::Path;
 /// a content comparison; the case it guards against is a missing or truncated
 /// file, which a length check catches.
 pub(crate) fn ensure_installed(exe: &Path, bytes: &[u8], replaced: bool) -> bool {
+    // A 0-byte "binary" is never a legitimate update — it is the shape of a
+    // half-finished download or a `std::fs::write` truncation window caught by a
+    // racing self_replace (two updaters share one temp path). Installing it is the
+    // field brick: LMmOS-AHGQCQ0G6CR (2026-09-01) ended up with a 0-byte 0755
+    // launch path that launchd respawned to no effect 12,756 times. Refuse here
+    // and leave whatever is already there, so the caller stays on the old version
+    // rather than exiting into a dead path. The callers already reject empty
+    // downloads; this makes the last-resort writer safe even if a future one does
+    // not.
+    if bytes.is_empty() {
+        eprintln!("update: refusing to install a 0-byte binary at {} — staying on current version", exe.display());
+        return false;
+    }
     let ok_now = std::fs::metadata(exe).map(|m| m.len() as usize == bytes.len()).unwrap_or(false);
     if ok_now {
         return true;
@@ -49,6 +62,13 @@ pub(crate) fn ensure_installed(exe: &Path, bytes: &[u8], replaced: bool) -> bool
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755));
+    }
+    // Read the size back: a write that returned Ok can still have landed short on a
+    // full disk, and shipping a truncated binary is the same dead device by another
+    // route. Only report success when the launch path actually holds all the bytes.
+    if std::fs::metadata(exe).map(|m| m.len() as usize).unwrap_or(0) != bytes.len() {
+        eprintln!("update: restored binary at {} is the wrong size — staying on current version", exe.display());
+        return false;
     }
     true
 }
@@ -136,6 +156,36 @@ mod tests {
 
         assert!(!ensure_installed(&exe, NEW, false));
         assert!(!exe.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Empty `bytes` is never a real binary. A 0-byte "update" is exactly the
+    /// field brick (LMmOS-AHGQCQ0G6CR, 2026-09-01: launch path became a 0-byte
+    /// 0755 file and launchd respawned it 12,756 times, each exiting 0 at once).
+    /// `ensure_installed` is the last line of defense before the caller exits, so
+    /// it must REFUSE empty bytes and leave the existing, working binary intact
+    /// and executable rather than overwrite it with nothing.
+    #[test]
+    fn refuses_to_install_an_empty_binary_over_a_working_one() {
+        let d = scratch("empty");
+        let exe = d.join("it-ai");
+        std::fs::write(&exe, NEW).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Must report failure so apply_update does NOT exit into a dead path.
+        assert!(!ensure_installed(&exe, b"", false), "a 0-byte update must be refused");
+        // The working binary must be untouched — same bytes, still executable.
+        assert_eq!(std::fs::read(&exe).unwrap(), NEW, "the working binary was overwritten");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755, "a device that cannot exec its own binary is still dead");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }
