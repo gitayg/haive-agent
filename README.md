@@ -244,6 +244,9 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
 - The agent only receives each pass's public key and preshared key; it never sees a client's
   private key. Pass expiry is enforced on the device too, and the applied state is restored after
   a reboot.
+- Apply, disable, the boot resume and the expiry ticker run one at a time. A disable stops a resume
+  that is still retrying, and the ticker cannot write back a pass list that a disable or a newer
+  apply replaced.
 
 ## Operator skill
 

@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const IFACE: &str = "itai-wg";
@@ -223,11 +223,56 @@ struct State {
     desired: Option<Desired>,
     wan: String,
     last_error: Option<String>,
+    /// Bumped by every hub apply and disable. Work that started under an older
+    /// generation (the boot resume, a ticker step) must not write its result back.
+    generation: u64,
+}
+
+impl State {
+    /// The hub changed its mind: anything already in flight is stale.
+    fn supersede(&mut self) {
+        self.generation += 1;
+    }
+
+    fn disable(&mut self) -> String {
+        self.supersede();
+        self.desired = None;
+        std::mem::take(&mut self.wan)
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    /// The ticker's read: the generation it saw, and the desired state without
+    /// its expired peers. None when nothing expired.
+    fn expiry_plan(&self, now: u64) -> Option<(u64, Desired)> {
+        let d = self.desired.as_ref()?;
+        let live = live_peers(&d.peers, now);
+        (live.len() != d.peers.len()).then(|| (self.generation, Desired { peers: live, ..d.clone() }))
+    }
+
+    /// The ticker's write: refused if the hub applied or disabled since the read.
+    fn commit_expiry(&mut self, generation: u64, next: Desired) -> bool {
+        if !self.is_current(generation) {
+            return false;
+        }
+        self.desired = Some(next);
+        true
+    }
 }
 
 fn state() -> &'static Mutex<State> {
     static S: OnceLock<Mutex<State>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(State { desired: None, wan: String::new(), last_error: None }))
+    S.get_or_init(|| Mutex::new(State { desired: None, wan: String::new(), last_error: None, generation: 0 }))
+}
+
+/// Serialises everything that changes the exit (hub apply and disable, the boot
+/// resume, the ticker), so their system changes never interleave. Take it
+/// before `state()`, never while holding `state()`.
+fn op() -> MutexGuard<'static, ()> {
+    static O: OnceLock<Mutex<()>> = OnceLock::new();
+    O.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 static DEVICE: OnceLock<String> = OnceLock::new();
@@ -240,37 +285,63 @@ pub fn start(device: String) {
     }
     let _ = DEVICE.set(device);
     std::thread::spawn(|| {
+        // Read the generation before the file: a hub apply that lands in between
+        // then either wrote the file we load, or supersedes the resume.
+        let generation = state().lock().unwrap_or_else(|e| e.into_inner()).generation;
         if let Some(d) = load_desired() {
-            // The network may not be up yet at boot: keep trying until it takes.
-            loop {
-                match apply_desired(d.clone()) {
-                    Ok(_) => break,
-                    Err(e) => {
-                        println!("[vpn] resume failed, retrying in 30s: {e}");
-                        std::thread::sleep(Duration::from_secs(30));
-                    }
-                }
-            }
+            resume(d, generation);
         }
         ticker();
     });
+}
+
+/// The network may not be up yet at boot: keep trying until it takes, unless
+/// the hub applies or disables in the meantime.
+fn resume(d: Desired, generation: u64) {
+    loop {
+        {
+            let _op = op();
+            if !state().lock().unwrap_or_else(|e| e.into_inner()).is_current(generation) {
+                println!("[vpn] resume superseded by the hub");
+                return;
+            }
+            match apply_desired(d.clone()) {
+                Ok(_) => return,
+                Err(e) => println!("[vpn] resume failed, retrying in 30s: {e}"),
+            }
+        }
+        std::thread::sleep(Duration::from_secs(30));
+    }
 }
 
 /// Every 15s: drop expired peers, and re-point NAT if the uplink changed (Wi-Fi ↔ Ethernet).
 fn ticker() {
     loop {
         std::thread::sleep(Duration::from_secs(15));
-        let Some(d) = state().lock().unwrap_or_else(|e| e.into_inner()).desired.clone() else { continue };
-        let live = live_peers(&d.peers, now_secs());
-        if live.len() != d.peers.len() {
-            let mut next = d.clone();
-            next.peers = live;
+        let _op = op();
+        let expired = {
+            // Read, decide, write and persist under one lock: a disable cannot
+            // land in between and be undone.
+            let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
+            match s.expiry_plan(now_secs()) {
+                Some((generation, next)) if s.commit_expiry(generation, next.clone()) => {
+                    save_desired(&next);
+                    Some(next)
+                }
+                _ => None,
+            }
+        };
+        if let Some(next) = expired {
             reconcile_peers(&next.peers);
-            save_desired(&next);
-            state().lock().unwrap_or_else(|e| e.into_inner()).desired = Some(next);
+        }
+        let (enabled, old) = {
+            let s = state().lock().unwrap_or_else(|e| e.into_inner());
+            (s.desired.is_some(), s.wan.clone())
+        };
+        if !enabled {
+            continue;
         }
         if let Some(wan) = wan_iface() {
-            let old = state().lock().unwrap_or_else(|e| e.into_inner()).wan.clone();
             if wan != old {
                 remove_rules(&old);
                 if ensure_rules(&wan).is_ok() {
@@ -466,9 +537,9 @@ fn apply_desired(d: Desired) -> Result<Value, String> {
     d.peers = live_peers(&d.peers, now_secs());
     reconcile_peers(&d.peers);
     shim_ensure(&d.relay, hex_decode(&d.secret).unwrap_or_default());
-    save_desired(&d);
     {
         let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
+        save_desired(&d);
         s.desired = Some(d);
         s.wan = wan;
         s.last_error = None;
@@ -675,6 +746,8 @@ pub fn apply_ep(body: &str) -> (Value, u16) {
         Ok(d) => d,
         Err(e) => return (json!({"ok": false, "error": format!("bad body: {e}")}), 400),
     };
+    let _op = op();
+    state().lock().unwrap_or_else(|e| e.into_inner()).supersede();
     match apply_desired(d) {
         Ok(st) => (json!({"ok": true, "status": st}), 200),
         Err(e) => {
@@ -685,17 +758,19 @@ pub fn apply_ep(body: &str) -> (Value, u16) {
 }
 
 pub fn disable_ep() -> (Value, u16) {
+    let _op = op();
     shim_stop();
     let wan = {
+        // The saved file goes under the same lock as the in-memory state, so a
+        // ticker step can never write it back after this.
         let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
-        s.desired = None;
-        std::mem::take(&mut s.wan)
+        let _ = std::fs::remove_file(dir().join("desired.json"));
+        s.disable()
     };
     remove_rules(&wan);
     if iface_up() {
         let _ = run("ip", &["link", "del", IFACE]);
     }
-    let _ = std::fs::remove_file(dir().join("desired.json"));
     (json!({"ok": true}), 200)
 }
 
@@ -753,6 +828,50 @@ mod tests {
         d.relay = "no-port".into();
         assert!(validate(&d).is_err());
         assert_eq!(live_peers(&[p("10.77.0.2/32", 10), p("10.77.0.3/32", 20)], 15).len(), 1);
+    }
+
+    fn enabled_state(peers: &[(&str, u64)]) -> State {
+        let key = "A2+2dpchy903HY/kmF70XH8jsgBgj1Vvf4+64neJqwI=".to_string();
+        let peers = peers.iter().map(|(ip, exp)| Peer { public_key: key.clone(), preshared_key: key.clone(), allowed_ips: (*ip).into(), expires_at: *exp }).collect();
+        let d = Desired { relay: "relay.example:31820".into(), secret: "ab".repeat(16), peers };
+        State { desired: Some(d), wan: "eth0".into(), last_error: None, generation: 1 }
+    }
+
+    #[test]
+    fn a_disable_between_the_tickers_read_and_write_stays_disabled() {
+        let mut s = enabled_state(&[("10.77.0.2/32", 10), ("10.77.0.3/32", 20)]);
+        let (generation, next) = s.expiry_plan(15).expect("one peer expired");
+        s.disable();
+        assert!(!s.commit_expiry(generation, next), "the stale write must be refused");
+        assert!(s.desired.is_none(), "the disable must not be undone");
+
+        // Disable then a fresh apply: the old pass list must not overwrite the new one.
+        let mut s = enabled_state(&[("10.77.0.2/32", 10), ("10.77.0.3/32", 20)]);
+        let (generation, next) = s.expiry_plan(15).unwrap();
+        s.disable();
+        s.supersede();
+        s.desired = enabled_state(&[("10.77.0.9/32", 99)]).desired;
+        assert!(!s.commit_expiry(generation, next));
+        assert_eq!(s.desired.as_ref().unwrap().peers[0].allowed_ips, "10.77.0.9/32");
+
+        // Control: with nothing in between, the expired peer is dropped.
+        let mut s = enabled_state(&[("10.77.0.2/32", 10), ("10.77.0.3/32", 20)]);
+        let (generation, next) = s.expiry_plan(15).unwrap();
+        assert!(s.commit_expiry(generation, next));
+        assert_eq!(s.desired.as_ref().unwrap().peers.len(), 1);
+        assert!(s.expiry_plan(15).is_none(), "nothing left to expire");
+    }
+
+    #[test]
+    fn a_hub_disable_or_apply_stops_the_boot_resume() {
+        let mut s = enabled_state(&[("10.77.0.2/32", 10)]);
+        let seen = s.generation;
+        assert!(s.is_current(seen));
+        s.disable();
+        assert!(!s.is_current(seen), "disable must stop the resume loop");
+        let seen = s.generation;
+        s.supersede();
+        assert!(!s.is_current(seen), "a hub apply must stop the resume loop");
     }
 
     #[test]
