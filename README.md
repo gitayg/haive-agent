@@ -237,13 +237,20 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
 - **Needs root**, meaning the service install (`--install`). The agent checks for uid 0, so
   `CAP_NET_ADMIN` alone is not enough. It installs `wireguard-tools` and `iptables` with `apt-get`
   when they are missing.
-- It creates the `itai-wg` interface (`10.77.0.1/24`, falling back to `wireguard-go` when the kernel
-  has no WireGuard module), turns on IPv4 forwarding, and adds iptables NAT and filter rules tagged
-  `it-ai-vpn`. Those rules block the device itself, private and CGNAT ranges, and peer-to-peer
-  traffic. Every apply, and every uplink change (Wi-Fi to Ethernet), first deletes all tagged rules
-  whatever interface they named, then inserts the full set at fixed positions at the top of each
-  chain, so the drops always sit above the accepts. Disabling removes the interface and every
-  tagged rule.
+- It creates the `itai-wg` interface (`10.77.0.1/24`, falling back to `wireguard-go` when the
+  kernel has no WireGuard module), turns on IPv4 forwarding, and adds iptables NAT and filter
+  rules tagged `it-ai-vpn`. Those rules block the device itself, private and CGNAT ranges, and
+  peer-to-peer traffic, and drop any other forwarded traffic to or from `itai-wg`. Every apply,
+  and every uplink change (Wi-Fi to Ethernet), first deletes all tagged rules whatever interface
+  they named, then inserts the full set at fixed positions at the top of each chain, so the
+  peer-to-peer and private-range drops always sit above the accepts. Disabling removes the interface
+  and every tagged rule.
+- **IPv4 forwarding is put back.** Before turning it on, the agent records the previous
+  `ip_forward` value in `~/.it-ai/vpn/ip_forward.before`. If it was `0`, the agent is the reason
+  forwarding is on: a tagged rule then drops every forwarded packet that does not involve
+  `itai-wg`, and disabling sets `ip_forward` back to `0`. If it was already `1` (a Docker host, a
+  router), the agent adds no such rule and leaves it on when disabled. The FORWARD chain policy is
+  never changed.
 - The agent only receives each pass's public key and preshared key; it never sees a client's
   private key. Pass expiry is enforced on the device too, and the applied state is restored after
   a reboot.

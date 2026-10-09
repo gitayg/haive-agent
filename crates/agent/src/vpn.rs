@@ -343,7 +343,7 @@ fn ticker() {
         }
         if let Some(wan) = wan_iface() {
             // Rebuilds every tagged rule for the new uplink, whatever the old one was.
-            if wan != old && ensure_rules(&wan).is_ok() {
+            if wan != old && ensure_rules(&wan, forwarding_isolated()).is_ok() {
                 state().lock().unwrap_or_else(|e| e.into_inner()).wan = wan;
             }
         }
@@ -437,8 +437,56 @@ fn ensure_iface() -> Result<(), String> {
     }
     run("wg", &["set", IFACE, "private-key", &key_file, "listen-port", &WG_PORT.to_string()])?;
     run("ip", &["link", "set", IFACE, "mtu", &MTU.to_string(), "up"])?;
-    let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1");
     Ok(())
+}
+
+const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+
+fn forward_record_file() -> std::path::PathBuf {
+    dir().join("ip_forward.before")
+}
+
+/// The ip_forward value to keep on record before turning forwarding on. Off
+/// now means off is what a disable must return to, whatever an older record
+/// says (after a reboot, say). On now keeps an existing record: on a re-apply
+/// that "1" is the agent's own, and the record holds what was there before.
+fn forward_to_record(current: &str, recorded: Option<&str>) -> String {
+    match (current.trim(), recorded.map(str::trim)) {
+        ("0", _) => "0".into(),
+        (_, Some(r)) => r.into(),
+        (cur, None) => cur.into(),
+    }
+}
+
+/// What a disable writes back: "0" only when forwarding was off before the
+/// agent turned it on. If it was already on, or there is no record, it is left
+/// alone (a Docker host needs it).
+fn forward_to_restore(recorded: Option<&str>) -> Option<&'static str> {
+    (recorded.map(str::trim) == Some("0")).then_some("0")
+}
+
+/// Records the current ip_forward before the agent turns it on. Returns
+/// whether the agent is the reason forwarding is on, in which case only
+/// `itai-wg` traffic may be forwarded.
+fn record_forwarding() -> Result<bool, String> {
+    let current = std::fs::read_to_string(IP_FORWARD).map_err(|e| format!("{IP_FORWARD}: {e}"))?;
+    let recorded = std::fs::read_to_string(forward_record_file()).ok();
+    let keep = forward_to_record(&current, recorded.as_deref());
+    let _ = std::fs::create_dir_all(dir());
+    std::fs::write(forward_record_file(), &keep).map_err(|e| format!("recording ip_forward: {e}"))?;
+    restrict(&forward_record_file());
+    Ok(forward_to_restore(Some(&keep)).is_some())
+}
+
+fn forwarding_isolated() -> bool {
+    forward_to_restore(std::fs::read_to_string(forward_record_file()).ok().as_deref()).is_some()
+}
+
+fn restore_forwarding() {
+    if let Some(v) = forward_to_restore(std::fs::read_to_string(forward_record_file()).ok().as_deref()) {
+        let _ = std::fs::write(IP_FORWARD, v);
+    }
+    let _ = std::fs::remove_file(forward_record_file());
 }
 
 /// The chains this module writes to, as (table, chain).
@@ -446,8 +494,10 @@ const CHAINS: &[(&str, &str)] = &[("filter", "FORWARD"), ("filter", "INPUT"), ("
 
 /// (table, chain, rule), each chain's rules listed top to bottom. Every rule
 /// carries the module's comment tag so it can be found and removed exactly,
-/// without touching anyone else's rules.
-fn rules(wan: &str) -> Vec<(&'static str, &'static str, Vec<String>)> {
+/// without touching anyone else's rules. `isolate`: the agent turned forwarding
+/// on, so nothing but `itai-wg` traffic may be forwarded. The FORWARD policy
+/// itself is never changed.
+fn rules(wan: &str, isolate: bool) -> Vec<(&'static str, &'static str, Vec<String>)> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     let port = WG_PORT.to_string();
     // The drops come first so they win over the accepts.
@@ -458,6 +508,14 @@ fn rules(wan: &str) -> Vec<(&'static str, &'static str, Vec<String>)> {
     r.extend([
         ("filter", "FORWARD", s(&["-i", IFACE, "-o", wan, "-j", "ACCEPT"])),
         ("filter", "FORWARD", s(&["-i", wan, "-o", IFACE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])),
+        // Anything else to or from the tunnel is refused, whatever the FORWARD policy.
+        ("filter", "FORWARD", s(&["-i", IFACE, "-j", "DROP"])),
+        ("filter", "FORWARD", s(&["-o", IFACE, "-j", "DROP"])),
+    ]);
+    if isolate {
+        r.push(("filter", "FORWARD", s(&["!", "-i", IFACE, "!", "-o", IFACE, "-j", "DROP"])));
+    }
+    r.extend([
         // Pass holders cannot reach services on this device itself.
         ("filter", "INPUT", s(&["-i", IFACE, "-j", "DROP"])),
         // WireGuard answers only the shim on loopback.
@@ -497,10 +555,10 @@ fn delete_tagged(table: &str, listing: &str) -> Vec<Vec<String>> {
 /// every chain first, then insert the full set at explicit positions 1..n, so
 /// each chain ends up in exactly `rules()`'s order, above everyone else's.
 /// `listings` holds `iptables -S` output per (table, chain).
-fn apply_plan(wan: &str, listings: &[(&str, &str, String)]) -> Vec<Vec<String>> {
+fn apply_plan(wan: &str, isolate: bool, listings: &[(&str, &str, String)]) -> Vec<Vec<String>> {
     let mut plan: Vec<Vec<String>> = listings.iter().flat_map(|(t, _, l)| delete_tagged(t, l)).collect();
     let mut pos: HashMap<(&str, &str), usize> = HashMap::new();
-    for (t, c, r) in rules(wan) {
+    for (t, c, r) in rules(wan, isolate) {
         let n = pos.entry((t, c)).or_insert(0);
         *n += 1;
         plan.push(["-w", "-t", t, "-I", c, &n.to_string()].iter().map(|x| x.to_string()).chain(r).collect());
@@ -512,8 +570,8 @@ fn listings() -> Vec<(&'static str, &'static str, String)> {
     CHAINS.iter().map(|(t, c)| (*t, *c, run("iptables", &["-w", "-t", t, "-S", c]).unwrap_or_default())).collect()
 }
 
-fn ensure_rules(wan: &str) -> Result<(), String> {
-    for cmd in apply_plan(wan, &listings()) {
+fn ensure_rules(wan: &str, isolate: bool) -> Result<(), String> {
+    for cmd in apply_plan(wan, isolate, &listings()) {
         let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
         let done = run("iptables", &args);
         // A delete may race a rule that is already gone; an insert must land.
@@ -562,7 +620,10 @@ fn apply_desired(d: Desired) -> Result<Value, String> {
     ensure_prereqs()?;
     ensure_iface()?;
     let wan = wan_iface().ok_or("no default route — is the device online?")?;
-    ensure_rules(&wan)?;
+    // Record ip_forward and put the rules in place before forwarding goes on.
+    let isolate = record_forwarding()?;
+    ensure_rules(&wan, isolate)?;
+    let _ = std::fs::write(IP_FORWARD, "1");
     let mut d = d;
     d.peers = live_peers(&d.peers, now_secs());
     reconcile_peers(&d.peers);
@@ -797,6 +858,8 @@ pub fn disable_ep() -> (Value, u16) {
         let _ = std::fs::remove_file(dir().join("desired.json"));
         s.disable();
     }
+    // Forwarding goes back off before the isolation rule goes away.
+    restore_forwarding();
     remove_rules();
     if iface_up() {
         let _ = run("ip", &["link", "del", IFACE]);
@@ -918,13 +981,9 @@ mod tests {
         vec![("filter", "FORWARD", fwd.into()), ("filter", "INPUT", "-P INPUT ACCEPT\n".into()), ("nat", "POSTROUTING", nat.into()), ("mangle", "FORWARD", String::new())]
     }
 
-    fn target(c: &[String]) -> &str {
-        &c[c.iter().position(|x| x == "-j").unwrap() + 1]
-    }
-
     #[test]
     fn firewall_plan_deletes_every_tagged_rule_before_inserting() {
-        let plan = apply_plan("wlan0", &old_listings());
+        let plan = apply_plan("wlan0", false, &old_listings());
         let first_insert = plan.iter().position(|c| c[3] == "-I").expect("inserts");
         assert!(plan[..first_insert].iter().all(|c| c[3] == "-D"), "deletes come first");
         assert!(plan[first_insert..].iter().all(|c| c[3] == "-I"), "no delete after an insert");
@@ -939,21 +998,48 @@ mod tests {
 
     #[test]
     fn firewall_plan_orders_drops_above_accepts_for_a_changed_wan() {
-        let plan = apply_plan("wlan0", &old_listings());
-        let inserts: Vec<&Vec<String>> = plan.iter().filter(|c| c[3] == "-I").collect();
-        assert!(inserts.iter().all(|c| !c.contains(&"eth0".to_string())), "nothing names the old WAN");
-        for (table, chain) in CHAINS {
-            let at: Vec<String> = inserts.iter().filter(|c| c[2] == *table && c[4] == *chain).map(|c| c[5].clone()).collect();
-            let want: Vec<String> = (1..=at.len()).map(|n| n.to_string()).collect();
-            assert_eq!(at, want, "{table}/{chain} is inserted at explicit positions 1..n");
+        for isolate in [false, true] {
+            let plan = apply_plan("wlan0", isolate, &old_listings());
+            assert!(plan.iter().all(|c| !c.contains(&"-P".to_string())), "the FORWARD policy is never touched");
+            let inserts: Vec<&Vec<String>> = plan.iter().filter(|c| c[3] == "-I").collect();
+            assert!(inserts.iter().all(|c| !c.contains(&"eth0".to_string())), "nothing names the old WAN");
+            for (table, chain) in CHAINS {
+                let at: Vec<String> = inserts.iter().filter(|c| c[2] == *table && c[4] == *chain).map(|c| c[5].clone()).collect();
+                let want: Vec<String> = (1..=at.len()).map(|n| n.to_string()).collect();
+                assert_eq!(at, want, "{table}/{chain} is inserted at explicit positions 1..n");
+            }
+            let fwd: Vec<String> = inserts.iter().filter(|c| c[2] == "filter" && c[4] == "FORWARD").map(|c| c[6..].join(" ")).collect();
+            let first_accept = fwd.iter().position(|r| r.contains("-j ACCEPT")).unwrap();
+            let last_accept = fwd.iter().rposition(|r| r.contains("-j ACCEPT")).unwrap();
+            assert_eq!(last_accept - first_accept, 1, "{fwd:#?}");
+            assert!(fwd[first_accept].starts_with("-i itai-wg -o wlan0 ") && fwd[last_accept].starts_with("-i wlan0 -o itai-wg "), "{fwd:#?}");
+            // Above the accepts: peer-to-peer and private ranges.
+            assert_eq!(fwd[..first_accept].len(), 1 + BLOCKED_NETS.len());
+            assert!(fwd[..first_accept].iter().all(|r| r.starts_with("-i itai-wg ") && r.contains("-j DROP")), "{fwd:#?}");
+            // Below them: the tunnel's default deny, plus everything else when the agent turned forwarding on.
+            let mut below = vec!["-i itai-wg -j DROP", "-o itai-wg -j DROP"];
+            if isolate {
+                below.push("! -i itai-wg ! -o itai-wg -j DROP");
+            }
+            let got: Vec<String> = fwd[last_accept + 1..].iter().map(|r| r.trim_end_matches(" -m comment --comment it-ai-vpn").to_string()).collect();
+            assert_eq!(got, below, "isolate={isolate}");
         }
-        let fwd: Vec<&&Vec<String>> = inserts.iter().filter(|c| c[2] == "filter" && c[4] == "FORWARD").collect();
-        let last_drop = fwd.iter().rposition(|c| target(c) == "DROP").unwrap();
-        let first_accept = fwd.iter().position(|c| target(c) == "ACCEPT").unwrap();
-        assert!(last_drop < first_accept, "every DROP sits above every ACCEPT");
-        assert_eq!(fwd.iter().filter(|c| target(c) == "DROP").count(), 1 + BLOCKED_NETS.len());
-        let accepts: Vec<String> = fwd.iter().filter(|c| target(c) == "ACCEPT").map(|c| c.join(" ")).collect();
-        assert!(accepts[0].contains("-i itai-wg -o wlan0") && accepts[1].contains("-i wlan0 -o itai-wg"), "{accepts:#?}");
+    }
+
+    #[test]
+    fn ip_forward_is_restored_only_when_the_agent_turned_it_on() {
+        assert_eq!(forward_to_restore(Some("0\n")), Some("0"), "it was 0: restore 0");
+        assert_eq!(forward_to_restore(Some("1\n")), None, "it was 1: leave it alone");
+        assert_eq!(forward_to_restore(None), None, "no record: leave it alone");
+
+        assert_eq!(forward_to_record("0\n", None), "0");
+        assert_eq!(forward_to_record("1\n", None), "1");
+        assert_eq!(forward_to_record("1", Some("0")), "0", "a re-apply must not record the agent's own 1");
+        assert_eq!(forward_to_record("0", Some("1")), "0", "forwarding is off now (a reboot): off is what to return to");
+        // End to end: off before, two applies, then disable restores off.
+        let first = forward_to_record("0", None);
+        let second = forward_to_record("1", Some(&first));
+        assert_eq!(forward_to_restore(Some(&second)), Some("0"));
     }
 
     #[test]
