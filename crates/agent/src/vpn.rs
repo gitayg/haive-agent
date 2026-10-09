@@ -234,10 +234,10 @@ impl State {
         self.generation += 1;
     }
 
-    fn disable(&mut self) -> String {
+    fn disable(&mut self) {
         self.supersede();
         self.desired = None;
-        std::mem::take(&mut self.wan)
+        self.wan.clear();
     }
 
     fn is_current(&self, generation: u64) -> bool {
@@ -342,11 +342,9 @@ fn ticker() {
             continue;
         }
         if let Some(wan) = wan_iface() {
-            if wan != old {
-                remove_rules(&old);
-                if ensure_rules(&wan).is_ok() {
-                    state().lock().unwrap_or_else(|e| e.into_inner()).wan = wan;
-                }
+            // Rebuilds every tagged rule for the new uplink, whatever the old one was.
+            if wan != old && ensure_rules(&wan).is_ok() {
+                state().lock().unwrap_or_else(|e| e.into_inner()).wan = wan;
             }
         }
     }
@@ -443,22 +441,23 @@ fn ensure_iface() -> Result<(), String> {
     Ok(())
 }
 
-/// (table, chain, rule) — every rule carries the module's comment tag so it can
-/// be found and removed exactly, without touching anyone else's rules.
+/// The chains this module writes to, as (table, chain).
+const CHAINS: &[(&str, &str)] = &[("filter", "FORWARD"), ("filter", "INPUT"), ("nat", "POSTROUTING"), ("mangle", "FORWARD")];
+
+/// (table, chain, rule), each chain's rules listed top to bottom. Every rule
+/// carries the module's comment tag so it can be found and removed exactly,
+/// without touching anyone else's rules.
 fn rules(wan: &str) -> Vec<(&'static str, &'static str, Vec<String>)> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     let port = WG_PORT.to_string();
-    // Inserted (-I) in this order, so the later entries end up on top: the drops
-    // win over the accepts, and all of them sit above Docker's FORWARD chains.
-    let mut r = vec![
-        ("filter", "FORWARD", s(&["-i", IFACE, "-o", wan, "-j", "ACCEPT"])),
-        ("filter", "FORWARD", s(&["-i", wan, "-o", IFACE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])),
-        ("filter", "FORWARD", s(&["-i", IFACE, "-o", IFACE, "-j", "DROP"])),
-    ];
+    // The drops come first so they win over the accepts.
+    let mut r = vec![("filter", "FORWARD", s(&["-i", IFACE, "-o", IFACE, "-j", "DROP"]))];
     for net in BLOCKED_NETS {
         r.push(("filter", "FORWARD", s(&["-i", IFACE, "-d", net, "-j", "DROP"])));
     }
     r.extend([
+        ("filter", "FORWARD", s(&["-i", IFACE, "-o", wan, "-j", "ACCEPT"])),
+        ("filter", "FORWARD", s(&["-i", wan, "-o", IFACE, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])),
         // Pass holders cannot reach services on this device itself.
         ("filter", "INPUT", s(&["-i", IFACE, "-j", "DROP"])),
         // WireGuard answers only the shim on loopback.
@@ -473,27 +472,64 @@ fn rules(wan: &str) -> Vec<(&'static str, &'static str, Vec<String>)> {
     r
 }
 
-fn ipt(table: &str, op: &str, chain: &str, rule: &[String]) -> bool {
-    let mut args = vec!["-w", "-t", table, op, chain];
-    args.extend(rule.iter().map(String::as_str));
-    run("iptables", &args).is_ok()
+/// `iptables` arguments that delete every rule carrying the module's tag, read
+/// from `iptables -t <table> -S <chain>`. Whatever WAN those rules named.
+fn delete_tagged(table: &str, listing: &str) -> Vec<Vec<String>> {
+    let quoted = format!("\"{TAG}\"");
+    listing
+        .lines()
+        .filter_map(|line| {
+            let mut t: Vec<String> = line.split_whitespace().map(String::from).collect();
+            let tagged = t.windows(2).any(|w| w[0] == "--comment" && (w[1] == TAG || w[1] == quoted));
+            if t.len() < 2 || t[0] != "-A" || !tagged {
+                return None;
+            }
+            t[0] = "-D".into();
+            for x in t.iter_mut().filter(|x| **x == quoted) {
+                *x = TAG.into();
+            }
+            Some(["-w", "-t", table].iter().map(|x| x.to_string()).chain(t).collect())
+        })
+        .collect()
+}
+
+/// The whole apply, as `iptables` argument lists: delete every tagged rule in
+/// every chain first, then insert the full set at explicit positions 1..n, so
+/// each chain ends up in exactly `rules()`'s order, above everyone else's.
+/// `listings` holds `iptables -S` output per (table, chain).
+fn apply_plan(wan: &str, listings: &[(&str, &str, String)]) -> Vec<Vec<String>> {
+    let mut plan: Vec<Vec<String>> = listings.iter().flat_map(|(t, _, l)| delete_tagged(t, l)).collect();
+    let mut pos: HashMap<(&str, &str), usize> = HashMap::new();
+    for (t, c, r) in rules(wan) {
+        let n = pos.entry((t, c)).or_insert(0);
+        *n += 1;
+        plan.push(["-w", "-t", t, "-I", c, &n.to_string()].iter().map(|x| x.to_string()).chain(r).collect());
+    }
+    plan
+}
+
+fn listings() -> Vec<(&'static str, &'static str, String)> {
+    CHAINS.iter().map(|(t, c)| (*t, *c, run("iptables", &["-w", "-t", t, "-S", c]).unwrap_or_default())).collect()
 }
 
 fn ensure_rules(wan: &str) -> Result<(), String> {
-    for (t, c, r) in rules(wan) {
-        if !ipt(t, "-C", c, &r) && !ipt(t, "-I", c, &r) {
-            return Err(format!("iptables: could not add {t}/{c} {}", r.join(" ")));
+    for cmd in apply_plan(wan, &listings()) {
+        let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let done = run("iptables", &args);
+        // A delete may race a rule that is already gone; an insert must land.
+        if args[3] == "-I" {
+            done.map_err(|e| format!("iptables: could not add {e}"))?;
         }
     }
     Ok(())
 }
 
-fn remove_rules(wan: &str) {
-    if wan.is_empty() {
-        return;
-    }
-    for (t, c, r) in rules(wan) {
-        while ipt(t, "-D", c, &r) {}
+fn remove_rules() {
+    for (t, _, l) in listings() {
+        for cmd in delete_tagged(t, &l) {
+            let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            let _ = run("iptables", &args);
+        }
     }
 }
 
@@ -526,12 +562,6 @@ fn apply_desired(d: Desired) -> Result<Value, String> {
     ensure_prereqs()?;
     ensure_iface()?;
     let wan = wan_iface().ok_or("no default route — is the device online?")?;
-    {
-        let old = state().lock().unwrap_or_else(|e| e.into_inner()).wan.clone();
-        if old != wan {
-            remove_rules(&old);
-        }
-    }
     ensure_rules(&wan)?;
     let mut d = d;
     d.peers = live_peers(&d.peers, now_secs());
@@ -760,14 +790,14 @@ pub fn apply_ep(body: &str) -> (Value, u16) {
 pub fn disable_ep() -> (Value, u16) {
     let _op = op();
     shim_stop();
-    let wan = {
+    {
         // The saved file goes under the same lock as the in-memory state, so a
         // ticker step can never write it back after this.
         let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
         let _ = std::fs::remove_file(dir().join("desired.json"));
-        s.disable()
-    };
-    remove_rules(&wan);
+        s.disable();
+    }
+    remove_rules();
     if iface_up() {
         let _ = run("ip", &["link", "del", IFACE]);
     }
@@ -872,6 +902,58 @@ mod tests {
         let seen = s.generation;
         s.supersede();
         assert!(!s.is_current(seen), "a hub apply must stop the resume loop");
+    }
+
+    /// What 3.8.0 left behind for `eth0`, between Docker's rules, as `iptables -S` prints it.
+    fn old_listings() -> Vec<(&'static str, &'static str, String)> {
+        let fwd = "-P FORWARD DROP\n\
+            -A FORWARD -i itai-wg -d 10.0.0.0/8 -m comment --comment it-ai-vpn -j DROP\n\
+            -A FORWARD -j DOCKER-USER\n\
+            -A FORWARD -i itai-wg -o eth0 -m comment --comment it-ai-vpn -j ACCEPT\n\
+            -A FORWARD -i eth0 -o itai-wg -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment \"it-ai-vpn\" -j ACCEPT\n\
+            -A FORWARD -m comment --comment \"not it-ai-vpn\" -j ACCEPT\n";
+        let nat = "-P POSTROUTING ACCEPT\n\
+            -A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE\n\
+            -A POSTROUTING -s 10.77.0.0/24 -o eth0 -m comment --comment it-ai-vpn -j MASQUERADE\n";
+        vec![("filter", "FORWARD", fwd.into()), ("filter", "INPUT", "-P INPUT ACCEPT\n".into()), ("nat", "POSTROUTING", nat.into()), ("mangle", "FORWARD", String::new())]
+    }
+
+    fn target(c: &[String]) -> &str {
+        &c[c.iter().position(|x| x == "-j").unwrap() + 1]
+    }
+
+    #[test]
+    fn firewall_plan_deletes_every_tagged_rule_before_inserting() {
+        let plan = apply_plan("wlan0", &old_listings());
+        let first_insert = plan.iter().position(|c| c[3] == "-I").expect("inserts");
+        assert!(plan[..first_insert].iter().all(|c| c[3] == "-D"), "deletes come first");
+        assert!(plan[first_insert..].iter().all(|c| c[3] == "-I"), "no delete after an insert");
+
+        let deletes: Vec<String> = plan[..first_insert].iter().map(|c| c.join(" ")).collect();
+        assert_eq!(deletes.len(), 4, "every tagged rule, and nothing else: {deletes:#?}");
+        assert!(deletes.contains(&"-w -t filter -D FORWARD -i itai-wg -o eth0 -m comment --comment it-ai-vpn -j ACCEPT".into()), "the old WAN's accept goes");
+        assert!(deletes.contains(&"-w -t nat -D POSTROUTING -s 10.77.0.0/24 -o eth0 -m comment --comment it-ai-vpn -j MASQUERADE".into()), "the old WAN's NAT goes");
+        assert!(deletes.iter().all(|d| d.contains("--comment it-ai-vpn ")), "a quoted tag is unquoted for -D");
+        assert!(!deletes.iter().any(|d| d.contains("DOCKER") || d.contains("docker0") || d.contains("not")), "other rules are left alone");
+    }
+
+    #[test]
+    fn firewall_plan_orders_drops_above_accepts_for_a_changed_wan() {
+        let plan = apply_plan("wlan0", &old_listings());
+        let inserts: Vec<&Vec<String>> = plan.iter().filter(|c| c[3] == "-I").collect();
+        assert!(inserts.iter().all(|c| !c.contains(&"eth0".to_string())), "nothing names the old WAN");
+        for (table, chain) in CHAINS {
+            let at: Vec<String> = inserts.iter().filter(|c| c[2] == *table && c[4] == *chain).map(|c| c[5].clone()).collect();
+            let want: Vec<String> = (1..=at.len()).map(|n| n.to_string()).collect();
+            assert_eq!(at, want, "{table}/{chain} is inserted at explicit positions 1..n");
+        }
+        let fwd: Vec<&&Vec<String>> = inserts.iter().filter(|c| c[2] == "filter" && c[4] == "FORWARD").collect();
+        let last_drop = fwd.iter().rposition(|c| target(c) == "DROP").unwrap();
+        let first_accept = fwd.iter().position(|c| target(c) == "ACCEPT").unwrap();
+        assert!(last_drop < first_accept, "every DROP sits above every ACCEPT");
+        assert_eq!(fwd.iter().filter(|c| target(c) == "DROP").count(), 1 + BLOCKED_NETS.len());
+        let accepts: Vec<String> = fwd.iter().filter(|c| target(c) == "ACCEPT").map(|c| c.join(" ")).collect();
+        assert!(accepts[0].contains("-i itai-wg -o wlan0") && accepts[1].contains("-i wlan0 -o itai-wg"), "{accepts:#?}");
     }
 
     #[test]

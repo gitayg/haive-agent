@@ -240,7 +240,10 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
 - It creates the `itai-wg` interface (`10.77.0.1/24`, falling back to `wireguard-go` when the kernel
   has no WireGuard module), turns on IPv4 forwarding, and adds iptables NAT and filter rules tagged
   `it-ai-vpn`. Those rules block the device itself, private and CGNAT ranges, and peer-to-peer
-  traffic. Disabling removes the interface and every tagged rule.
+  traffic. Every apply, and every uplink change (Wi-Fi to Ethernet), first deletes all tagged rules
+  whatever interface they named, then inserts the full set at fixed positions at the top of each
+  chain, so the drops always sit above the accepts. Disabling removes the interface and every
+  tagged rule.
 - The agent only receives each pass's public key and preshared key; it never sees a client's
   private key. Pass expiry is enforced on the device too, and the applied state is restored after
   a reboot.
