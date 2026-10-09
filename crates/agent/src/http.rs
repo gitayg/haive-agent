@@ -463,6 +463,7 @@ fn privileged_path(path: &str) -> bool {
             | "/jobs/stop"
             | "/jobs/list"
     ) || path.starts_with("/shell/")
+        || path.starts_with("/vpn/")
 }
 
 fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
@@ -595,7 +596,18 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
             let (v, code) = crate::jobs::list_ep();
             json_resp(&v, code)
         }
-        _ =>Response::from_string("not found").with_status_code(404),
+        (Method::Get, "/vpn/status") => json_resp(&crate::vpn::status(), 200),
+        (Method::Post, "/vpn/apply") => {
+            let mut b = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::Read::take(req.as_reader(), 1 << 20), &mut b);
+            let (v, code) = crate::vpn::apply_ep(&b);
+            json_resp(&v, code)
+        }
+        (Method::Post, "/vpn/disable") => {
+            let (v, code) = crate::vpn::disable_ep();
+            json_resp(&v, code)
+        }
+        _ => Response::from_string("not found").with_status_code(404),
     };
     let _ = req.respond(resp);
 }
