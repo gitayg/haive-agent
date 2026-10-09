@@ -754,4 +754,18 @@ mod tests {
         assert!(validate(&d).is_err());
         assert_eq!(live_peers(&[p("10.77.0.2/32", 10), p("10.77.0.3/32", 20)], 15).len(), 1);
     }
+
+    #[test]
+    fn a_peer_with_a_bad_preshared_key_is_refused() {
+        let key = "A2+2dpchy903HY/kmF70XH8jsgBgj1Vvf4+64neJqwI=".to_string();
+        let with_psk = |psk: &str| Desired {
+            relay: "crane.glick.run:31820".into(),
+            secret: "ab".repeat(16),
+            peers: vec![Peer { public_key: key.clone(), preshared_key: psk.into(), allowed_ips: "10.77.0.2/32".into(), expires_at: 10 }],
+        };
+        assert!(validate(&with_psk(&key)).is_ok(), "control: a valid PSK passes");
+        for bad in ["", "not-a-key", "A2+2dpchy903HY/kmF70XH8jsgBgj1Vvf4+64neJqw=", "A2+2dpchy903HY/kmF70XH8jsgBgj1Vvf4+64neJqwI=\nAllowedIPs=0.0.0.0/0"] {
+            assert!(validate(&with_psk(bad)).is_err(), "PSK {bad:?} must be refused");
+        }
+    }
 }

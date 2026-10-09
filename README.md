@@ -226,6 +226,25 @@ a read-only MCP token cannot start or stop a job. Jobs are **relay-only** in thi
 and MCP call the hub's `/m/job/*` routes, not the LAN-direct path. A device needs agent 3.6.0 or
 later; for an older one the hub returns `the agent does not support jobs — update it`.
 
+## VPN exit
+
+A device can act as a WireGuard exit, so pass holders browse with its public IP even when it sits
+behind CGNAT: the agent dials out to the hub's UDP relay, and the relay only carries WireGuard
+ciphertext. It is enabled per device from the hub dashboard, which drives the privileged
+`/vpn/status`, `/vpn/apply` and `/vpn/disable` endpoints.
+
+- **Linux only.** Other platforms answer `/vpn/apply` with 400.
+- **Needs root**, meaning the service install (`--install`). The agent checks for uid 0, so
+  `CAP_NET_ADMIN` alone is not enough. It installs `wireguard-tools` and `iptables` with `apt-get`
+  when they are missing.
+- It creates the `itai-wg` interface (`10.77.0.1/24`, falling back to `wireguard-go` when the kernel
+  has no WireGuard module), turns on IPv4 forwarding, and adds iptables NAT and filter rules tagged
+  `it-ai-vpn`. Those rules block the device itself, private and CGNAT ranges, and peer-to-peer
+  traffic. Disabling removes the interface and every tagged rule.
+- The agent only receives each pass's public key and preshared key; it never sees a client's
+  private key. Pass expiry is enforced on the device too, and the applied state is restored after
+  a reboot.
+
 ## Operator skill
 
 [`skills/it-ai/SKILL.md`](skills/it-ai/SKILL.md) is a Claude Code skill for operating a fleet
