@@ -23,14 +23,18 @@
 //!
 //! WireGuard itself is the kernel module when the box has it and `wg` is installed,
 //! and otherwise the agent's embedded boringtun device (`vpn/userspace.rs`), which
-//! needs only /dev/net/tun. See `vpn/backend.rs` for the choice.
+//! needs only /dev/net/tun. See `vpn/backend.rs` for the choice. A watchdog checks the
+//! embedded device every 10s and after every apply, and rebuilds it if its worker thread died
+//! or it stopped answering (`vpn/health.rs`).
 
 mod backend;
+mod health;
 mod uapi;
 #[cfg(target_os = "linux")]
 mod userspace;
 
 use backend::Backend;
+use health::Userspace as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -38,7 +42,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const IFACE: &str = "itai-wg";
@@ -236,6 +240,8 @@ struct State {
     /// Bumped by every hub apply and disable. Work that started under an older
     /// generation (the boot resume, a ticker step) must not write its result back.
     generation: u64,
+    /// The userspace backend's watchdog record.
+    watch: health::Watch,
 }
 
 impl State {
@@ -248,6 +254,7 @@ impl State {
         self.supersede();
         self.desired = None;
         self.wan.clear();
+        self.watch = health::Watch::default();
     }
 
     fn is_current(&self, generation: u64) -> bool {
@@ -274,7 +281,7 @@ impl State {
 
 fn state() -> &'static Mutex<State> {
     static S: OnceLock<Mutex<State>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(State { desired: None, wan: String::new(), last_error: None, generation: 0 }))
+    S.get_or_init(|| Mutex::new(State { desired: None, wan: String::new(), last_error: None, generation: 0, watch: Default::default() }))
 }
 
 /// Serialises everything that changes the exit (hub apply and disable, the boot
@@ -342,7 +349,10 @@ fn ticker() {
             }
         };
         if let Some(next) = expired {
-            reconcile_peers(&next.peers);
+            if let Err(e) = reconcile_peers(&next.peers) {
+                // The watchdog's next check decides whether the device needs rebuilding.
+                println!("[vpn] dropping expired passes: {e}");
+            }
         }
         let (enabled, old) = {
             let s = state().lock().unwrap_or_else(|e| e.into_inner());
@@ -717,30 +727,22 @@ fn current_peers() -> Vec<String> {
     run("wg", &["show", IFACE, "peers"]).map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect()).unwrap_or_default()
 }
 
-fn reconcile_peers(peers: &[Peer]) {
+/// Err when a peer could not be added, changed or removed.
+fn reconcile_peers(peers: &[Peer]) -> Result<(), String> {
     let live = wg();
     match live.as_ref() {
         Some(Live::Kernel) => {
             drop(live);
-            reconcile_kernel_peers(peers);
+            reconcile_kernel_peers(peers)
         }
         #[cfg(target_os = "linux")]
-        Some(Live::Userspace(d)) => {
-            let current = match d.request(uapi::GET).and_then(|r| uapi::check(&r).map(uapi::parse_get)) {
-                Ok(c) => c.peers,
-                Err(e) => return println!("[vpn] boringtun: reading peers: {e}"),
-            };
-            for req in uapi::peer_plan(&current, peers) {
-                if let Err(e) = d.request(&req).and_then(|r| uapi::check(&r).map(|_| ())) {
-                    println!("[vpn] boringtun: updating a peer: {e}");
-                }
-            }
-        }
-        None => {}
+        Some(Live::Userspace(d)) => uapi::reconcile(d, peers),
+        None => Err("no WireGuard interface".into()),
     }
 }
 
-fn reconcile_kernel_peers(peers: &[Peer]) {
+fn reconcile_kernel_peers(peers: &[Peer]) -> Result<(), String> {
+    let mut failed = vec![];
     let want: Vec<&str> = peers.iter().map(|p| p.public_key.as_str()).collect();
     for pk in current_peers() {
         if !want.contains(&pk.as_str()) {
@@ -753,10 +755,17 @@ fn reconcile_kernel_peers(peers: &[Peer]) {
         if std::fs::write(&f, &p.preshared_key).is_ok() {
             restrict(&f);
             if let Err(e) = run("wg", &["set", IFACE, "peer", &p.public_key, "preshared-key", &f.to_string_lossy(), "allowed-ips", &p.allowed_ips]) {
-                println!("[vpn] {e}");
+                failed.push(e);
             }
             let _ = std::fs::remove_file(&f);
+        } else {
+            failed.push(format!("writing the preshared key for {}", p.allowed_ips));
         }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
     }
 }
 
@@ -771,16 +780,125 @@ fn apply_desired(d: Desired) -> Result<Value, String> {
     let _ = std::fs::write(IP_FORWARD, "1");
     let mut d = d;
     d.peers = live_peers(&d.peers, now_secs());
-    reconcile_peers(&d.peers);
+    let peers = reconcile_peers(&d.peers);
     shim_ensure(&d.relay, hex_decode(&d.secret).unwrap_or_default());
-    {
+    // Saved even when a peer change failed: this is what the hub wants, and what the
+    // watchdog rebuilds a broken device with.
+    let generation = {
         let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
         save_desired(&d);
         s.desired = Some(d);
         s.wan = wan;
         s.last_error = None;
+        s.watch.fresh_apply();
+        s.generation
+    };
+    ensure_watchdog();
+    // Checked right away, so a device that is already broken is not reported as applied.
+    let health = SysExit.check();
+    if let Some(Err(h)) = &health {
+        // To the watchdog at once: it rebuilds the device with what was just saved.
+        let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
+        s.watch.failed(now_secs(), generation, h.clone());
+        drop(s);
+        kick_watchdog();
     }
-    Ok(status())
+    match (peers, health) {
+        (Ok(()), None | Some(Ok(()))) => Ok(status()),
+        (Err(e), _) => Err(e),
+        (Ok(()), Some(Err(h))) => Err(format!("the built-in WireGuard is not healthy after the apply ({h}); the agent is rebuilding it")),
+    }
+}
+
+// ---- the userspace backend's watchdog -----------------------------------------------
+
+/// The running device, for `health::step`.
+struct SysExit;
+
+impl health::Userspace for SysExit {
+    fn check(&mut self) -> Option<Result<(), String>> {
+        #[cfg(target_os = "linux")]
+        if let Some(Live::Userspace(d)) = wg().as_ref() {
+            return Some(health::check(d));
+        }
+        None
+    }
+    fn teardown(&mut self) {
+        iface_down(&mut wg());
+    }
+    /// The same key and port as always (the key file), and the desired state's live peers.
+    /// The firewall rules name the interface, so they hold for the new one.
+    fn rebuild(&mut self, d: &Desired) -> Result<(), String> {
+        ensure_iface()?;
+        reconcile_peers(&live_peers(&d.peers, now_secs()))
+    }
+}
+
+/// Whether the watchdog thread runs. Changed only under `op()`.
+static WATCHING: AtomicBool = AtomicBool::new(false);
+
+fn kick() -> &'static (Mutex<bool>, Condvar) {
+    static K: OnceLock<(Mutex<bool>, Condvar)> = OnceLock::new();
+    K.get_or_init(Default::default)
+}
+
+/// Wakes the watchdog now instead of at its next check.
+fn kick_watchdog() {
+    let (m, c) = kick();
+    *m.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    c.notify_all();
+}
+
+/// Starts the watchdog unless it runs. Call under `op()` once the exit is enabled; it ends
+/// on its own after a disable.
+fn ensure_watchdog() {
+    if !WATCHING.swap(true, Ordering::SeqCst) && std::thread::Builder::new().name("itai-vpn-watch".into()).spawn(watchdog).is_err() {
+        WATCHING.store(false, Ordering::SeqCst);
+    }
+}
+
+fn watchdog() {
+    let mut wait = health::CHECK_EVERY;
+    loop {
+        {
+            let (m, c) = kick();
+            let g = m.lock().unwrap_or_else(|e| e.into_inner());
+            *c.wait_timeout_while(g, wait, |kicked| !*kicked).unwrap_or_else(|e| e.into_inner()).0 = false;
+        }
+        // Under op(), like apply and disable: a recovery never interleaves with either.
+        let _op = op();
+        let (generation, desired, mut w) = {
+            let s = state().lock().unwrap_or_else(|e| e.into_inner());
+            if s.desired.is_none() {
+                WATCHING.store(false, Ordering::SeqCst);
+                return;
+            }
+            (s.generation, s.desired.clone(), s.watch.clone())
+        };
+        let outcome = health::step(&mut w, generation, desired.as_ref(), &mut SysExit, now_secs());
+        let mut s = state().lock().unwrap_or_else(|e| e.into_inner());
+        let reason = w.last_failure.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+        wait = match outcome {
+            health::Outcome::Idle => health::CHECK_EVERY,
+            health::Outcome::Retry(t) => {
+                println!("[vpn] built-in WireGuard is unhealthy ({reason}); rebuilding it in {}s", t.as_secs());
+                t
+            }
+            health::Outcome::Recovered => {
+                println!("[vpn] built-in WireGuard rebuilt (restart {})", w.restarts);
+                // It now runs the hub's desired state in full.
+                s.last_error = None;
+                health::CHECK_EVERY
+            }
+            health::Outcome::GaveUp(e) => {
+                let msg = format!("the built-in WireGuard failed {} times within {} minutes and was stopped: {e}", health::GIVE_UP_AFTER, health::WINDOW_SECS / 60);
+                println!("[vpn] {msg}");
+                s.last_error = Some(msg);
+                health::CHECK_EVERY
+            }
+        };
+        s.watch = w;
+    }
 }
 
 // ---- the relay shim ----------------------------------------------------------------
@@ -998,6 +1116,9 @@ pub fn status() -> Value {
         "sessions": sessions,
         "peers": peers,
         "error": s.last_error,
+        "health": s.watch.health.name(),
+        "restarts": s.watch.restarts,
+        "last_failure": s.watch.last_failure.as_ref().map(|(at, reason)| json!({"at": at, "reason": reason})),
     })
 }
 
@@ -1034,6 +1155,8 @@ pub fn disable_ep() -> (Value, u16) {
     restore_forwarding();
     remove_rules();
     iface_down(&mut wg());
+    // The watchdog sees nothing desired and ends.
+    kick_watchdog();
     (json!({"ok": true}), 200)
 }
 
@@ -1097,7 +1220,7 @@ mod tests {
         let key = "A2+2dpchy903HY/kmF70XH8jsgBgj1Vvf4+64neJqwI=".to_string();
         let peers = peers.iter().map(|(ip, exp)| Peer { public_key: key.clone(), preshared_key: key.clone(), allowed_ips: (*ip).into(), expires_at: *exp }).collect();
         let d = Desired { relay: "relay.example:31820".into(), secret: "ab".repeat(16), peers };
-        State { desired: Some(d), wan: "eth0".into(), last_error: None, generation: 1 }
+        State { desired: Some(d), wan: "eth0".into(), last_error: None, generation: 1, watch: Default::default() }
     }
 
     #[test]
@@ -1224,6 +1347,47 @@ mod tests {
         assert_eq!(clamp([0; 32])[31], 0x40);
     }
 
+    /// For the e2e test: holds one boringtun device's worker inside boringtun's own tracing
+    /// calls, a genuine stuck worker, without patching boringtun.
+    #[cfg(target_os = "linux")]
+    mod stall {
+        use std::sync::{Mutex, Once};
+        use tracing::{span, Event, Metadata, Subscriber};
+
+        static HELD: Mutex<Option<String>> = Mutex::new(None);
+
+        struct Stall;
+
+        impl Subscriber for Stall {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, _: &Event<'_>) {
+                let me = std::fs::read_to_string("/proc/thread-self/comm").unwrap_or_default();
+                if HELD.lock().unwrap().as_deref() == Some(me.trim_end()) {
+                    // Never released: the test ends with this thread still here.
+                    loop {
+                        std::thread::park();
+                    }
+                }
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+
+        /// From now on, the next tracing event on the threads named `mark` never returns.
+        pub fn hold(mark: &str) {
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| tracing::subscriber::set_global_default(Stall).unwrap());
+            *HELD.lock().unwrap() = Some(mark.to_string());
+        }
+    }
+
     /// The exit end to end, on the real apply/status/disable entry points, against a stock
     /// kernel WireGuard client in another container. Driven by `scripts/vpn-e2e.sh`; needs
     /// root, CAP_NET_ADMIN and /dev/net/tun. The hub relay is NOT in the path: the client
@@ -1312,22 +1476,115 @@ mod tests {
         println!("[e2e] after the client's traffic: {}", end["peers"]);
         assert!(end["peers"][0]["rx"].as_u64().unwrap() > 0 && end["peers"][0]["tx"].as_u64().unwrap() > 0, "{end}");
 
-        let (r, code) = disable_ep();
-        assert_eq!(code, 200, "{r}");
-        assert!(!iface_up(), "{IFACE} must be gone after disable");
-        assert!(wg().is_none());
-        assert_eq!(tagged(), 0, "every tagged rule removed");
-        // The shim thread notices its stop flag within its 1s read timeout.
-        let (mut threads, mut fds) = (0, 0);
-        for _ in 0..50 {
-            (threads, fds) = (count("/proc/self/task"), count("/proc/self/fd"));
-            if threads == threads_before && fds == fds_before {
-                break;
+        // Crash recovery. The watchdog must bring the exit back by itself: no apply from
+        // anyone (the generation must not move), and the client reconfigures nothing.
+        let round = |n: u32, what: &str| {
+            std::fs::write(dir.join(format!("round{n}")), what).unwrap();
+            if what != "end" {
+                wait_for(&format!("round{n}.done"), 180);
             }
-            std::thread::sleep(Duration::from_millis(100));
+        };
+        let recovered = |what: &str, generation: u64| -> Value {
+            let t0 = std::time::Instant::now();
+            let (mut last, mut seen) = (String::new(), vec![]);
+            let healed = loop {
+                let st = status();
+                let line = format!("health={} restarts={} up={} peers={} last_failure={}", st["health"], st["restarts"], st["up"], st["peers"].as_array().map_or(0, Vec::len), st["last_failure"]);
+                if line != last {
+                    println!("[e2e] {what} +{:.1}s {line}", t0.elapsed().as_secs_f32());
+                    last = line;
+                }
+                seen.push(st["health"].as_str().unwrap_or("").to_string());
+                if st["health"] == "ok" && st["restarts"] == 1 {
+                    break st;
+                }
+                assert!(t0.elapsed() < Duration::from_secs(90), "{what}: no recovery within 90s: {st}");
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            assert!(seen.iter().any(|h| h == "recovering"), "{what}: {seen:?}");
+            assert_eq!(healed["peers"][0]["allowedIps"], "10.77.0.2/32", "{what}: rebuilt with the same pass: {healed}");
+            assert_eq!(state().lock().unwrap().generation, generation, "{what}: no apply happened in between");
+            println!("[e2e] {what}: recovered in {:.1}s without an apply (generation still {generation}); backend={} up={}", t0.elapsed().as_secs_f32(), healed["backend"], healed["up"]);
+            healed
+        };
+        let traffic_counted = |what: &str| {
+            let st = status();
+            println!("[e2e] {what}: health={} restarts={} peers={}", st["health"], st["restarts"], st["peers"]);
+            assert!(st["peers"][0]["rx"].as_u64().unwrap() > 0 && st["peers"][0]["tx"].as_u64().unwrap() > 0, "{st}");
+        };
+        let comms = || std::fs::read_dir("/proc/self/task").unwrap().filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok()).map(|c| c.trim_end().to_string()).collect::<Vec<_>>();
+        let disable = || -> (usize, usize) {
+            let (r, code) = disable_ep();
+            assert_eq!(code, 200, "{r}");
+            assert!(!iface_up(), "{IFACE} must be gone after disable");
+            assert!(wg().is_none());
+            assert_eq!(tagged(), 0, "every tagged rule removed");
+            // The shim and watchdog threads notice within a second.
+            let (mut threads, mut fds) = (0, 0);
+            for _ in 0..50 {
+                (threads, fds) = (count("/proc/self/task"), count("/proc/self/fd"));
+                if threads == threads_before && fds == fds_before {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            println!("[e2e] after disable: {IFACE} present={} tagged rules={} watchdog running={} threads {threads_before}->{threads} {:?} fds {fds_before}->{fds}", iface_up(), tagged(), WATCHING.load(Ordering::SeqCst), comms());
+            (threads, fds)
+        };
+        let on_device = |f: &dyn Fn(&userspace::Device)| match wg().as_ref() {
+            Some(Live::Userspace(d)) => f(d),
+            _ => panic!("not the userspace backend"),
+        };
+
+        if want_backend == "userspace" {
+            assert_eq!((end["health"].as_str(), end["restarts"].as_u64()), (Some("ok"), Some(0)), "{end}");
+
+            // 1. A worker panic, the way boringtun 0.7.1 really dies.
+            let generation = state().lock().unwrap().generation;
+            on_device(&|d| d.inject_worker_panic().unwrap());
+            println!("[e2e] injected a worker panic: a set=1 for the peer boringtun already has (0.7.1 panics on it)");
+            let healed = recovered("worker panic", generation);
+            let reason = healed["last_failure"]["reason"].as_str().unwrap_or("");
+            assert!(reason.contains("Modifying existing peers is not yet supported"), "{healed}");
+            round(1, "after a worker panic");
+            traffic_counted("worker panic: after the client's traffic on the rebuilt device");
+            let left = disable();
+            assert_eq!(left, (threads_before, fds_before), "no boringtun thread or fd left behind after a recovery plus disable; fds before {targets_before:?} after {:?}", fd_targets());
+
+            // 2. A worker that hangs: held inside one of boringtun's own tracing calls while
+            //    it adds a peer, so its UAPI never answers and it cannot be stopped or joined.
+            let (r, code) = apply_ep(&pass("10.77.0.2/32"));
+            assert_eq!(code, 200, "{r}");
+            let generation = state().lock().unwrap().generation;
+            on_device(&|d| stall::hold(d.mark()));
+            let newcomer: String = public_key_of(&clamp([7; 32])).iter().map(|b| format!("{b:02x}")).collect();
+            on_device(&|d| d.send_unanswered(&format!("set=1\npublic_key={newcomer}\nallowed_ip=10.77.0.9/32\n\n")).unwrap());
+            println!("[e2e] injected a hang: boringtun's worker is held inside its own tracing::info!(\"Peer added\")");
+            let healed = recovered("hung worker", generation);
+            let reason = healed["last_failure"]["reason"].as_str().unwrap_or("");
+            assert!(reason.contains("no answer from boringtun's UAPI"), "{healed}");
+            round(2, "after a hung worker");
+            traffic_counted("hung worker: after the client's traffic on the rebuilt device");
+            let (threads, fds) = disable();
+            let mut extra = fd_targets();
+            for t in &targets_before {
+                if let Some(i) = extra.iter().position(|x| x == t) {
+                    extra.remove(i);
+                }
+            }
+            println!("[e2e] hung worker: left behind by design: {} thread(s), {} fd(s) {extra:?}", threads - threads_before, fds - fds_before);
+            assert_eq!(threads, threads_before + 2, "the held worker, and the stop helper still waiting to join it: {:?}", comms());
+            // The held worker's epoll stays open (it may still wait on it); everything the
+            // device used (TUN queue, UDP sockets, UAPI end, timers) is a /dev/null placeholder.
+            assert_eq!(extra.iter().filter(|t| *t == "anon_inode:[eventpoll]").count(), 1, "{extra:?}");
+            assert!(fds == fds_before + extra.len() && extra.iter().all(|t| t == "/dev/null" || t == "anon_inode:[eventpoll]"), "{extra:?}");
+            assert!(!extra.iter().any(|t| t.starts_with("socket:") || t == "/dev/net/tun"), "no socket or TUN queue kept: {extra:?}");
+            round(3, "end");
+        } else {
+            round(1, "end");
+            let left = disable();
+            assert_eq!(left, (threads_before, fds_before), "no thread or fd left behind; fds before {targets_before:?} after {:?}", fd_targets());
         }
-        println!("[e2e] after disable: {IFACE} present={} tagged rules={} threads {threads_before}->{threads} fds {fds_before}->{fds}", iface_up(), tagged());
-        assert_eq!((threads, fds), (threads_before, fds_before), "no boringtun thread or fd left behind; fds before {targets_before:?} after {:?}", fd_targets());
         std::fs::write(dir.join("exit.done"), "ok").unwrap();
     }
 

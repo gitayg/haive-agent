@@ -113,6 +113,21 @@ pub fn peer_plan(current: &[UPeer], want: &[Peer]) -> Vec<String> {
     plan
 }
 
+/// One UAPI request and its reply, as the device answers it.
+pub trait Uapi {
+    fn request(&self, req: &str) -> Result<String, String>;
+}
+
+/// Brings the device's peers to `want`. Err on the first request that fails or that the
+/// device refuses, so an apply can report it instead of answering 200 over a broken exit.
+pub fn reconcile(dev: &impl Uapi, want: &[Peer]) -> Result<(), String> {
+    let current = parse_get(check(&dev.request(GET)?).map_err(|e| format!("boringtun: reading peers: {e}"))?).peers;
+    for req in peer_plan(&current, want) {
+        check(&dev.request(&req)?).map_err(|e| format!("boringtun refused a peer change: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +195,35 @@ mod tests {
         let plan = peer_plan(&[], &[peer(A, "10.77.0.2/32"), peer(A, "10.77.0.5/32")]);
         assert_eq!(plan.len(), 1, "a second add for the same key would panic boringtun: {plan:#?}");
         assert!(plan[0].contains("allowed_ip=10.77.0.5/32"), "the last one wins, as with wg set");
+    }
+
+    /// Answers `get=1` with one peer A, and every `set=1` with `set_reply`.
+    struct Dev {
+        set_reply: Result<&'static str, &'static str>,
+        sent: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Uapi for Dev {
+        fn request(&self, req: &str) -> Result<String, String> {
+            self.sent.borrow_mut().push(req.into());
+            if req == GET {
+                return Ok(format!("listen_port=51820\npublic_key={}\npreshared_key={}\nallowed_ip=10.77.0.2/32\nerrno=0\n\n", b64_to_hex(A).unwrap(), b64_to_hex(B).unwrap()));
+            }
+            self.set_reply.map(String::from).map_err(String::from)
+        }
+    }
+
+    #[test]
+    fn a_failed_peer_change_is_an_error_not_a_log_line() {
+        let dev = |r| Dev { set_reply: r, sent: Default::default() };
+        let want = [peer(A, "10.77.0.2/32"), peer(B, "10.77.0.4/32")];
+        let ok = dev(Ok("errno=0\n\n"));
+        assert_eq!(reconcile(&ok, &want), Ok(()));
+        assert_eq!(ok.sent.borrow().len(), 2, "get, then one add for B");
+
+        let refused = reconcile(&dev(Ok("errno=22\n\n")), &want).unwrap_err();
+        assert!(refused.contains("errno=22"), "{refused}");
+        let hung = reconcile(&dev(Err("boringtun UAPI read: timed out")), &want).unwrap_err();
+        assert!(hung.contains("timed out"), "{hung}");
     }
 }

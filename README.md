@@ -343,6 +343,31 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
   `/dev/net/tun`. That covers kernels without the module, such as Jetson (Tegra) and some WSL2 and
   container kernels. `HIVE_VPN_USERSPACE=1` forces the built-in one. `/vpn/status` reports which
   one is running as `backend` (`kernel` or `userspace`).
+- **The built-in WireGuard is watched and rebuilt when it dies.** boringtun runs on one worker
+  thread inside the agent. If that thread panics, only the thread dies, and the exit would
+  otherwise stop forwarding while everything else still looks fine. Every 10 seconds, and right
+  after every apply, a watchdog checks three things: that the worker thread is still running, that
+  a UAPI `get=1` answers with `errno=0` within 2 seconds, and that `itai-wg` still exists. If any
+  check fails, the agent tears the device down, releasing every fd it held, and rebuilds it with
+  the same key, port and passes, then checks it again. Clients reconnect on their own; nothing is
+  re-sent from the hub. Rebuilds back off at 1s, 2s, 4s and so on, up to 60s. After 5 failures
+  within 10 minutes the watchdog stops: the device stays down, `health` is `failed`, and `error`
+  carries the reason until the next apply from the hub. A disable or a newer apply ends a recovery
+  that is still running, so a disabled exit is never brought back. The kernel backend is not
+  watched, since the agent runs no threads for it.
+  - A worker that is stuck, not dead, cannot be killed. Its TUN queue and UDP sockets are released
+    (their fd numbers are kept on `/dev/null`) so that the new device can take the interface and
+    port. The thread itself stays parked until the agent restarts.
+  - `/vpn/status` reports `health` (`ok`, `recovering` or `failed`), `restarts` (rebuilds since the
+    exit was enabled), and `last_failure` (`{at, reason}`, where `at` is in Unix seconds). For a
+    panic, `reason` includes boringtun's panic message and location. A panic hook records it only
+    for boringtun's worker threads, and passes every panic on to the previous hook.
+- **`/vpn/apply` fails instead of answering 200 over a broken exit.** It fails when the interface
+  cannot be created, when a pass cannot be added, changed or removed, or when the built-in device
+  is unhealthy right after the apply. In those cases the applied state is still saved, and the
+  watchdog rebuilds the device with it. The hub dashboard shows the device's `error` in the exit's
+  status line. It does not show `health`, `restarts` or `last_failure` yet, although they reach the
+  browser unchanged.
 - It creates the `itai-wg` interface (`10.77.0.1/24`), turns on IPv4 forwarding, and adds iptables
   NAT and filter rules tagged `it-ai-vpn`. Those rules block the device itself, private and CGNAT
   ranges, and peer-to-peer traffic, and drop any other forwarded traffic to or from `itai-wg`.
@@ -363,8 +388,11 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
   that is still retrying, and the ticker cannot write back a pass list that a disable or a newer
   apply replaced.
 - `scripts/vpn-e2e.sh [userspace|kernel]` runs the exit in Docker against a stock WireGuard client
-  and checks the handshake, traffic through the NAT, and a clean disable. The hub relay is not part
-  of that test.
+  and checks the handshake, traffic through the NAT, and a clean disable. On the userspace backend
+  it also kills boringtun's worker (with the real 0.7.1 panic) and later holds it stuck. Each time it
+  checks that `/vpn/status` goes `recovering` and then `ok`, that the client's traffic flows again
+  with no apply in between, and what is left after disable: nothing after the panic, and only the
+  parked thread after the hang. The hub relay is not part of that test.
 
 ## Operator skill
 

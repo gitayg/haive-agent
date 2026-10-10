@@ -4,7 +4,9 @@
 #   client (stock kernel WireGuard) ──UDP──▶ exit :51821 ─loopback─▶ itai-wg ──NAT──▶ target
 #
 # The exit runs the ignored test `vpn::tests::e2e_exit_serves_a_stock_wireguard_client`, which
-# drives the real apply/status/disable entry points. The hub relay and the shim are NOT in the
+# drives the real apply/status/disable entry points. On the userspace backend it then kills
+# boringtun's worker (the real 0.7.1 panic) and later holds it stuck, and the client checks its
+# traffic after each recovery ("rounds", coordinated through files). The hub relay and the shim are NOT in the
 # path: a loopback forwarder in the test stands in for the shim. The subnet is 198.18.0.0/24
 # because the exit's own rules drop forwarded traffic to private ranges, Docker's included.
 #
@@ -65,6 +67,24 @@ echo "== client: the exit itself must not answer pass holders"
 if ping -c 2 -W 1 10.77.0.1 >/dev/null; then echo "UNEXPECTED: 10.77.0.1 answered"; exit 1; else echo "10.77.0.1 refused, as designed"; fi
 echo "== client: wg show"; wg show wg0
 echo ok > client.done
+n=1
+while :; do
+  for i in $(seq 300); do [ -s "round$n" ] && break; sleep 1; done
+  what=$(cat "round$n" 2>/dev/null || echo "no request")
+  [ "$what" = end ] && break
+  [ "$what" = "no request" ] && { echo "the exit never asked for round $n"; exit 1; }
+  echo "== client: round $n: the exit rebuilt its WireGuard $what; same tunnel, nothing reconfigured here"
+  for i in $(seq 60); do
+    if ping -c 1 -W 1 198.18.0.30 >/dev/null; then echo "first reply after $i attempt(s) (WireGuard re-handshakes on its own)"; break; fi
+    [ "$i" = 60 ] && { echo "no reply through the rebuilt exit"; exit 1; }
+  done
+  echo "== client: ping the target again"; ping -c 3 -W 2 198.18.0.30
+  echo "== client: curl the target again"
+  curl -sS -m 10 -o /dev/null -w "HTTP %{http_code} from %{remote_ip}:%{remote_port}\n" http://198.18.0.30:8080/
+  echo "== client: wg show"; wg show wg0
+  echo ok > "round$n.done"
+  n=$((n + 1))
+done
 ' >/dev/null
 
 client_rc=$(docker wait itai-vpn-client)

@@ -111,3 +111,8 @@ pipewire = "0.9"
 # Pinned exactly: vpn/userspace.rs closes fds this release leaks on teardown, which
 # is only safe while the crate is known not to close them itself.
 boringtun = { version = "=0.7.1", features = ["device"] }
+
+# Tests only: vpn.rs's Docker end-to-end test stalls a boringtun worker inside one of
+# boringtun's own tracing calls, to prove a hung device is recovered.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tracing = "0.1"

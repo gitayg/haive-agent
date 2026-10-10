@@ -2514,6 +2514,7 @@ dependencies = [
  "sysinfo",
  "tao",
  "tiny_http",
+ "tracing",
  "tray-icon",
  "ureq",
  "windows 0.59.0",
