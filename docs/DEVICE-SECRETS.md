@@ -99,8 +99,8 @@ poll, cap-key, hub cert.
   on macOS); any inherited `HOME` is ignored. That dir is pinned in the entry:
   `Environment=HOME=<dir>` in the systemd unit, `EnvironmentVariables/HOME` in the
   LaunchDaemon plist. Windows (schtasks runs as the installing user) and `--persist`
-  autostart entries are unchanged. Existing service entries are not rewritten until the
-  next `--install`, and they keep working because they still carry `--relay-token`.
+  autostart entries are unchanged. Existing service entries keep working because they still
+  carry `--relay-token`; from agent 3.8.2 the agent removes it itself (below).
 
 **Unchanged:** `direct_token` / LAN-direct semantics. If its derivation depends on the
 relay token, keep its value stable across the switch, and report how.
@@ -111,3 +111,25 @@ relay token, keep its value stable across the switch, and report how.
   its enrollment token.
 - Existing installs with `--relay-token` in their autostart entry keep working. `POST /persist`
   (or re-running `--install`) rewrites the entry without it.
+- **Agent 3.8.2: an agent removes the token from its own old entry** (`entryclean.rs`). At every
+  start in relay mode, once it holds a device secret for this hub, each of its own entries that
+  still carries `--relay-token` (`.desktop` / `it-ai.service`, the `com.itai.agent` plists, the
+  `IT-AI` Run value / scheduled task) is rewritten without it, but only when the rewritten entry
+  provably finds the same `relay.cred`: the HOME it runs with is read from the entry (an unpinned
+  root unit: `/`, its cwd), and that `relay.cred` must be the file the secret was loaded from
+  (`RelayCred::file`, absolute). If it differs, HOME is pinned in a root unit/LaunchDaemon when the
+  agent is root (and in a LaunchAgent), otherwise the entry is left with a log line. The pinned
+  HOME is `service_home()` when the credential is found there, else the directory holding it, and
+  only if it and its `.it-ai` pass `securefs::check_trusted_dir`: every component from `/` down,
+  symlinks and their targets included, owned by root or the agent's euid and not group/world
+  writable. Credentials are never moved or copied. The new text
+  is read back and checked again before it is written. Files are touched only through
+  `entryclean/securefs.rs`: no symlink is followed (the directory is opened `O_DIRECTORY|O_NOFOLLOW`,
+  the entry `lstat`ed and opened `O_NOFOLLOW` relative to it, same dev/ino), the file and its
+  directory must be owned by the agent's euid and every directory above by it or root, none
+  group/world-writable, the file single-linked; the temp file is `O_CREAT|O_EXCL|O_NOFOLLOW` in that
+  directory and `renameat` on the directory fd replaces the entry after re-checking it is still the
+  inode that was read. A scheduled task is changed only when its principal is this user. Write-only: atomic file replace (mode and
+  owner kept), `systemctl daemon-reload`, `schtasks /Change /TR` on an `InteractiveToken` task of
+  this user; nothing is started, stopped or loaded. Hello sysinfo gains
+  `autostart_token: bool`.

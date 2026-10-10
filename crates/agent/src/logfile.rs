@@ -52,6 +52,21 @@ pub(crate) fn prepare(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Send a child's stdout and stderr to the log, appending (prepared as above:
+/// owner-only, capped), or to null when it cannot be opened. Used by the
+/// `--background` relaunch and by the Windows restart after a self-update.
+pub(crate) fn redirect(c: &mut std::process::Command, path: &Path) {
+    let open = || OpenOptions::new().append(true).open(path).ok();
+    match prepare(path).ok().and_then(|_| Some((open()?, open()?))) {
+        Some((out, err)) => {
+            c.stdout(out).stderr(err);
+        }
+        None => {
+            c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        }
+    }
+}
+
 /// Empty the log IN PLACE once it passes `MAX_LEN`. Truncate, never unlink: a
 /// launchd-started agent writes through an fd launchd opened, so removing the path
 /// would send that agent's output to an orphaned inode until its next restart, and

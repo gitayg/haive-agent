@@ -161,7 +161,7 @@ fn passwd_home(uid: libc::uid_t) -> Option<PathBuf> {
 
 // ---- macOS: LaunchAgent ----
 #[cfg(target_os = "macos")]
-fn plist_path() -> PathBuf {
+pub(crate) fn plist_path() -> PathBuf {
     PathBuf::from(home()).join("Library/LaunchAgents/com.itai.agent.plist")
 }
 
@@ -188,7 +188,7 @@ fn prepare_plist_log(home: &Path) {
 
 /// The LaunchAgent plist; `home` is the user's, where its log goes.
 #[cfg(any(target_os = "macos", test))]
-fn agent_plist(exe: &Path, args: &[String], home: &Path) -> String {
+pub(crate) fn agent_plist(exe: &Path, args: &[String], home: &Path) -> String {
     let mut pa = format!("      <string>{}</string>\n", exe.display());
     for a in args {
         pa.push_str(&format!("      <string>{a}</string>\n"));
@@ -225,7 +225,7 @@ fn mac_uninstall() {
 
 // ---- Linux: XDG autostart ----
 #[cfg(all(unix, not(target_os = "macos")))]
-fn desktop_path() -> PathBuf {
+pub(crate) fn desktop_path() -> PathBuf {
     PathBuf::from(home()).join(".config/autostart/it-ai.desktop")
 }
 
@@ -325,14 +325,14 @@ fn win_service_uninstall() {
 
 // ---- macOS: LaunchDaemon (starts at boot, root) ----
 #[cfg(target_os = "macos")]
-fn daemon_path() -> PathBuf {
+pub(crate) fn daemon_path() -> PathBuf {
     PathBuf::from("/Library/LaunchDaemons/com.itai.agent.plist")
 }
 
 /// The LaunchDaemon plist, with HOME pinned to the service home (see `service_home`)
 /// and its log in that home.
 #[cfg(any(target_os = "macos", test))]
-fn daemon_plist(exe: &Path, args: &[String], home: &Path) -> String {
+pub(crate) fn daemon_plist(exe: &Path, args: &[String], home: &Path) -> String {
     let mut pa = format!("      <string>{}</string>\n", exe.display());
     for a in args {
         pa.push_str(&format!("      <string>{a}</string>\n"));
@@ -362,13 +362,13 @@ fn mac_service_uninstall() {
 
 // ---- Linux: systemd system service (starts at boot, root) ----
 #[cfg(all(unix, not(target_os = "macos")))]
-fn unit_path() -> PathBuf {
+pub(crate) fn unit_path() -> PathBuf {
     PathBuf::from("/etc/systemd/system/it-ai.service")
 }
 
 /// The systemd unit, with HOME pinned to the service home (see `service_home`).
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
-fn service_unit(exe: &Path, args: &[String], home: &Path) -> String {
+pub(crate) fn service_unit(exe: &Path, args: &[String], home: &Path) -> String {
     let mut ex = format!("{}", exe.display());
     for a in args {
         ex.push(' ');

@@ -6,6 +6,8 @@ mod analysis;
 mod capture;
 mod config;
 mod discovery;
+mod entryclean;
+mod entrytoken;
 mod http;
 mod input;
 mod jobs;
@@ -91,16 +93,8 @@ struct Args {
 
 /// Where a detached agent's stdout/stderr land, so "it just vanished" is always
 /// answerable. Lives beside the agent's certs in ~/.it-ai.
-fn log_path() -> std::path::PathBuf {
+pub(crate) fn log_path() -> std::path::PathBuf {
     logfile::path_in(std::path::Path::new(&persistence::home()))
-}
-
-/// Append handle to the log, creating ~/.it-ai (0700) and the file (0600) as
-/// needed and trimming it past ~1 MB (see `logfile`).
-fn log_file() -> Option<std::fs::File> {
-    let p = log_path();
-    logfile::prepare(&p).ok()?;
-    std::fs::OpenOptions::new().append(true).open(&p).ok()
 }
 
 /// If `--background` was given, re-spawn ourselves detached (no console, stdio to
@@ -120,14 +114,7 @@ fn relaunch_detached() -> bool {
     // printing "running in the background" left NO trace — a panic, a failed bind
     // and a rejected token all looked identical (the device just never appeared).
     // Point stdout+stderr at ~/.it-ai/agent.log so a silent death is self-diagnosing.
-    match (log_file(), log_file()) {
-        (Some(out), Some(err)) => {
-            c.stdout(std::process::Stdio::from(out)).stderr(std::process::Stdio::from(err));
-        }
-        _ => {
-            c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        }
-    }
+    logfile::redirect(&mut c, &log_path());
     let spawned;
     #[cfg(windows)]
     {
@@ -615,7 +602,7 @@ fn main() {
     let mut direct_token = String::new();
     if let Some(relay_addr) = args.relay.clone() {
         let rid = relay_id();
-        let (nm, si) = (name.clone(), sysinfo.clone());
+        let (nm, mut si) = (name.clone(), sysinfo.clone());
         let cred_path = relaycred::default_path();
         let resolved = relaycred::resolve(
             &relay_addr,
@@ -640,6 +627,13 @@ fn main() {
         // ONE credential for every relay caller, so a device secret issued
         // mid-run reaches all of them at once.
         let cred = Arc::new(relaycred::RelayCred::new(&relay_addr, &rid, cred_path, resolved));
+        // An entry an agent older than 3.7.0 wrote still has the enrollment token
+        // on its command line; drop it now that this device has its own secret,
+        // and tell the hub whether any entry still has it.
+        let autostart_token = entryclean::run(&relay_addr, cred.file(), cred.is_device());
+        if let Some(o) = si.as_object_mut() {
+            o.insert("autostart_token".into(), serde_json::json!(autostart_token));
+        }
         direct_token = cred.direct_token().to_string();
         // LAN-direct authorization: the hub's capability public key. Without it
         // every privileged request arriving on the LAN listener is refused (the

@@ -719,20 +719,10 @@ pub(crate) fn apply_update(slot: crate::updatelock::UpdateSlot, bytes: &[u8]) ->
     // Report whether the replacement actually launched. Callers must NOT exit the
     // still-running process when this is false — a failed relaunch with no
     // supervisor would otherwise leave the device dead.
-    let mut c = crate::relaycred::restart_command(&exe, args);
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // The relaunch MUST be windowless + detached. A plain spawn pops a fresh
-        // console window — the "second terminal" that appears after an update — and
-        // ties the new agent to the old console. CREATE_NO_WINDOW hides the console;
-        // a new process group + null stdio detach it from ours so it lives on after
-        // this process exits.
-        c.creation_flags(0x0800_0000 | 0x0000_0200) // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-    }
+    let mut c = update_restart_command(&exe, args, &crate::log_path());
+    #[cfg(not(windows))]
+    let mut c = crate::relaycred::restart_command(&exe, args);
     match c.spawn() {
         Ok(_) => {
             slot.hold_until_exit();
@@ -743,6 +733,28 @@ pub(crate) fn apply_update(slot: crate::updatelock::UpdateSlot, bytes: &[u8]) ->
             false
         }
     }
+}
+
+/// The process a Windows self-update starts in place of this one: same args
+/// (the token in its environment, see `restart_command`), windowless and
+/// detached. A plain spawn pops a fresh console window (the "second terminal"
+/// after an update) and ties the new agent to the old console: CREATE_NO_WINDOW
+/// hides it, and a new process group with no stdin detaches it from ours so it
+/// lives on after this process exits. Its stdout+stderr are appended to the same
+/// `agent.log` a `--background` start writes (`logfile::redirect`); before 3.8.2
+/// they went to null, so an updated Windows agent logged nowhere. Unix does not
+/// use this: it `exec`s, which keeps the old process's stdout/stderr.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn update_restart_command(exe: &std::path::Path, args: Vec<String>, log: &std::path::Path) -> std::process::Command {
+    let mut c = crate::relaycred::restart_command(exe, args);
+    c.stdin(std::process::Stdio::null());
+    crate::logfile::redirect(&mut c, log);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000 | 0x0000_0200); // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    }
+    c
 }
 
 /// GET /wol?mac=AA:BB:CC:DD:EE:FF — this (online) agent broadcasts a Wake-on-LAN
@@ -1767,5 +1779,46 @@ mod exec_output_tests {
         v.extend(std::iter::repeat(b'b').take(MAX_EXEC_OUTPUT));
         let out = clip_output(&v);
         assert!(out.contains("output truncated"));
+    }
+}
+
+#[cfg(test)]
+mod update_restart_tests {
+    use super::update_restart_command;
+
+    fn scratch_log(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!("it-ai-update-restart-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        crate::logfile::path_in(&home)
+    }
+
+    /// The Windows restart after a self-update appends the new agent's stdout and
+    /// stderr to agent.log (owner-only, created if missing), not to null. Run here
+    /// with sh standing in for the agent; the builder is the same on every OS.
+    #[cfg(unix)]
+    #[test]
+    fn restarted_agent_appends_stdout_and_stderr_to_agent_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let log = scratch_log("unix");
+        crate::logfile::prepare(&log).unwrap();
+        std::fs::write(&log, "before update\n").unwrap();
+        let args = vec!["-c".to_string(), "echo restarted-out; echo restarted-err >&2".to_string()];
+        let st = update_restart_command(std::path::Path::new("/bin/sh"), args, &log).status().unwrap();
+        assert!(st.success());
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "before update\nrestarted-out\nrestarted-err\n");
+        assert_eq!(std::fs::metadata(&log).unwrap().permissions().mode() & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(log.parent().unwrap().parent().unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restarted_agent_appends_stdout_and_stderr_to_agent_log() {
+        let log = scratch_log("win");
+        let args = vec!["/C".to_string(), "echo restarted-out& echo restarted-err 1>&2".to_string()];
+        let st = update_restart_command(std::path::Path::new("cmd.exe"), args, &log).status().unwrap();
+        assert!(st.success());
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("restarted-out") && text.contains("restarted-err"), "{text}");
+        let _ = std::fs::remove_dir_all(log.parent().unwrap().parent().unwrap());
     }
 }

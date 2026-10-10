@@ -27,8 +27,12 @@ pub struct CredFile {
     pub device: Option<String>,
 }
 
+/// Absolute: with no HOME (a systemd service without `User=`) `home()` is empty
+/// and the file is relative to the working directory, so resolve it once here and
+/// `RelayCred::file` names the file actually used.
 pub fn default_path() -> PathBuf {
-    path_in(Path::new(&crate::persistence::home()))
+    let p = path_in(Path::new(&crate::persistence::home()));
+    std::path::absolute(&p).unwrap_or(p)
 }
 
 pub fn path_in(home: &Path) -> PathBuf {
@@ -267,6 +271,11 @@ impl RelayCred {
         &self.direct_token
     }
 
+    /// The `relay.cred` this credential was loaded from and is saved to.
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+
     /// The hub issued `secret`: persist `{hub, device}` (dropping `enroll`) and
     /// switch every caller to it. The in-memory switch happens even if the write
     /// fails — the hub already holds the secret — and the error is returned.
@@ -402,6 +411,47 @@ mod tests {
     fn a_self_update_restart_is_marked() {
         let c = restart_command(Path::new("/bin/it-ai"), s(&["--relay", "h", "--persist"]));
         assert!(c.get_envs().any(|(k, v)| k == ENV_RESTART && v.is_some()));
+    }
+
+    /// Set only in the child `exec_restart_keeps_stdout_and_stderr` spawns.
+    #[cfg(unix)]
+    const EXEC_PROBE: &str = "IT_AI_TEST_EXEC_PROBE";
+
+    /// The child half: exec through `restart_command` exactly as `apply_update`
+    /// does on unix. Does nothing in a normal test run.
+    #[cfg(unix)]
+    #[test]
+    fn exec_probe_child() {
+        use std::os::unix::process::CommandExt;
+        if std::env::var_os(EXEC_PROBE).is_none() {
+            return;
+        }
+        let args = s(&["-c", "echo exec-out; echo exec-err >&2"]);
+        let e = restart_command(Path::new("/bin/sh"), args).exec();
+        panic!("exec failed: {e}");
+    }
+
+    /// A unix self-update `exec`s the new binary, which keeps this process's
+    /// stdout and stderr: whatever they pointed at (agent.log for a --background
+    /// start, launchd's StandardOutPath, the journal) the new agent writes there.
+    #[cfg(unix)]
+    #[test]
+    fn exec_restart_keeps_stdout_and_stderr() {
+        let dir = tmpdir("exec");
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("agent.log");
+        let open = || std::fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
+        let st = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["relaycred::tests::exec_probe_child", "--exact", "--nocapture", "--test-threads=1"])
+            .env(EXEC_PROBE, "1")
+            .stdout(open())
+            .stderr(open())
+            .status()
+            .unwrap();
+        assert!(st.success(), "{st}");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("exec-out\n") && text.contains("exec-err\n"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

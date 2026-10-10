@@ -100,9 +100,44 @@ From agent 3.7.0, with hub 3.16.0 or later:
   otherwise `--relay-token`, then `HIVE_RELAY_TOKEN`, then an enrollment token saved in
   `relay.cred`. With none of these it exits with `relay mode requires an enrollment token`.
 - **Existing installs keep working.** An entry written by an older agent still carries
-  `--relay-token`; the agent enrolls with it and gets its own secret on the first hello. Re-run
-  `--persist` / `--install` (or `POST /persist`) to rewrite the entry without the token. Against a
+  `--relay-token`; the agent enrolls with it and gets its own secret on the first hello. Against a
   hub older than 3.16.0 the agent simply stays on the enrollment token.
+- **Existing installs clean themselves up (agent 3.8.2+).** At every start, once the agent holds a
+  device secret for this hub, it removes `--relay-token` from its own old entry: the `.desktop`
+  autostart and the `it-ai.service` unit on Linux, the `com.itai.agent` LaunchAgent and LaunchDaemon
+  on macOS, the `IT-AI` Run value and the `IT-AI` scheduled task on Windows. So the first start on
+  3.8.2, which is usually the restart after the self-update, takes the token off the command line.
+  - **It rewrites an entry only if the rewritten entry will find the same `relay.cred`.** The
+    agent works out the HOME the entry runs with from the entry itself and compares that
+    `relay.cred` with the file it loaded its secret from. An old systemd unit has no HOME, so it
+    looks in `/.it-ai`. When the secret is elsewhere, the agent pins `Environment=HOME=` in the
+    unit, or `EnvironmentVariables/HOME` in a plist, but only for a root service when the agent
+    is root, and only to a directory that root (or the agent's own user) alone can change, checked
+    from `/` down, symlinks included. That is the service account's passwd home when the
+    secret is there, otherwise the directory that holds it. A root service is never pointed at a
+    directory a user could plant a credential, certificate or job in. No credential is ever moved
+    or copied. A `.desktop` entry, a Run value and a scheduled task cannot pin HOME, so they are
+    rewritten only when they already find the file. A task is changed only when it runs as this
+    user with no stored password (`InteractiveToken`). Every other case is left as it is, with a
+    log line saying why.
+  - **It only rewrites a file nobody else can change.** It never follows a symlink: the entry's
+    directory is opened once, and the entry is read, checked and replaced through that
+    directory with `O_NOFOLLOW`, `O_EXCL` and `renameat`. The file and its directory must belong to
+    the agent's own user, every directory above them to that user or root, and none of them may
+    be writable by group or others, as with ssh's `StrictModes`. So a root agent never rewrites a
+    file in a directory a user can change. An entry that fails these checks is left as it is,
+    with a log line.
+  - **It never starts, stops or loads anything.** Files are replaced atomically and keep their
+    mode and owner. A unit is followed by `systemctl daemon-reload` only. A plist takes effect at
+    its next load. The task is changed in place with `schtasks /Change /TN IT-AI /TR …` and no `/RU`, `/RP` or
+    `/RL`, so its principal and run level are not part of the change.
+  - It logs one `autostart:` line per entry it rewrites or leaves, and nothing once the entries
+    are clean. Each hello reports `autostart_token: true|false`: whether any of the agent's own
+    entries still carries the token. A hub that does not know the field ignores it.
+  - `scripts/entryclean-e2e.sh` checks this in Docker against old `.desktop` and unit entries,
+    and starts each rewritten entry to confirm it finds the device secret. It also checks that a
+    root agent leaves a user-owned entry and a symlinked unit alone, and never pins a unit's HOME
+    to a user-owned directory.
 - **After a revoke.** When the hub refuses the device secret, the agent logs
   `relay: device credential rejected — re-enroll this device` and retries every 60 s; it never
   exits. If an enrollment token was passed on this start (flag or `HIVE_RELAY_TOKEN`), it
@@ -147,6 +182,12 @@ writes stdout and stderr to `~/.it-ai/agent.log`. For the LaunchDaemon that is t
 home, `/var/root/.it-ai/agent.log`. A `--background` agent already logged there. The installer
 creates the file as 0600 in a 0700 directory. At startup the agent empties it in place if it has passed 1 MB.
 Re-run `--persist` or `--install` to add logging to an existing install.
+
+On Windows, from agent 3.8.2, the agent that a self-update starts appends its stdout and stderr to
+the same `%USERPROFILE%\.it-ai\agent.log` as a `--background` start, with the same 0600 file and
+1 MB cap. Before 3.8.2 that output went nowhere, so after an update the log stopped at the old
+version. On macOS and Linux an update `exec`s the new binary, which keeps the old process's stdout
+and stderr. A test checks this.
 
 ## LAN-direct
 
