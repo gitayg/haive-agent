@@ -122,12 +122,17 @@ relay token, keep its value stable across the switch, and report how.
   HOME is `service_home()` when the credential is found there, else the directory holding it, and
   only if it and its `.it-ai` pass `securefs::check_trusted_dir`: every component from `/` down,
   symlinks and their targets included, owned by root or the agent's euid and not group/world
-  writable. Credentials are never moved or copied. The new text
+  writable (from 3.8.3 group-write is accepted in the agent user's private group, below). Credentials are never moved or copied. The new text
   is read back and checked again before it is written. Files are touched only through
   `entryclean/securefs.rs`: no symlink is followed (the directory is opened `O_DIRECTORY|O_NOFOLLOW`,
   the entry `lstat`ed and opened `O_NOFOLLOW` relative to it, same dev/ino), the file and its
   directory must be owned by the agent's euid and every directory above by it or root, none
-  group/world-writable, the file single-linked; the temp file is `O_CREAT|O_EXCL|O_NOFOLLOW` in that
+  world-writable and none group-writable except, from agent 3.8.3, in the owner's user-private
+  group (`securefs::private_group`, fail-closed: `/etc/nsswitch.conf` parsed strictly, exactly
+  one `passwd:` and one `group:` line, no `[...]` actions, sources only `files`/`systemd` (or
+  `compat` with no `*_compat:` line and no `+`/`-` NIS entries); the gid is the owner's primary gid and the group is named for the owner; the
+  group lists no supplementary members; no other passwd entry has it as primary gid; never for
+  root; Debian's OpenSSH `user-group-modes.patch` rule, made stricter), the file single-linked; the temp file is `O_CREAT|O_EXCL|O_NOFOLLOW` in that
   directory and `renameat` on the directory fd replaces the entry after re-checking it is still the
   inode that was read. A scheduled task is changed only when its principal is this user. Write-only: atomic file replace (mode and
   owner kept), `systemctl daemon-reload`, `schtasks /Change /TR` on an `InteractiveToken` task of

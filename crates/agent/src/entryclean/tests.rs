@@ -182,11 +182,226 @@ fn meta(uid: u32, mode: u32) -> securefs::Meta {
     securefs::Meta { uid, gid: 0, mode, nlink: 1, dev: 1, ino: 1 }
 }
 
+/// Injected user and group databases: passwd as (uid, name, primary gid), group
+/// as (gid, name, supplementary members), and nsswitch.conf (None: unreadable).
+#[cfg(unix)]
+struct FakeDb {
+    passwd: Vec<(u32, &'static str, u32)>,
+    group: Vec<(u32, &'static str, Vec<&'static str>)>,
+    nss: Option<&'static str>,
+    /// `/etc/passwd`, `/etc/group` as (name, text); a name not listed is unreadable.
+    etc: Vec<(&'static str, &'static str)>,
+}
+
+#[cfg(unix)]
+impl securefs::GroupDb for FakeDb {
+    fn user(&self, uid: u32) -> Option<(String, u32)> {
+        self.passwd.iter().find(|p| p.0 == uid).map(|p| (p.1.to_string(), p.2))
+    }
+    fn group(&self, gid: u32) -> Option<(String, Vec<String>)> {
+        self.group.iter().find(|g| g.0 == gid).map(|g| (g.1.to_string(), g.2.iter().map(|m| m.to_string()).collect()))
+    }
+    fn primary_users(&self, gid: u32) -> Vec<u32> {
+        self.passwd.iter().filter(|p| p.2 == gid).map(|p| p.0).collect()
+    }
+    fn nsswitch(&self) -> Option<String> {
+        self.nss.map(str::to_string)
+    }
+    fn etc(&self, name: &str) -> Option<String> {
+        self.etc.iter().find(|e| e.0 == name).map(|e| e.1.to_string())
+    }
+}
+
+/// A Debian/Ubuntu-style nsswitch.conf (local sources only; the `hosts:` action
+/// brackets are on another database and do not matter).
+#[cfg(unix)]
+const NSS_LOCAL: &str = "# /etc/nsswitch.conf\npasswd:         files systemd\ngroup:          files systemd\nshadow:         files systemd\nhosts:          files mdns4_minimal [NOTFOUND=return] dns\n";
+
+#[cfg(unix)]
+const ETC_LOCAL: [(&str, &str); 2] = [("passwd", "root:x:0:0::/root:/bin/sh\nopswat:x:1000:1000::/home/opswat:/bin/bash\n"), ("group", "root:x:0:\nopswat:x:1000:\n")];
+
+/// The measured Ubuntu box: opswat is uid 1000, group opswat (1000) has no
+/// members (`opswat:x:1000:`), and no other user's primary group is 1000. Root's
+/// group 0 is root's alone too, but root never gets the exception.
+#[cfg(unix)]
+fn upg_db() -> FakeDb {
+    FakeDb {
+        passwd: vec![(0, "root", 0), (1000, "opswat", 1000), (1001, "eve", 1001), (65534, "nobody", 65534)],
+        group: vec![(0, "root", vec![]), (1000, "opswat", vec![]), (1001, "eve", vec![]), (27, "sudo", vec!["opswat"]), (65534, "nogroup", vec![])],
+        nss: Some(NSS_LOCAL),
+        etc: ETC_LOCAL.to_vec(),
+    }
+}
+
+/// One user `me` (uid) whose private group is `gid`, on local NSS.
+#[cfg(unix)]
+fn me_db(uid: u32, gid: u32) -> FakeDb {
+    FakeDb { passwd: vec![(uid, "me", gid)], group: vec![(gid, "me", vec![])], nss: Some(NSS_LOCAL), etc: ETC_LOCAL.to_vec() }
+}
+
+#[cfg(unix)]
+fn gmeta(uid: u32, gid: u32, mode: u32) -> securefs::Meta {
+    securefs::Meta { gid, ..meta(uid, mode) }
+}
+
+/// The user-private-group rule on its own, with injected group data: every
+/// condition must be proven, and the refusal names the one that is not.
+#[cfg(unix)]
+#[test]
+fn group_write_is_safe_only_in_the_owners_private_group() {
+    use securefs::private_group;
+    let db = upg_db();
+    let refused = |uid: u32, gid: u32, db: &FakeDb, why: &str| {
+        let e = private_group(uid, gid, db).unwrap_err();
+        assert!(e.contains(why), "{uid}/{gid}: wanted {why:?}, got {e:?}");
+    };
+    assert_eq!(private_group(1000, 1000, &db), Ok(()), "opswat:x:1000: with no members, local NSS");
+    // Not the owner's primary group.
+    refused(1000, 1001, &db, "not uid 1000's primary group");
+    refused(1000, 27, &db, "not uid 1000's primary group");
+    // The group's name is not the user's name.
+    let renamed = FakeDb { group: vec![(1000, "staff", vec![])], ..upg_db() };
+    refused(1000, 1000, &renamed, "its name `staff` is not the user name `opswat`");
+    // The group lists a supplementary member, even the owner itself.
+    refused(1000, 1000, &FakeDb { group: vec![(1000, "opswat", vec!["opswat"])], ..upg_db() }, "lists members opswat");
+    refused(1000, 1000, &FakeDb { group: vec![(1000, "opswat", vec!["eve"])], ..upg_db() }, "lists members eve");
+    // Another user has it as a primary group.
+    let shared = FakeDb { passwd: vec![(1000, "opswat", 1000), (1002, "mallory", 1000)], ..upg_db() };
+    refused(1000, 1000, &shared, "uid 1002 also has it as primary group");
+    // Unknown user or group: not provably private.
+    refused(4242, 4242, &db, "uid 4242 has no passwd entry");
+    refused(1000, 1000, &FakeDb { group: vec![], ..upg_db() }, "group 1000 has no group entry");
+    // Root never.
+    refused(0, 0, &db, "root's paths never");
+    // Users or groups from a source that may not be enumerable: refused, even
+    // though everything above holds.
+    for (nss, why) in [
+        ("passwd: files sss\ngroup: files sss\n", "passwd: uses `sss`"),
+        ("passwd: files systemd\ngroup: files ldap\n", "group: uses `ldap`"),
+        ("passwd: cache files\ngroup: files\n", "passwd: uses `cache`"),
+        ("passwd: files winbind\ngroup: files winbind\n", "uses `winbind`"),
+        ("passwd: files\n", "has no group: line"),
+        ("group: files\n", "has no passwd: line"),
+        ("passwd: files\ngroup: files\npasswd: files sss\n", "2 passwd: lines"),
+        ("passwd: files [NOTFOUND=return] sss\ngroup: files\n", "action"),
+    ] {
+        refused(1000, 1000, &FakeDb { nss: Some(nss), ..upg_db() }, why);
+    }
+    refused(1000, 1000, &FakeDb { nss: None, ..upg_db() }, "/etc/nsswitch.conf cannot be read");
+}
+
+/// The nsswitch.conf reading is strict and fails closed: wherever it could
+/// disagree with glibc (which then might consult sss or ldap), it refuses.
+#[cfg(unix)]
+#[test]
+fn only_files_and_systemd_count_as_local_nss() {
+    use securefs::nss_local;
+    let etc = |f: &str| ETC_LOCAL.iter().find(|e| e.0 == f).map(|e| e.1.to_string());
+    let ok = |conf: &str| assert_eq!(nss_local(conf, &etc), Ok(()), "{conf:?}");
+    let refused = |conf: &str, why: &str| {
+        let e = nss_local(conf, &etc).unwrap_err();
+        assert!(e.contains(why), "{conf:?}: wanted {why:?}, got {e:?}");
+    };
+    ok(NSS_LOCAL);
+    ok("passwd: files # sss\ngroup: files\n");
+    ok("passwd:files\ngroup:files systemd\n");
+    ok("  passwd:\tfiles  systemd  \ngroup: files\n");
+    ok("#passwd: sss\npasswd: files\ngroup: files\n");
+    ok("passwd: files\ngroup: files\npasswd_compat: nis\n");
+    // Action brackets on passwd:/group:, in any spacing.
+    refused("passwd: files [NOTFOUND=return] systemd\ngroup: files\n", "action");
+    refused("passwd: files\ngroup: files [SUCCESS=merge] systemd\n", "action");
+    refused("passwd: files [ NOTFOUND = return ] systemd\ngroup: files\n", "action");
+    refused("passwd: files [SUCCESS=merge] sss\ngroup: files\n", "action");
+    // Exactly one line per database: duplicates, in any case, are refused.
+    refused("passwd: files\ngroup: files\npasswd: files sss\n", "2 passwd: lines");
+    refused("passwd: files\ngroup: files\npasswd: files\n", "2 passwd: lines");
+    refused("passwd: files\ngroup: files\ngroup: files\n", "2 group: lines");
+    refused("passwd: files\nPASSWD: files sss\ngroup: files\n", "2 passwd: lines");
+    refused("passwd: files\nGroup : ldap\ngroup: files\n", "2 group: lines");
+    // A line that is not `database: sources`.
+    refused("passwd: files\ngroup: files\npasswd files sss\n", "line 3 is not `database: sources`");
+    // Missing database lines or an empty file: glibc's built-in defaults, unknown here.
+    refused("", "no passwd: line");
+    refused("passwd: files\n", "no group: line");
+    refused("group: files\n", "no passwd: line");
+    refused("passwd:\ngroup: files\n", "passwd: names no source");
+    // Any source outside the allowlist, including case variants and unknown names.
+    refused("passwd: files sss\ngroup: files sss\n", "`sss`");
+    refused("passwd: files\ngroup: files ldap\n", "`ldap`");
+    refused("passwd: Files\ngroup: files\n", "`Files`");
+    refused("passwd: files winbind\ngroup: files\n", "`winbind`");
+    refused("passwd: cache files\ngroup: files\n", "`cache`");
+    refused("passwd: files mymachines\ngroup: files\n", "`mymachines`");
+    // compat: only with no passwd_compat/group_compat line and no +/- entries.
+    ok("passwd: compat\ngroup: compat\n");
+    refused("passwd: compat\ngroup: compat\npasswd_compat: ldap\n", "passwd_compat");
+    refused("passwd: compat\ngroup: files\nGROUP_COMPAT: nis\n", "group_compat");
+    let nis = |f: &str| match f {
+        "passwd" => Some("root:x:0:0::/root:/bin/sh\n+@admins::::::\n".to_string()),
+        _ => etc(f),
+    };
+    assert!(nss_local("passwd: compat\ngroup: compat\n", &nis).unwrap_err().contains("/etc/passwd has NIS"));
+    let nis_g = |f: &str| match f {
+        "group" => Some("root:x:0:\n-wheel\n".to_string()),
+        _ => etc(f),
+    };
+    assert!(nss_local("passwd: files\ngroup: compat\n", &nis_g).unwrap_err().contains("/etc/group has NIS"));
+    assert!(nss_local("passwd: compat\ngroup: files\n", &|_| None).unwrap_err().contains("/etc/passwd cannot be read"));
+    // NIS entries do not matter when compat is not used.
+    assert_eq!(nss_local("passwd: files\ngroup: files\n", &nis), Ok(()));
+}
+
+/// The measured case end to end through the checks: a 0664 file in a 0775
+/// directory, both opswat:opswat (a private group), is accepted; the same modes
+/// in a shared group, or world-writable, are not.
+#[cfg(unix)]
+#[test]
+fn ubuntu_private_group_664_in_775_is_accepted() {
+    use securefs::{check_dir, check_file};
+    const REG: u32 = libc::S_IFREG as u32;
+    const DIR: u32 = libc::S_IFDIR as u32;
+    let db = upg_db();
+    let p = Path::new("/home/opswat/.config/autostart");
+    assert_eq!(check_file(&gmeta(1000, 1000, REG | 0o664), 1000, &db), Ok(()));
+    assert_eq!(check_dir(p, &gmeta(1000, 1000, DIR | 0o775), 1000, true, &db), Ok(()));
+    assert_eq!(check_dir(p, &gmeta(1000, 1000, DIR | 0o775), 1000, false, &db), Ok(()));
+    // A shared group (one with a member, another user's primary group), a group
+    // named for someone else, or users from SSSD: refused.
+    for (gid, db) in [
+        (27, upg_db()),
+        (1001, upg_db()),
+        (1000, FakeDb { passwd: vec![(1000, "opswat", 1000), (1002, "mallory", 1000)], ..upg_db() }),
+        (1000, FakeDb { group: vec![(1000, "opswat", vec!["eve"])], ..upg_db() }),
+        (1000, FakeDb { group: vec![(1000, "staff", vec![])], ..upg_db() }),
+        (1000, FakeDb { nss: Some("passwd: files sss\ngroup: files sss\n"), ..upg_db() }),
+    ] {
+        let e = check_file(&gmeta(1000, gid, REG | 0o664), 1000, &db).unwrap_err();
+        assert!(e.contains(&format!("writable by group {gid}")), "{e}");
+        assert!(check_dir(p, &gmeta(1000, gid, DIR | 0o775), 1000, true, &db).unwrap_err().contains("writable by group"));
+    }
+    // World-writable: never, private group or not.
+    for mode in [0o666, 0o646, 0o662] {
+        let e = check_file(&gmeta(1000, 1000, REG | mode), 1000, &db).unwrap_err();
+        assert!(e.contains("world-writable"), "{mode:o}: {e}");
+    }
+    for mode in [0o777, 0o757, 0o1777] {
+        assert!(check_dir(p, &gmeta(1000, 1000, DIR | mode), 1000, true, &db).unwrap_err().contains("world-writable"), "{mode:o}");
+    }
+    // Root-owned, group-write in root's own group 0: still refused, for a root or user agent.
+    assert!(check_dir(p, &gmeta(0, 0, DIR | 0o775), 0, true, &db).unwrap_err().contains("writable by group 0"));
+    assert!(check_dir(p, &gmeta(0, 0, DIR | 0o775), 1000, false, &db).is_err());
+    // A root agent never rewrites the user's file, private group or not.
+    assert!(check_file(&gmeta(1000, 1000, REG | 0o664), 0, &db).unwrap_err().contains("owned by uid 1000"));
+}
+
 /// The ownership rules, with injected metadata (no chown needed).
 #[cfg(unix)]
 #[test]
 fn only_our_own_unshared_files_and_dirs_are_rewritten() {
-    use securefs::{check_dir, check_file};
+    let db = upg_db();
+    let check_dir = |p: &Path, m: &securefs::Meta, e: u32, own: bool| securefs::check_dir(p, m, e, own, &db);
+    let check_file = |m: &securefs::Meta, e: u32| securefs::check_file(m, e, &db);
     const REG: u32 = libc::S_IFREG as u32;
     const DIR: u32 = libc::S_IFDIR as u32;
     let p = Path::new("/x");
@@ -244,11 +459,20 @@ fn a_group_or_world_writable_directory_is_refused() {
     let entry = me.join(".config/autostart/it-ai.desktop");
     std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
     let old = "[Desktop Entry]\nExec=/bin/it-ai --relay-token htok_old\n";
-    for (dir, mode) in [(entry.parent().unwrap().to_path_buf(), 0o775), (entry.parent().unwrap().to_path_buf(), 0o757), (me.join(".config"), 0o777)] {
+    // Group-write: refused here only when the scratch dir's group is not this
+    // user's private group (macOS staff, root's group 0, a shared group). The
+    // private-group case has its own test below.
+    use std::os::unix::fs::MetadataExt;
+    let gid = std::fs::metadata(entry.parent().unwrap()).unwrap().gid();
+    let mut cases = vec![(entry.parent().unwrap().to_path_buf(), 0o757), (me.join(".config"), 0o777)];
+    if securefs::private_group(securefs::euid(), gid, &securefs::SysGroups).is_err() {
+        cases.push((entry.parent().unwrap().to_path_buf(), 0o775));
+    }
+    for (dir, mode) in cases {
         std::fs::write(&entry, old).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
         let e = securefs::open(&entry).unwrap().unwrap();
-        assert!(e.check(securefs::euid()).unwrap_err().contains("writable"), "{} {mode:o}", dir.display());
+        assert!(e.check(securefs::euid(), &securefs::SysGroups).unwrap_err().contains("writable"), "{} {mode:o}", dir.display());
         assert!(unix::clean(Kind::Desktop, &entry, &path_in(&me), false, true));
         assert_eq!(std::fs::read_to_string(&entry).unwrap(), old, "{} {mode:o}", dir.display());
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -256,6 +480,36 @@ fn a_group_or_world_writable_directory_is_refused() {
     // Back to 0755 all the way: now it is rewritten.
     assert!(!unix::clean(Kind::Desktop, &entry, &path_in(&me), false, true));
     assert!(!std::fs::read_to_string(&entry).unwrap().contains("htok_old"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A real 0664 entry in a 0775 directory, through `Entry::check`: accepted when
+/// the group database says the file's group is this user's private group, refused
+/// when it says the group is shared. The group the files really have is used, so
+/// this needs no chgrp.
+#[cfg(unix)]
+#[test]
+fn a_664_entry_in_a_775_dir_is_checked_against_the_group_database() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = scratch("upg");
+    let me = securefs::euid();
+    let dir = root.join("autostart");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("it-ai.desktop");
+    std::fs::write(&f, "x").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+    std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let (fg, dg) = (std::fs::metadata(&f).unwrap().gid(), std::fs::metadata(&dir).unwrap().gid());
+    let e = securefs::open(&f).unwrap().unwrap();
+    if me != 0 && fg == dg {
+        assert_eq!(e.check(me, &me_db(me, fg)), Ok(()));
+    }
+    let mut shared = me_db(me, fg);
+    shared.passwd.push((me + 1, "other", fg));
+    if dg != fg {
+        shared.group.push((dg, "other", vec![]));
+    }
+    assert!(e.check(me, &shared).unwrap_err().contains("writable by group"));
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -270,7 +524,7 @@ fn a_directory_swapped_after_the_checks_is_not_written() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("it-ai.desktop"), "old").unwrap();
     let e = securefs::open(&dir.join("it-ai.desktop")).unwrap().unwrap();
-    e.check(securefs::euid()).unwrap();
+    e.check(securefs::euid(), &securefs::SysGroups).unwrap();
     // The swap: the checked directory moves away, an attacker's takes its place.
     std::fs::rename(&dir, root.join("checked")).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
@@ -375,38 +629,50 @@ fn a_pinned_home_must_be_trusted_from_the_root_down() {
     let me = securefs::euid();
     let root = scratch("trust");
     let home = home_with_secret(&root, "svc");
-    assert_eq!(securefs::check_trusted_dir(&home, me), Ok(()));
-    assert_eq!(securefs::check_trusted_dir(Path::new("/"), me), Ok(()));
+    assert_eq!(securefs::check_trusted_dir(&home, me, &securefs::SysGroups), Ok(()));
+    assert_eq!(securefs::check_trusted_dir(Path::new("/"), me, &securefs::SysGroups), Ok(()));
     // Owned by someone who is neither root nor this agent.
     if me == 0 {
         std::os::unix::fs::chown(&home, Some(12345), None).unwrap();
-        assert!(securefs::check_trusted_dir(&home, 0).unwrap_err().contains("owned by uid 12345"));
+        assert!(securefs::check_trusted_dir(&home, 0, &securefs::SysGroups).unwrap_err().contains("owned by uid 12345"));
         std::os::unix::fs::chown(&home, Some(0), None).unwrap();
     } else {
-        assert!(securefs::check_trusted_dir(&home, me + 12345).unwrap_err().contains("owned by uid"));
+        assert!(securefs::check_trusted_dir(&home, me + 12345, &securefs::SysGroups).unwrap_err().contains("owned by uid"));
     }
     // Writable by others: the dir itself, or any directory above it.
     set(&home, 0o777);
-    assert!(securefs::check_trusted_dir(&home, me).unwrap_err().contains("writable"));
+    assert!(securefs::check_trusted_dir(&home, me, &securefs::SysGroups).unwrap_err().contains("writable"));
     set(&home, 0o755);
+    set(&root, 0o757);
+    assert!(securefs::check_trusted_dir(&home, me, &securefs::SysGroups).unwrap_err().contains("world-writable"));
+    // Group-write above it: refused in a shared group, accepted in this user's
+    // private group (never for root), with injected group data.
+    use std::os::unix::fs::MetadataExt;
     set(&root, 0o775);
-    assert!(securefs::check_trusted_dir(&home, me).unwrap_err().contains("writable"));
+    let gid = std::fs::metadata(&root).unwrap().gid();
+    let mut shared = me_db(me, gid);
+    shared.passwd.push((me + 1, "other", gid));
+    assert!(securefs::check_trusted_dir(&home, me, &shared).unwrap_err().contains("writable by group"));
+    assert_eq!(securefs::check_trusted_dir(&home, me, &me_db(me, gid)).is_ok(), me != 0);
+    let sss = FakeDb { nss: Some("passwd: files sss\ngroup: files sss\n"), ..me_db(me, gid) };
+    let why = if me == 0 { "root's paths never" } else { "uses `sss`" };
+    assert!(securefs::check_trusted_dir(&home, me, &sss).unwrap_err().contains(why));
     set(&root, 0o755);
     // A symlink in a trusted dir to a trusted dir is fine, and so is the target.
     std::os::unix::fs::symlink(&home, root.join("link")).unwrap();
-    assert_eq!(securefs::check_trusted_dir(&root.join("link"), me), Ok(()));
+    assert_eq!(securefs::check_trusted_dir(&root.join("link"), me, &securefs::SysGroups), Ok(()));
     // A symlink in a directory others can write could be repointed later.
     let ww = root.join("ww");
     std::fs::create_dir(&ww).unwrap();
     std::os::unix::fs::symlink(&home, ww.join("link")).unwrap();
     set(&ww, 0o777);
-    assert!(securefs::check_trusted_dir(&ww.join("link"), me).is_err());
+    assert!(securefs::check_trusted_dir(&ww.join("link"), me, &securefs::SysGroups).is_err());
     // A symlink from a trusted dir into an untrusted one.
     std::os::unix::fs::symlink(&ww, root.join("to-ww")).unwrap();
-    assert!(securefs::check_trusted_dir(&root.join("to-ww"), me).unwrap_err().contains("writable"));
+    assert!(securefs::check_trusted_dir(&root.join("to-ww"), me, &securefs::SysGroups).unwrap_err().contains("writable"));
     set(&ww, 0o755);
     #[cfg(target_os = "macos")]
-    assert_eq!(securefs::check_trusted_dir(Path::new("/var/root"), 0), Ok(()), "/var is root's symlink to /private/var");
+    assert_eq!(securefs::check_trusted_dir(Path::new("/var/root"), 0, &securefs::SysGroups), Ok(()), "/var is root's symlink to /private/var");
     let _ = std::fs::remove_dir_all(&root);
 }
 

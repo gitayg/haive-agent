@@ -124,9 +124,37 @@ From agent 3.7.0, with hub 3.16.0 or later:
     directory is opened once, and the entry is read, checked and replaced through that
     directory with `O_NOFOLLOW`, `O_EXCL` and `renameat`. The file and its directory must belong to
     the agent's own user, every directory above them to that user or root, and none of them may
-    be writable by group or others, as with ssh's `StrictModes`. So a root agent never rewrites a
+    be writable by others, as with ssh's `StrictModes`. So a root agent never rewrites a
     file in a directory a user can change. An entry that fails these checks is left as it is,
     with a log line.
+  - **Group-write is allowed only in the user's private group (agent 3.8.3+).** Debian and Ubuntu
+    give each user a group of their own and umask 002, so a desktop user's `~/.config/autostart`
+    is 0775 and `it-ai.desktop` 0664, both `user:user`. 3.8.2 refused any group-writable file or
+    directory, so on most Ubuntu desktops the clean-up never ran and the token stayed in the file.
+    Group-write on a path owned by the agent's user now counts as safe only when every one of
+    these is proven, and the log line names the first that is not:
+    - the path's gid is the user's primary gid, and the group's name is the user's name;
+    - the group lists no supplementary members, and no other passwd entry has that gid as its
+      primary group;
+    - `/etc/nsswitch.conf` provably takes users and groups only from this machine, where all of
+      them can be listed, so "no other user has this group" can be checked. It is read strictly
+      and anything this reading might get differently from glibc is refused. The file must exist
+      and be readable, and every non-comment line must be `database: sources`. It needs exactly
+      one `passwd:` and exactly one `group:` line, with database names compared ignoring case. Those
+      lines may have no `[...]` action items. Their sources may only be `files` and `systemd`, or
+      `compat` when there is no `passwd_compat:`/`group_compat:` line and `/etc/passwd`
+      (`/etc/group`) has no `+`/`-` NIS entry. Any other source (`sss`, `ldap`, `winbind`, `nis`,
+      `cache`, an unknown or differently-cased name), a missing or duplicated line, or an
+      unreadable file means the group is not proven private, and the entry is left alone. A
+      vendor file such as openSUSE's `/usr/etc/nsswitch.conf` is not read: without
+      `/etc/nsswitch.conf` the rule never applies, and neither does it on macOS, which has none.
+
+    This is the rule Debian patches into OpenSSH's `StrictModes`
+    (`debian/patches/user-group-modes.patch`, "Allow harmless group-writability", Debian bug
+    #314347), made stricter. Debian also accepts the owner listed as the group's only member, and
+    it trusts NSS enumeration from any source. World-writable is always refused, so is group-write
+    in any shared group, and root-owned paths never get the exception (no group-write at all). The
+    same rule applies to the HOME a root service would be pinned to, which must still be root's own.
   - **It never starts, stops or loads anything.** Files are replaced atomically and keep their
     mode and owner. A unit is followed by `systemctl daemon-reload` only. A plist takes effect at
     its next load. The task is changed in place with `schtasks /Change /TN IT-AI /TR …` and no `/RU`, `/RP` or
@@ -137,7 +165,12 @@ From agent 3.7.0, with hub 3.16.0 or later:
   - `scripts/entryclean-e2e.sh` checks this in Docker against old `.desktop` and unit entries,
     and starts each rewritten entry to confirm it finds the device secret. It also checks that a
     root agent leaves a user-owned entry and a symlinked unit alone, and never pins a unit's HOME
-    to a user-owned directory.
+    to a user-owned directory. Since 3.8.3 it also strips a 0664 entry in a 0775 directory of a
+    user whose private group has no members, and leaves the same entry alone in a shared group
+    (another member, or another user's primary group), when the group is not named for the user,
+    when nsswitch.conf takes users from `sss` or has a second `PASSWD:` line, and when it is
+    world-writable. It also checks that a
+    root agent never follows an `agent.log` or `~/.it-ai` symlink another user planted.
 - **After a revoke.** When the hub refuses the device secret, the agent logs
   `relay: device credential rejected — re-enroll this device` and retries every 60 s; it never
   exits. If an enrollment token was passed on this start (flag or `HIVE_RELAY_TOKEN`), it
@@ -188,6 +221,30 @@ the same `%USERPROFILE%\.it-ai\agent.log` as a `--background` start, with the sa
 1 MB cap. Before 3.8.2 that output went nowhere, so after an update the log stopped at the old
 version. On macOS and Linux an update `exec`s the new binary, which keeps the old process's stdout
 and stderr. A test checks this.
+
+On Linux and macOS, from agent 3.8.3, an agent started without a terminal points its own stdout and
+stderr at `~/.it-ai/agent.log` (0600, appending, the same 1 MB cap) at startup. This is the Linux
+desktop autostart: the `.desktop` entry's `Exec=` has no `--background`, so the agent used to write
+wherever the session sent its output, and `agent.log` stopped at the last `--background` start
+(measured on Ubuntu 26.04 GNOME: the log stopped at 3.3.1 while the agent ran 3.8.2). It applies
+when stdout is a pipe, a socket, `/dev/null` or closed. It does not apply when stdout is a terminal,
+or a regular file: launchd's `StandardOutPath` is already `agent.log`, so a launchd agent is not
+redirected a second time, and neither is a `--background` child or a `> file`. A systemd service
+keeps logging to the journal (`journalctl -u it-ai`): the agent stays on it when `$JOURNAL_STREAM`
+names the device and inode of its own stdout or stderr, as systemd.exec(5) says to check, and
+`$SYSTEMD_EXEC_PID`, when set, is the agent's own pid. A variable merely inherited from a service
+further up the tree (a desktop session started by systemd) does not count. A Linux autostart agent
+therefore logs to `~/.it-ai/agent.log` of the user it runs as. The unix restart after an update
+`exec`s with the same descriptors, so it keeps logging there too.
+
+On Linux and macOS the agent never opens its log through a link (3.8.3). `~/.it-ai` is opened
+`O_DIRECTORY|O_NOFOLLOW` and must be a directory of the agent's own user. `agent.log` is opened
+relative to it with `O_NOFOLLOW` and must be a regular file of that user with one link. A mode an
+older agent left loose is tightened through those descriptors (0700 and 0600), and the 1 MB trim
+truncates that descriptor, never a path. Otherwise the agent does not log there and says why on
+stderr. This covers the `--background` relaunch, the trim at every start and the redirect above. So
+a root agent whose `~/.it-ai/agent.log`, or `~/.it-ai`, another user turned into a link never
+appends to, chmods or truncates the file it points at. Windows opens the path as before.
 
 ## LAN-direct
 

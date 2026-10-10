@@ -743,7 +743,8 @@ pub(crate) fn apply_update(slot: crate::updatelock::UpdateSlot, bytes: &[u8]) ->
 /// lives on after this process exits. Its stdout+stderr are appended to the same
 /// `agent.log` a `--background` start writes (`logfile::redirect`); before 3.8.2
 /// they went to null, so an updated Windows agent logged nowhere. Unix does not
-/// use this: it `exec`s, which keeps the old process's stdout/stderr.
+/// use this: it `exec`s, which keeps the old process's stdout/stderr (agent.log
+/// since 3.8.3 unless a terminal, file or service journal: `logfile::adopt_stdio`).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn update_restart_command(exe: &std::path::Path, args: Vec<String>, log: &std::path::Path) -> std::process::Command {
     let mut c = crate::relaycred::restart_command(exe, args);

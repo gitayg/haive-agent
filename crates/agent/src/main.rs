@@ -553,6 +553,12 @@ fn main() {
         println!("IT-AI installed as an elevated service — starts at logon, self-restarting, and started now. You can close this window.");
         return;
     }
+    // From here this process is the long-running agent. Started without a
+    // terminal and not into a file or a systemd service's journal (a desktop
+    // autostart's Exec=, a nohup), its output would go nowhere anyone looks:
+    // send it to agent.log.
+    #[cfg(unix)]
+    logfile::adopt_stdio(&log_path());
     let lifetime = if args.persist {
         persistence::install(&persist_args(), true);
         "persistent (autostart at login)".to_string()

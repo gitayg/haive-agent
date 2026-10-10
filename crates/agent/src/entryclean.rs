@@ -190,12 +190,12 @@ pub(crate) fn run(hub: &str, loaded: &Path, is_device: bool) -> bool {
 }
 
 #[cfg(unix)]
-mod securefs;
+pub(crate) mod securefs;
 
 /// The home to pin into an entry whose own HOME would miss the credential kept
 /// in `cred_home`: the service account's passwd home when the credential is found
 /// there, else `cred_home` itself. Either way only a directory, and its `.it-ai`,
-/// that no one but root or this agent can change, checked from `/` down
+/// that no one but root or this agent (or its private group) can change, checked from `/` down
 /// (`securefs::check_trusted_dir`): a root service pinned to a directory a user
 /// can write would load a credential, certs, jobs and schedules that user
 /// planted. Otherwise the entry is left alone. Credentials are never moved or
@@ -210,7 +210,7 @@ pub(crate) fn pin_target(
 ) -> Result<PathBuf, String> {
     let h = if same(&relaycred::path_in(service_home), loaded) { service_home.to_path_buf() } else { cred_home.to_path_buf() };
     for d in [h.clone(), h.join(".it-ai")] {
-        securefs::check_trusted_dir(&d, euid).map_err(|why| format!("HOME={} is not safe to pin: {why}", h.display()))?;
+        securefs::check_trusted_dir(&d, euid, &securefs::SysGroups).map_err(|why| format!("HOME={} is not safe to pin: {why}", h.display()))?;
     }
     Ok(h)
 }
@@ -267,7 +267,7 @@ pub(crate) mod unix {
         if !ready {
             return left(LEFT_FOR_LATER);
         }
-        if let Err(why) = entry.check(securefs::euid()) {
+        if let Err(why) = entry.check(securefs::euid(), &securefs::SysGroups) {
             return left(&format!("left as is: {why}"));
         }
         let pin_to = |h: &Path| pin_target(h, loaded, &crate::persistence::service_home(), securefs::euid(), &same_file);

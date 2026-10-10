@@ -140,5 +140,109 @@ grep -q 'HOME=/u is not safe to pin' /tmp/8.log && pass "logged why" || fail "lo
 [ -f /u/.it-ai/relay.cred ] && [ ! -e /.it-ai/relay.cred ] && [ ! -e /root/.it-ai/relay.cred ] && pass "no credential moved or copied" || fail "credential moved/copied"
 rm -rf /u
 
-for f in /tmp/1.log /tmp/2.log /tmp/4.log /tmp/5.log /tmp/6.log /tmp/7.log /tmp/8.log; do echo "--- autostart lines in $f"; grep autostart: "$f" || true; done
+# A user laid out as Ubuntu lays out a desktop user: a user-private group with no members
+# (useradd -U, as adduser does), umask 002, so ~/.config/autostart is 0775 and the entry 0664.
+upg_user() { # upg_user <name>: home 750, .config 700, autostart 775, .desktop 664, cred 700/600
+  id "$1" >/dev/null 2>&1 || useradd -m -U -s /bin/bash "$1"
+  local h=/home/$1
+  rm -rf "$h/.config" "$h/.it-ai"; cred "$h" device; desktop "$h"
+  chown -R "$1:$1" "$h"; chmod 750 "$h"; chmod 700 "$h/.config"; chmod 775 "$h/.config/autostart"; chmod 664 "$h/.config/autostart/it-ai.desktop"
+}
+
+echo "== 9. Ubuntu user-private group: opswat:opswat, group has no members, autostart 775, entry 664: stripped"
+reset; upg_user opswat
+echo "   getent group opswat: $(getent group opswat)"; stat -c '   %a %U:%G %n' /home/opswat /home/opswat/.config /home/opswat/.config/autostart /home/opswat/.config/autostart/it-ai.desktop
+SECS=12 run_agent /tmp/9.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
+! has_token /home/opswat/.config/autostart/it-ai.desktop && pass "UPG entry stripped" || fail "UPG entry still has it: $(grep autostart: /tmp/9.log)"
+[ "$(stat -c '%a %U:%G' /home/opswat/.config/autostart/it-ai.desktop)" = "664 opswat:opswat" ] && pass "mode 664 and owner kept" || fail "now $(stat -c '%a %U:%G' /home/opswat/.config/autostart/it-ai.desktop)"
+grep -q "removed the enrollment token from /home/opswat/.config/autostart/it-ai.desktop" /tmp/9.log && pass "logged the rewrite" || fail "log: $(grep autostart: /tmp/9.log)"
+grep -q '"autostart_token":false' /tmp/hello.log && pass "hello says autostart_token=false" || fail "hello: $(head -c 300 /tmp/hello.log)"
+
+echo "== 10a. shared group: autostart 775 and entry 664 in group team (members opswat, eve): left alone"
+reset; upg_user opswat; id eve >/dev/null 2>&1 || useradd -m -U eve; getent group team >/dev/null || groupadd team
+usermod -aG team opswat; usermod -aG team eve
+chgrp team /home/opswat/.config/autostart /home/opswat/.config/autostart/it-ai.desktop
+echo "   getent group team: $(getent group team)"
+cp /home/opswat/.config/autostart/it-ai.desktop /tmp/desk.before
+SECS=12 run_agent /tmp/10a.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
+cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "shared-group entry untouched" || fail "rewritten in a shared group"
+grep -q 'left as is: .*writable by group' /tmp/10a.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10a.log)"
+grep -q '"autostart_token":true' /tmp/hello.log && pass "hello says autostart_token=true" || fail "hello: $(head -c 300 /tmp/hello.log)"
+
+echo "== 10b. the group is opswat's, but mallory has it as HER primary group: left alone"
+reset; upg_user opswat; id mallory >/dev/null 2>&1 || useradd -m -g opswat mallory
+echo "   getent group opswat: $(getent group opswat); getent passwd mallory: $(getent passwd mallory)"
+cp /home/opswat/.config/autostart/it-ai.desktop /tmp/desk.before
+SECS=12 run_agent /tmp/10b.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
+cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "entry untouched" || fail "rewritten though another user shares the group"
+grep -q 'left as is: .*writable by group' /tmp/10b.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10b.log)"
+userdel -r mallory >/dev/null 2>&1 || true
+
+echo "== 10c. user-private group but the entry is world-writable (666): left alone"
+reset; upg_user opswat; chmod 666 /home/opswat/.config/autostart/it-ai.desktop
+cp /home/opswat/.config/autostart/it-ai.desktop /tmp/desk.before
+SECS=12 run_agent /tmp/10c.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
+cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "world-writable entry untouched" || fail "rewritten though world-writable"
+grep -q 'left as is: it is world-writable' /tmp/10c.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10c.log)"
+
+echo "== 10d. user-private group, but passwd/group also come from SSSD (not enumerable): left alone"
+reset; upg_user opswat; cp /etc/nsswitch.conf /tmp/nsswitch.before
+sed -i -E 's/^(passwd|group):.*/\1: files sss/' /etc/nsswitch.conf; grep -E '^(passwd|group):' /etc/nsswitch.conf | sed 's/^/   /'
+cp /home/opswat/.config/autostart/it-ai.desktop /tmp/desk.before
+SECS=12 run_agent /tmp/10d.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
+cp /tmp/nsswitch.before /etc/nsswitch.conf
+cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "entry untouched with sss in nsswitch" || fail "rewritten though NSS has sss"
+grep -q 'uses `sss`' /tmp/10d.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10d.log)"
+
+echo "== 10f. nsswitch.conf keeps 'passwd: files' but adds a second 'PASSWD: files ldap' line: left alone"
+reset; upg_user opswat; cp /etc/nsswitch.conf /tmp/nsswitch.before; printf 'PASSWD: files ldap\n' >> /etc/nsswitch.conf
+grep -iE '^(passwd|group) *:' /etc/nsswitch.conf | sed 's/^/   /'
+cp /home/opswat/.config/autostart/it-ai.desktop /tmp/desk.before
+SECS=12 run_agent /tmp/10f.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
+cp /tmp/nsswitch.before /etc/nsswitch.conf
+cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "entry untouched with a duplicate passwd line" || fail "rewritten though nsswitch.conf has two passwd lines"
+grep -q 'has 2 passwd: lines' /tmp/10f.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10f.log)"
+
+echo "== 10e. rita's primary group has no members and no other user, but is named ritagrp, not rita: left alone"
+reset; getent group ritagrp >/dev/null || groupadd ritagrp; id rita >/dev/null 2>&1 || useradd -m -g ritagrp rita
+rm -rf /home/rita/.config /home/rita/.it-ai; cred /home/rita device; desktop /home/rita
+chown -R rita:ritagrp /home/rita; chmod 775 /home/rita/.config/autostart; chmod 664 /home/rita/.config/autostart/it-ai.desktop
+echo "   getent group ritagrp: $(getent group ritagrp); getent passwd rita: $(getent passwd rita)"
+cp /home/rita/.config/autostart/it-ai.desktop /tmp/desk.before
+SECS=12 run_agent /tmp/10e.log runuser -u rita -- env HOME=/home/rita "$BIN" --relay "$HUB" --name e2e
+cmp -s /tmp/desk.before /home/rita/.config/autostart/it-ai.desktop && pass "entry untouched" || fail "rewritten though the group is not named for the user"
+grep -q "its name \`ritagrp\` is not the user name \`rita\`" /tmp/10e.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10e.log)"
+
+echo "== 11. where a desktop-autostart agent logs: stdout to /dev/null or a pipe -> ~/.it-ai/agent.log"
+LOG=/home/opswat/.it-ai/agent.log
+count() { local n=0; [ -f "$LOG" ] && n=$(grep -c -- '— serving' "$LOG") || true; echo "$n"; }
+reset; upg_user opswat
+: > /tmp/hello.log; timeout -s TERM 20 runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e >/dev/null 2>&1 || true
+grep -q -- '— serving' "$LOG" && grep -q 'removed the enrollment token' "$LOG" && pass "/dev/null: agent.log has the startup and autostart lines" || fail "/dev/null: agent.log: $(cat "$LOG" 2>&1 | head -5)"
+[ "$(stat -c '%a %U' "$LOG")" = "600 opswat" ] && pass "agent.log is 600 opswat" || fail "agent.log $(stat -c '%a %U' "$LOG")"
+n=$(count)
+: > /tmp/pipe.out; (timeout -s TERM 20 runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e 2>&1 | cat > /tmp/pipe.out) || true
+[ "$(count)" = $((n + 1)) ] && ! grep -q -- '— serving' /tmp/pipe.out && pass "pipe: appended to agent.log, nothing on the pipe" || fail "pipe: log $(count), pipe $(head -c 300 /tmp/pipe.out)"
+n=$(count)
+timeout -s TERM 20 runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e > /tmp/file.out 2>&1 || true
+[ "$(count)" = "$n" ] && grep -q -- '— serving' /tmp/file.out && pass "stdout a regular file (launchd, --background, > file): left there, agent.log untouched" || fail "file: log $(count), file $(head -c 300 /tmp/file.out)"
+echo "--- $LOG"; [ -f "$LOG" ] && sed 's/^/    /' "$LOG" || echo "    (none)"
+
+echo "== 12. root agent, HOME=/h: agent.log (then .it-ai) is a symlink another user planted: never followed"
+reset; mkdir -p /h/.it-ai; chmod 700 /h/.it-ai; cred /h device
+head -c 1500000 /dev/zero | tr '\0' v > /etc/victim; s0=$(sha256sum < /etc/victim)
+ln -s /etc/victim /h/.it-ai/agent.log
+timeout -s TERM 10 env HOME=/h "$BIN" --relay "$HUB" --name e2e >/dev/null 2>/tmp/12.err || true
+[ "$s0" = "$(sha256sum < /etc/victim)" ] && [ -L /h/.it-ai/agent.log ] && pass "agent.log symlink: target (1.5 MB) not appended to or truncated" || fail "victim now $(stat -c %s /etc/victim) bytes"
+grep -q 'not trimming /h/.it-ai/agent.log' /tmp/12.err && grep -q 'not writing to /h/.it-ai/agent.log' /tmp/12.err && pass "logged the refusals" || fail "stderr: $(head -3 /tmp/12.err)"
+rm -rf /h/.it-ai/agent.log /tmp/victimdir; mkdir -p /tmp/victimdir; chown nobody /tmp/victimdir
+mv /h/.it-ai /h/real-it-ai; ln -s /tmp/victimdir /h/.it-ai
+timeout -s TERM 10 env HOME=/h "$BIN" --relay "$HUB" --name e2e >/dev/null 2>/tmp/12b.err || true
+[ ! -e /tmp/victimdir/agent.log ] && [ "$(stat -c '%a %U' /tmp/victimdir)" = "755 nobody" ] && pass ".it-ai symlink: no agent.log created in its target, its mode and owner unchanged" || fail "victimdir: $(ls -la /tmp/victimdir)"
+# Not logfile's: the TLS cert is still written by path (tls::ensure_cert), so it lands in the target.
+echo "   NOT COVERED (tls.rs, outside this fix): files the agent wrote through the .it-ai symlink: $(ls -A /tmp/victimdir | tr '\n' ' ')"
+grep -q 'cannot be opened as a directory without following a link' /tmp/12b.err && pass "logged the refusal" || fail "stderr: $(head -3 /tmp/12b.err)"
+rm -f /h/.it-ai; rm -rf /tmp/victimdir /etc/victim
+
+for f in /tmp/1.log /tmp/2.log /tmp/4.log /tmp/5.log /tmp/6.log /tmp/7.log /tmp/8.log /tmp/9.log /tmp/10a.log /tmp/10b.log /tmp/10c.log /tmp/10d.log /tmp/10f.log /tmp/10e.log; do echo "--- autostart lines in $f"; grep autostart: "$f" || true; done
 [ $FAIL = 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }
