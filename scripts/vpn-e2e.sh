@@ -10,7 +10,10 @@
 # path: a loopback forwarder in the test stands in for the shim. The subnet is 198.18.0.0/24
 # because the exit's own rules drop forwarded traffic to private ranges, Docker's included.
 #
-# Usage: scripts/vpn-e2e.sh [userspace|kernel]   (default userspace = HIVE_VPN_USERSPACE=1)
+# Usage: scripts/vpn-e2e.sh [userspace|kernel|noipv6]   (default userspace = HIVE_VPN_USERSPACE=1)
+# noipv6: the userspace backend on a box with no IPv6 at all, as a kernel booted with
+# ipv6.disable=1: IPv6 is off by sysctl and scripts/seccomp-no-ipv6.json makes every AF_INET6
+# socket() fail with EAFNOSUPPORT, which the sysctl alone does not do.
 # Needs an image with the agent's Linux build deps and iproute2 but NOT iptables (the exit
 # must install it); IMG overrides the default tag. Containers get NET_ADMIN and
 # /dev/net/tun only, never --privileged. Everything it starts is removed on exit.
@@ -33,7 +36,9 @@ trap cleanup EXIT
 case "$BACKEND" in
   userspace) EXIT_ENV=(-e HIVE_VPN_USERSPACE=1) PRE="" ;;
   kernel) EXIT_ENV=() PRE="apt-get update -qq && apt-get install -y -qq wireguard-tools >/dev/null && " ;;
-  *) echo "usage: $0 [userspace|kernel]" >&2; exit 2 ;;
+  noipv6) EXIT_ENV=(-e HIVE_VPN_USERSPACE=1 --sysctl net.ipv6.conf.all.disable_ipv6=1 --sysctl net.ipv6.conf.default.disable_ipv6=1
+            --security-opt "seccomp=$REPO/scripts/seccomp-no-ipv6.json") PRE="" BACKEND=userspace ;;
+  *) echo "usage: $0 [userspace|kernel|noipv6]" >&2; exit 2 ;;
 esac
 
 docker network create --subnet 198.18.0.0/24 "$NET" >/dev/null

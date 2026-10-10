@@ -109,7 +109,8 @@ pipewire = "0.9"
 # the kernel has no WireGuard module (Jetson/Tegra, some WSL2 and container
 # kernels). `device` is the TUN + UDP + UAPI layer; it needs only /dev/net/tun.
 # Pinned exactly: vpn/userspace.rs closes fds this release leaks on teardown, which
-# is only safe while the crate is known not to close them itself.
+# is only safe while the crate is known not to close them itself. Built from
+# vendor/boringtun (0.7.1 plus an IPv4-only fallback; see [patch.crates-io] in the root Cargo.toml).
 boringtun = { version = "=0.7.1", features = ["device"] }
 
 # Tests only: vpn.rs's Docker end-to-end test stalls a boringtun worker inside one of

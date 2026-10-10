@@ -436,15 +436,29 @@ impl Device {
             port = udp_sock4.local_addr()?.as_socket().unwrap().port();
         }
 
-        let udp_sock6 = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-        udp_sock6.set_reuse_address(true)?;
-        udp_sock6.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
-        udp_sock6.set_nonblocking(true)?;
+        // IT-AI patch: a kernel without IPv6 (booted with ipv6.disable=1) refuses AF_INET6
+        // sockets. Listen on IPv4 alone then, instead of failing the whole device.
+        let udp_sock6 = (|| -> Result<socket2::Socket, Error> {
+            let s = socket2::Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            s.set_reuse_address(true)?;
+            s.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
+            s.set_nonblocking(true)?;
+            Ok(s)
+        })();
+        let udp_sock6 = match udp_sock6 {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(message = "No IPv6 listener, IPv4 only", error = ?e);
+                None
+            }
+        };
 
         self.register_udp_handler(udp_sock4.try_clone().unwrap())?;
-        self.register_udp_handler(udp_sock6.try_clone().unwrap())?;
+        if let Some(s) = &udp_sock6 {
+            self.register_udp_handler(s.try_clone().unwrap())?;
+        }
         self.udp4 = Some(udp_sock4);
-        self.udp6 = Some(udp_sock6);
+        self.udp6 = udp_sock6;
 
         self.listen_port = port;
 
@@ -536,8 +550,9 @@ impl Device {
             Box::new(|d, t| {
                 let peer_map = &d.peers;
 
+                // IT-AI patch: the IPv6 socket is optional (see open_listen_socket).
                 let (udp4, udp6) = match (d.udp4.as_ref(), d.udp6.as_ref()) {
-                    (Some(udp4), Some(udp6)) => (udp4, udp6),
+                    (Some(udp4), udp6) => (udp4, udp6),
                     _ => return Action::Continue,
                 };
 
@@ -560,9 +575,8 @@ impl Device {
                                 SocketAddr::V4(_) => {
                                     udp4.send_to(packet, &endpoint_addr.into()).ok()
                                 }
-                                SocketAddr::V6(_) => {
-                                    udp6.send_to(packet, &endpoint_addr.into()).ok()
-                                }
+                                SocketAddr::V6(_) => udp6
+                                    .and_then(|udp6| udp6.send_to(packet, &endpoint_addr.into()).ok()),
                             };
                         }
                         _ => panic!("Unexpected result from update_timers"),
@@ -776,7 +790,8 @@ impl Device {
                 let mtu = d.mtu.load(Ordering::Relaxed);
 
                 let udp4 = d.udp4.as_ref().expect("Not connected");
-                let udp6 = d.udp6.as_ref().expect("Not connected");
+                // IT-AI patch: the IPv6 socket is optional (see open_listen_socket).
+                let udp6 = d.udp6.as_ref();
 
                 let peers = &d.peers_by_ip;
                 for _ in 0..MAX_ITR {
@@ -819,7 +834,9 @@ impl Device {
                             } else if let Some(addr @ SocketAddr::V4(_)) = endpoint.addr {
                                 let _: Result<_, _> = udp4.send_to(packet, &addr.into());
                             } else if let Some(addr @ SocketAddr::V6(_)) = endpoint.addr {
-                                let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                                if let Some(udp6) = udp6 {
+                                    let _: Result<_, _> = udp6.send_to(packet, &addr.into());
+                                }
                             } else {
                                 tracing::error!("No endpoint");
                             }

@@ -8,7 +8,8 @@ version = "3.9.0"
 edition = "2021"
 license = "MIT"
 
-# boringtun 0.7.1, vendored exactly as published on crates.io (the .crate's sha256 is the
-# checksum Cargo.lock held for it), so it can carry a patch.
+# boringtun 0.7.1 as published, plus one patch (vendor/boringtun/src/device/mod.rs, marked
+# "IT-AI patch"): a kernel without IPv6 (ipv6.disable=1) refuses AF_INET6 sockets, and 0.7.1
+# then fails to create the device at all. Patched, it listens on IPv4 alone.
 [patch.crates-io]
 boringtun = { path = "vendor/boringtun" }

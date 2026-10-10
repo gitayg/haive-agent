@@ -343,6 +343,10 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
   `/dev/net/tun`. That covers kernels without the module, such as Jetson (Tegra) and some WSL2 and
   container kernels. `HIVE_VPN_USERSPACE=1` forces the built-in one. `/vpn/status` reports which
   one is running as `backend` (`kernel` or `userspace`).
+- **No IPv6 needed.** The built-in WireGuard listens on IPv4 and IPv6. On a kernel booted with
+  `ipv6.disable=1`, which refuses IPv6 sockets, boringtun 0.7.1 failed to start at all; the agent
+  builds it from `vendor/boringtun` with a patch that listens on IPv4 alone then. IPv6 turned off
+  by sysctl (`net.ipv6.conf.all.disable_ipv6=1`) never broke it.
 - **The built-in WireGuard is watched and rebuilt when it dies.** boringtun runs on one worker
   thread inside the agent. If that thread panics, only the thread dies, and the exit would
   otherwise stop forwarding while everything else still looks fine. Every 10 seconds, and right
@@ -387,12 +391,14 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
 - Apply, disable, the boot resume and the expiry ticker run one at a time. A disable stops a resume
   that is still retrying, and the ticker cannot write back a pass list that a disable or a newer
   apply replaced.
-- `scripts/vpn-e2e.sh [userspace|kernel]` runs the exit in Docker against a stock WireGuard client
+- `scripts/vpn-e2e.sh [userspace|kernel|noipv6]` runs the exit in Docker against a stock WireGuard client
   and checks the handshake, traffic through the NAT, and a clean disable. On the userspace backend
   it also kills boringtun's worker (with the real 0.7.1 panic) and later holds it stuck. Each time it
   checks that `/vpn/status` goes `recovering` and then `ok`, that the client's traffic flows again
   with no apply in between, and what is left after disable: nothing after the panic, and only the
-  parked thread after the hang. The hub relay is not part of that test.
+  parked thread after the hang. `noipv6` is the userspace run on a box without IPv6:
+  `scripts/seccomp-no-ipv6.json` makes every IPv6 `socket()` fail, as `ipv6.disable=1` does. The
+  hub relay is not part of that test.
 
 ## Operator skill
 
