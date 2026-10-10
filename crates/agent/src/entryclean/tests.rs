@@ -191,6 +191,11 @@ struct FakeDb {
     nss: Option<&'static str>,
     /// `/etc/passwd`, `/etc/group` as (name, text); a name not listed is unreadable.
     etc: Vec<(&'static str, &'static str)>,
+    /// (uid, gid): a group a user gets only at login, which `group` does not show
+    /// (an nss-systemd membership, an `initgroups:` source).
+    login: Vec<(u32, u32)>,
+    nscd: bool,
+    env: Option<&'static str>,
 }
 
 #[cfg(unix)]
@@ -204,11 +209,26 @@ impl securefs::GroupDb for FakeDb {
     fn primary_users(&self, gid: u32) -> Vec<u32> {
         self.passwd.iter().filter(|p| p.2 == gid).map(|p| p.0).collect()
     }
+    fn login_members(&self, gid: u32) -> Result<Vec<u32>, String> {
+        let members = self.group(gid).map(|g| g.1).unwrap_or_default();
+        Ok(self
+            .passwd
+            .iter()
+            .filter(|p| p.2 == gid || members.iter().any(|m| m == p.1) || self.login.contains(&(p.0, gid)))
+            .map(|p| p.0)
+            .collect())
+    }
     fn nsswitch(&self) -> Option<String> {
         self.nss.map(str::to_string)
     }
     fn etc(&self, name: &str) -> Option<String> {
         self.etc.iter().find(|e| e.0 == name).map(|e| e.1.to_string())
+    }
+    fn nscd(&self) -> bool {
+        self.nscd
+    }
+    fn systemd_env(&self) -> Option<String> {
+        self.env.map(str::to_string)
     }
 }
 
@@ -230,13 +250,16 @@ fn upg_db() -> FakeDb {
         group: vec![(0, "root", vec![]), (1000, "opswat", vec![]), (1001, "eve", vec![]), (27, "sudo", vec!["opswat"]), (65534, "nogroup", vec![])],
         nss: Some(NSS_LOCAL),
         etc: ETC_LOCAL.to_vec(),
+        login: vec![],
+        nscd: false,
+        env: None,
     }
 }
 
 /// One user `me` (uid) whose private group is `gid`, on local NSS.
 #[cfg(unix)]
 fn me_db(uid: u32, gid: u32) -> FakeDb {
-    FakeDb { passwd: vec![(uid, "me", gid)], group: vec![(gid, "me", vec![])], nss: Some(NSS_LOCAL), etc: ETC_LOCAL.to_vec() }
+    FakeDb { group: vec![(gid, "me", vec![])], passwd: vec![(uid, "me", gid)], ..upg_db() }
 }
 
 #[cfg(unix)]
@@ -290,6 +313,44 @@ fn group_write_is_safe_only_in_the_owners_private_group() {
     refused(1000, 1000, &FakeDb { nss: None, ..upg_db() }, "/etc/nsswitch.conf cannot be read");
 }
 
+/// What glibc and nss-systemd add beyond nsswitch.conf's text: nscd answering
+/// from its cache, nss-systemd's users that getpwent does not list (ids 0 and
+/// above 60000), variables that hide its records from this process, and groups a
+/// user gets only at login (an nss-systemd membership: `getgrgid` answers from
+/// /etc/group and shows no member, but `initgroups` adds it).
+#[cfg(unix)]
+#[test]
+fn what_nss_adds_beyond_nsswitch_conf_is_refused() {
+    use securefs::private_group;
+    let refused = |uid: u32, gid: u32, db: &FakeDb, why: &str| {
+        let e = private_group(uid, gid, db).unwrap_err();
+        assert!(e.contains(why), "{uid}/{gid}: wanted {why:?}, got {e:?}");
+    };
+    const FILES: &str = "passwd: files\ngroup: files\n";
+    assert_eq!(private_group(1000, 1000, &upg_db()), Ok(()));
+    // nscd: glibc asks it first, whatever the sources.
+    refused(1000, 1000, &FakeDb { nscd: true, ..upg_db() }, "nscd's socket exists");
+    refused(1000, 1000, &FakeDb { nscd: true, nss: Some(FILES), ..upg_db() }, "nscd's socket exists");
+    // A variable that changes nss-systemd's answers: refused with `systemd` listed,
+    // irrelevant without it.
+    for var in ["SYSTEMD_NSS_DYNAMIC_BYPASS", "SYSTEMD_BYPASS_USERDB"] {
+        refused(1000, 1000, &FakeDb { env: Some(var), ..upg_db() }, var);
+        assert_eq!(private_group(1000, 1000, &FakeDb { env: Some(var), nss: Some(FILES), ..upg_db() }), Ok(()));
+    }
+    // With `systemd`, only gids 1-60000; files alone has no such limit.
+    let at = |id: u32, nss: &'static str| FakeDb { passwd: vec![(id, "dyn", id)], group: vec![(id, "dyn", vec![])], nss: Some(nss), ..upg_db() };
+    for id in [60001, 61184, 65534, 524288, 2147352576] {
+        refused(id, id, &at(id, NSS_LOCAL), "outside 1-60000");
+        assert_eq!(private_group(id, id, &at(id, FILES)), Ok(()), "{id}");
+    }
+    assert_eq!(private_group(60000, 60000, &at(60000, NSS_LOCAL)), Ok(()));
+    // eve gets opswat's group only at login: /etc/group still lists no member.
+    let membership = FakeDb { login: vec![(1001, 1000)], ..upg_db() };
+    assert_eq!(membership.group.iter().find(|g| g.0 == 1000).unwrap().2.len(), 0);
+    refused(1000, 1000, &membership, "uid 1001 gets it at login");
+    refused(1000, 1000, &FakeDb { nss: Some(FILES), ..membership }, "uid 1001 gets it at login");
+}
+
 /// The nsswitch.conf reading is strict and fails closed: wherever it could
 /// disagree with glibc (which then might consult sss or ldap), it refuses.
 #[cfg(unix)]
@@ -297,13 +358,12 @@ fn group_write_is_safe_only_in_the_owners_private_group() {
 fn only_files_and_systemd_count_as_local_nss() {
     use securefs::nss_local;
     let etc = |f: &str| ETC_LOCAL.iter().find(|e| e.0 == f).map(|e| e.1.to_string());
-    let ok = |conf: &str| assert_eq!(nss_local(conf, &etc), Ok(()), "{conf:?}");
+    let ok = |conf: &str| assert!(nss_local(conf, &etc).is_ok(), "{conf:?}: {:?}", nss_local(conf, &etc));
     let refused = |conf: &str, why: &str| {
         let e = nss_local(conf, &etc).unwrap_err();
         assert!(e.contains(why), "{conf:?}: wanted {why:?}, got {e:?}");
     };
     ok(NSS_LOCAL);
-    ok("passwd: files # sss\ngroup: files\n");
     ok("passwd:files\ngroup:files systemd\n");
     ok("  passwd:\tfiles  systemd  \ngroup: files\n");
     ok("#passwd: sss\npasswd: files\ngroup: files\n");
@@ -313,14 +373,15 @@ fn only_files_and_systemd_count_as_local_nss() {
     refused("passwd: files\ngroup: files [SUCCESS=merge] systemd\n", "action");
     refused("passwd: files [ NOTFOUND = return ] systemd\ngroup: files\n", "action");
     refused("passwd: files [SUCCESS=merge] sss\ngroup: files\n", "action");
-    // Exactly one line per database: duplicates, in any case, are refused.
+    // Exactly one line per database: duplicates are refused (glibc uses the last),
+    // and so is a case variant (glibc ignores it).
     refused("passwd: files\ngroup: files\npasswd: files sss\n", "2 passwd: lines");
     refused("passwd: files\ngroup: files\npasswd: files\n", "2 passwd: lines");
     refused("passwd: files\ngroup: files\ngroup: files\n", "2 group: lines");
-    refused("passwd: files\nPASSWD: files sss\ngroup: files\n", "2 passwd: lines");
-    refused("passwd: files\nGroup : ldap\ngroup: files\n", "2 group: lines");
+    refused("passwd: files\nPASSWD: files sss\ngroup: files\n", "names `PASSWD`");
+    refused("passwd: files\nGroup : ldap\ngroup: files\n", "names `Group`");
     // A line that is not `database: sources`.
-    refused("passwd: files\ngroup: files\npasswd files sss\n", "line 3 is not `database: sources`");
+    refused("passwd: files\ngroup: files\npasswd files sss\n", "line 3 is not `passwd: sources`");
     // Missing database lines or an empty file: glibc's built-in defaults, unknown here.
     refused("", "no passwd: line");
     refused("passwd: files\n", "no group: line");
@@ -336,7 +397,8 @@ fn only_files_and_systemd_count_as_local_nss() {
     // compat: only with no passwd_compat/group_compat line and no +/- entries.
     ok("passwd: compat\ngroup: compat\n");
     refused("passwd: compat\ngroup: compat\npasswd_compat: ldap\n", "passwd_compat");
-    refused("passwd: compat\ngroup: files\nGROUP_COMPAT: nis\n", "group_compat");
+    refused("passwd: compat\ngroup: files\nGROUP_COMPAT: nis\n", "names `GROUP_COMPAT`");
+    refused("passwd: files\ngroup: compat\ngroup_compat: nis\n", "there is a group_compat: line");
     let nis = |f: &str| match f {
         "passwd" => Some("root:x:0:0::/root:/bin/sh\n+@admins::::::\n".to_string()),
         _ => etc(f),
@@ -349,7 +411,84 @@ fn only_files_and_systemd_count_as_local_nss() {
     assert!(nss_local("passwd: files\ngroup: compat\n", &nis_g).unwrap_err().contains("/etc/group has NIS"));
     assert!(nss_local("passwd: compat\ngroup: files\n", &|_| None).unwrap_err().contains("/etc/passwd cannot be read"));
     // NIS entries do not matter when compat is not used.
-    assert_eq!(nss_local("passwd: files\ngroup: files\n", &nis), Ok(()));
+    assert_eq!(nss_local("passwd: files\ngroup: files\n", &nis), Ok(false));
+    // Ok(true): `systemd` is among the sources, so private_group adds its conditions.
+    assert_eq!(nss_local(NSS_LOCAL, &etc), Ok(true));
+    assert_eq!(nss_local("passwd: files\ngroup: files\ninitgroups: files systemd\n", &etc), Ok(true));
+}
+
+/// nsswitch.conf read as glibc reads it, both the parser of 2.33+
+/// (nss_database.c, nss_action_parse.c) and the one of 2.31/2.32 (nsswitch.c),
+/// each case measured with LD_DEBUG=libs on glibc 2.31 and 2.36: where either
+/// would consult a source outside files/systemd, or the two disagree, it is
+/// refused. Every case is checked and all mismatches are reported together.
+#[cfg(unix)]
+#[test]
+fn nsswitch_is_read_as_glibc_reads_it() {
+    use securefs::nss_local;
+    let etc = |f: &str| ETC_LOCAL.iter().find(|e| e.0 == f).map(|e| e.1.to_string());
+    const PG: &str = "passwd: files\ngroup: files\n";
+    let cases: Vec<(String, Option<&str>)> = vec![
+        // A `#` after the database name: 2.33+ reads `#` and `sss` as sources.
+        ("passwd: files # sss\ngroup: files\n".into(), Some("`#`")),
+        ("passwd: files #sss\ngroup: files\n".into(), Some("`#`")),
+        ("passwd: files\ngroup: files # ldap\n".into(), Some("`#`")),
+        ("passwd: files #\ngroup: files\n".into(), Some("`#`")),
+        // A line starting with `#` is skipped by both (2.33+: no database is named `#...`).
+        (format!("#passwd: sss\n  # group: ldap\n{PG}"), None),
+        (format!("{PG}passwd#: sss\n"), None),
+        // The last line without a newline: 2.33+ skips it, 2.32 reads it.
+        ("passwd: files\ngroup: files".into(), Some("newline")),
+        ("group: files\npasswd: sss".into(), Some("newline")),
+        (format!("{PG}  \t"), None),
+        // Database names are case-sensitive to glibc: `PASSWD:` is not `passwd:`.
+        ("PASSWD: files\ngroup: files\n".into(), Some("case-sensitive")),
+        ("passwd: files\nPASSWD: files sss\ngroup: files\n".into(), Some("case-sensitive")),
+        ("passwd: files\nGroup: ldap\ngroup: files\n".into(), Some("case-sensitive")),
+        ("passwd: compat\ngroup: compat\nPasswd_Compat: nis\n".into(), Some("case-sensitive")),
+        // No colon (both read `passwd sss` as passwd), or space/colon runs where
+        // 2.32 reads `:files` as a source name and 2.33+ reads `files`.
+        ("passwd sss\ngroup: files\n".into(), Some("is not `passwd: sources`")),
+        ("passwd files\ngroup: files\n".into(), Some("is not `passwd: sources`")),
+        ("passwd :files\ngroup: files\n".into(), Some("is not `passwd: sources`")),
+        ("passwd::files\ngroup: files\n".into(), Some("is not `passwd: sources`")),
+        ("passwd: :files\ngroup: files\n".into(), Some("is not `passwd: sources`")),
+        (format!("{PG}group\n"), Some("is not `group: sources`")),
+        // NUL ends glibc's line early; non-ASCII bytes are space or not by locale.
+        ("passwd: files\0 sss\ngroup: files\n".into(), Some("NUL")),
+        ("passwd: files\u{a0}sss\ngroup: files\n".into(), Some("non-ASCII")),
+        ("# caf\u{e9}\npasswd: files\ngroup: files\n".into(), Some("non-ASCII")),
+        // CR, VT, FF and tab are spaces to glibc, as here.
+        ("passwd: files systemd\r\ngroup: files\r\n".into(), None),
+        ("passwd:\tfiles\x0bsystemd\x0c\ngroup: files\n".into(), None),
+        ("passwd: files\rsss\ngroup: files\n".into(), Some("`sss`")),
+        // initgroups decides the groups added at login; gshadow, newgrp's members.
+        (format!("{PG}initgroups: sss\n"), Some("initgroups: uses `sss`")),
+        (format!("{PG}initgroups: files [SUCCESS=continue] ldap\n"), Some("action")),
+        (format!("{PG}initgroups: files\ninitgroups: files\n"), Some("2 initgroups: lines")),
+        (format!("{PG}initgroups:\n"), Some("initgroups: names no source")),
+        (format!("{PG}initgroups: compat\n"), Some("initgroups: uses `compat`, whose users")),
+        (format!("{PG}initgroups: files systemd\n"), None),
+        (format!("{PG}gshadow: files ldap\n"), Some("gshadow: uses `ldap`")),
+        (format!("{PG}gshadow: files\n"), None),
+        // Other databases cannot change these: their sources, comments and actions
+        // do not matter, but every line must still have a colon.
+        (format!("{PG}hosts: files dns # x\nsudoers: files sss\nautomount : files [x\n"), None),
+        (format!("{PG}hosts files dns\n"), Some("line 3 is not `database: sources`")),
+    ];
+    let mut wrong = Vec::new();
+    for (conf, want) in &cases {
+        let got = nss_local(conf, &etc);
+        let fine = match (want, &got) {
+            (None, Ok(_)) => true,
+            (Some(why), Err(e)) => e.contains(why),
+            _ => false,
+        };
+        if !fine {
+            wrong.push(format!("{conf:?}: wanted {}, got {got:?}", want.map_or("Ok".to_string(), |w| format!("Err(..{w}..)"))));
+        }
+    }
+    assert!(wrong.is_empty(), "{} of {} cases wrong:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
 }
 
 /// The measured case end to end through the checks: a 0664 file in a 0775

@@ -134,20 +134,40 @@ From agent 3.7.0, with hub 3.16.0 or later:
     Group-write on a path owned by the agent's user now counts as safe only when every one of
     these is proven, and the log line names the first that is not:
     - the path's gid is the user's primary gid, and the group's name is the user's name;
-    - the group lists no supplementary members, and no other passwd entry has that gid as its
-      primary group;
+    - the group lists no supplementary members. No other passwd entry has that gid as its
+      primary group or among its groups at login (`getgrouplist`, which is how login computes
+      them). Since 3.9.1 this also catches a group that only an nss-systemd membership
+      (`/etc/userdb/<user>:<group>.membership`) or an `initgroups:` source grants. Measured on
+      Debian 12: there `getent group` shows no member, but `id` shows the group;
     - `/etc/nsswitch.conf` provably takes users and groups only from this machine, where all of
-      them can be listed, so "no other user has this group" can be checked. It is read strictly
-      and anything this reading might get differently from glibc is refused. The file must exist
-      and be readable, and every non-comment line must be `database: sources`. It needs exactly
-      one `passwd:` and exactly one `group:` line, with database names compared ignoring case. Those
-      lines may have no `[...]` action items. Their sources may only be `files` and `systemd`, or
-      `compat` when there is no `passwd_compat:`/`group_compat:` line and `/etc/passwd`
-      (`/etc/group`) has no `+`/`-` NIS entry. Any other source (`sss`, `ldap`, `winbind`, `nis`,
-      `cache`, an unknown or differently-cased name), a missing or duplicated line, or an
-      unreadable file means the group is not proven private, and the entry is left alone. A
-      vendor file such as openSUSE's `/usr/etc/nsswitch.conf` is not read: without
-      `/etc/nsswitch.conf` the rule never applies, and neither does it on macOS, which has none.
+      them can be listed, so "no other user has this group" can be checked. The file must exist
+      and be readable. **Since 3.9.1 it is read the way glibc reads it, or refused.** That covers
+      both glibc 2.33+ and the 2.31/2.32 parser, each case measured on glibc 2.31 and 2.36:
+      - The file must be ASCII with no NUL, and must end in a newline (glibc 2.33+ skips a last
+        line without one).
+      - A `#` after `passwd:`, `group:`, `initgroups:` or `gshadow:` is refused. glibc 2.33+ has
+        no comments: it reads `passwd: files # ldap` as the sources `files`, `#` and `ldap`.
+        3.9.0 dropped the `# ldap`.
+      - Database names are case-sensitive to glibc, so `PASSWD:` is not a `passwd:` line.
+        3.9.0 took it for one, and a case variant of these names is now refused.
+      - The name must be followed directly by `:`, and there may be no `[...]` action item.
+      - It needs exactly one `passwd:` and one `group:` line, and at most one `initgroups:` and
+        `gshadow:` line (3.9.0 ignored those two).
+      - Their sources may only be `files` and `systemd`. `passwd:` and `group:` may also use
+        `compat` when there is no `passwd_compat:`/`group_compat:` line and `/etc/passwd`
+        (`/etc/group`) has no `+`/`-` NIS entry.
+
+      Any other source (`sss`, `ldap`, `winbind`, `nis`, `cache`, an unknown or differently-cased
+      name), a missing or duplicated line, or an unreadable file means the group is not proven
+      private, and the entry is left alone. So does an existing nscd socket
+      (`/var/run/nscd/socket`), since glibc then asks nscd's cache first. With `systemd` listed
+      (Ubuntu's and Debian's default), two more conditions apply. The gid must be 1–60000,
+      because nss-systemd's users that `getpwent` does not list (synthesized root/nobody,
+      foreign-range users) have ids outside that range. And no `SYSTEMD_NSS_*`,
+      `SYSTEMD_BYPASS_USERDB` or `SYSTEMD_ONLY_USERDB` variable may be set in the agent's
+      environment. A vendor file such as openSUSE's `/usr/etc/nsswitch.conf` is not read:
+      without `/etc/nsswitch.conf` the rule never applies, and neither does it on macOS, which
+      has none.
 
     This is the rule Debian patches into OpenSSH's `StrictModes`
     (`debian/patches/user-group-modes.patch`, "Allow harmless group-writability", Debian bug
@@ -168,8 +188,9 @@ From agent 3.7.0, with hub 3.16.0 or later:
     to a user-owned directory. Since 3.8.3 it also strips a 0664 entry in a 0775 directory of a
     user whose private group has no members, and leaves the same entry alone in a shared group
     (another member, or another user's primary group), when the group is not named for the user,
-    when nsswitch.conf takes users from `sss` or has a second `PASSWD:` line, and when it is
-    world-writable. It also checks that a
+    when nsswitch.conf takes users from `sss`, has a `PASSWD:` line or a `# ldap` after `passwd:`,
+    when an nss-systemd membership drop-in gives another user the group at login (in an image
+    with libnss-systemd), and when it is world-writable. It also checks that a
     root agent never follows an `agent.log` or `~/.it-ai` symlink another user planted.
 - **After a revoke.** When the hub refuses the device secret, the agent logs
   `relay: device credential rejected — re-enroll this device` and retries every 60 s; it never

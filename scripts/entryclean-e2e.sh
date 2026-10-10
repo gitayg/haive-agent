@@ -194,14 +194,38 @@ cp /tmp/nsswitch.before /etc/nsswitch.conf
 cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "entry untouched with sss in nsswitch" || fail "rewritten though NSS has sss"
 grep -q 'uses `sss`' /tmp/10d.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10d.log)"
 
-echo "== 10f. nsswitch.conf keeps 'passwd: files' but adds a second 'PASSWD: files ldap' line: left alone"
+echo "== 10f. nsswitch.conf keeps 'passwd: files' but adds a 'PASSWD: files ldap' line (glibc ignores it; case-sensitive): left alone"
 reset; upg_user opswat; cp /etc/nsswitch.conf /tmp/nsswitch.before; printf 'PASSWD: files ldap\n' >> /etc/nsswitch.conf
 grep -iE '^(passwd|group) *:' /etc/nsswitch.conf | sed 's/^/   /'
 cp /home/opswat/.config/autostart/it-ai.desktop /tmp/desk.before
 SECS=12 run_agent /tmp/10f.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
 cp /tmp/nsswitch.before /etc/nsswitch.conf
-cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "entry untouched with a duplicate passwd line" || fail "rewritten though nsswitch.conf has two passwd lines"
-grep -q 'has 2 passwd: lines' /tmp/10f.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10f.log)"
+cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "entry untouched with a PASSWD: line" || fail "rewritten though nsswitch.conf has a PASSWD: line"
+grep -q 'names `PASSWD`, which glibc does not read as `passwd:`' /tmp/10f.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10f.log)"
+
+echo "== 10g. 'passwd: ... # ldap': glibc 2.33+ has no comments and reads '#' and 'ldap' as sources: left alone"
+reset; upg_user opswat; cp /etc/nsswitch.conf /tmp/nsswitch.before; sed -i -E 's/^(passwd:.*)$/\1 # ldap/' /etc/nsswitch.conf
+grep -E '^passwd:' /etc/nsswitch.conf | sed 's/^/   /'
+cp /home/opswat/.config/autostart/it-ai.desktop /tmp/desk.before
+SECS=12 run_agent /tmp/10g.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
+cp /tmp/nsswitch.before /etc/nsswitch.conf
+cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "entry untouched with '# ldap' on the passwd line" || fail "rewritten though glibc reads '# ldap' as sources"
+grep -q 'has a `#` after `passwd:`' /tmp/10g.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10g.log)"
+
+echo "== 10h. nss-systemd membership drop-in gives eve opswat's group at login; /etc/group lists no member: left alone"
+if ls /lib/*/libnss_systemd.so.2 /usr/lib/*/libnss_systemd.so.2 >/dev/null 2>&1 && grep -qE '^group:.*systemd' /etc/nsswitch.conf; then
+  reset; upg_user opswat; id eve >/dev/null 2>&1 || useradd -m -U eve
+  mkdir -p /etc/userdb && echo "{}" > /etc/userdb/eve:opswat.membership  # an empty file is a mask
+  echo "   getent group opswat: $(getent group opswat); id eve: $(id eve)"
+  id -Gn eve | grep -qw opswat && pass "eve holds opswat at login (nss-systemd)" || fail "drop-in had no effect: $(id eve)"
+  cp /home/opswat/.config/autostart/it-ai.desktop /tmp/desk.before
+  SECS=12 run_agent /tmp/10h.log runuser -u opswat -- env HOME=/home/opswat "$BIN" --relay "$HUB" --name e2e
+  rm -f /etc/userdb/eve:opswat.membership
+  cmp -s /tmp/desk.before /home/opswat/.config/autostart/it-ai.desktop && pass "entry untouched" || fail "rewritten though eve gets the group at login"
+  grep -q "uid $(id -u eve) gets it at login" /tmp/10h.log && pass "logged why" || fail "log: $(grep autostart: /tmp/10h.log)"
+else
+  echo "SKIP: no libnss-systemd on group: in this image (10h needs it)"; : > /tmp/10h.log
+fi
 
 echo "== 10e. rita's primary group has no members and no other user, but is named ritagrp, not rita: left alone"
 reset; getent group ritagrp >/dev/null || groupadd ritagrp; id rita >/dev/null 2>&1 || useradd -m -g ritagrp rita
@@ -244,5 +268,5 @@ echo "   NOT COVERED (tls.rs, outside this fix): files the agent wrote through t
 grep -q 'cannot be opened as a directory without following a link' /tmp/12b.err && pass "logged the refusal" || fail "stderr: $(head -3 /tmp/12b.err)"
 rm -f /h/.it-ai; rm -rf /tmp/victimdir /etc/victim
 
-for f in /tmp/1.log /tmp/2.log /tmp/4.log /tmp/5.log /tmp/6.log /tmp/7.log /tmp/8.log /tmp/9.log /tmp/10a.log /tmp/10b.log /tmp/10c.log /tmp/10d.log /tmp/10f.log /tmp/10e.log; do echo "--- autostart lines in $f"; grep autostart: "$f" || true; done
+for f in /tmp/1.log /tmp/2.log /tmp/4.log /tmp/5.log /tmp/6.log /tmp/7.log /tmp/8.log /tmp/9.log /tmp/10a.log /tmp/10b.log /tmp/10c.log /tmp/10d.log /tmp/10f.log /tmp/10g.log /tmp/10h.log /tmp/10e.log; do echo "--- autostart lines in $f"; grep autostart: "$f" || true; done
 [ $FAIL = 0 ] && echo "ALL PASS" || { echo "SOME FAILED"; exit 1; }

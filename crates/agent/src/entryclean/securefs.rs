@@ -78,73 +78,157 @@ pub(crate) trait GroupDb {
     fn group(&self, gid: u32) -> Option<(String, Vec<String>)>;
     /// The uid of every passwd entry whose primary group is `gid`.
     fn primary_users(&self, gid: u32) -> Vec<u32>;
+    /// The uid of every passwd entry that holds `gid` once logged in: its groups
+    /// as login computes them (`getgrouplist`, every `initgroups`/`group` source),
+    /// primary group included. Err when they cannot be listed.
+    fn login_members(&self, gid: u32) -> Result<Vec<u32>, String>;
     /// `/etc/nsswitch.conf`, None when it cannot be read.
     fn nsswitch(&self) -> Option<String>;
     /// `/etc/passwd` or `/etc/group` (`name`), None when it cannot be read.
     fn etc(&self, name: &str) -> Option<String>;
+    /// Whether nscd's socket exists: glibc then asks nscd first.
+    fn nscd(&self) -> bool;
+    /// The first variable set in this process's environment that changes what
+    /// nss-systemd returns to it, if any.
+    fn systemd_env(&self) -> Option<String>;
 }
 
-/// NSS sources whose users and groups are all on this machine and all
-/// enumerable, so "no other user has this primary gid" can be proven by walking
-/// them: `files` (/etc/passwd, /etc/group) and `systemd` (nss-systemd: records
-/// of this machine only: systemd-homed users, `DynamicUser=` units, userdb
-/// drop-ins, the synthesized root/nobody; all returned by getpwent). `compat` is
-/// accepted only under the extra conditions in `nss_local`. Everything else is
-/// refused: `cache` (libnss-cache: a periodically synced copy of a remote
-/// directory, which can lag it), every remote source (`sss`, `ldap`, `winbind`,
-/// `nis`, ...), whose users may not be enumerable at all, and any name not
-/// listed here, in any case.
+/// NSS sources whose users and groups are all on this machine: `files`
+/// (/etc/passwd, /etc/group) and `systemd` (nss-systemd: userdb drop-ins,
+/// systemd-homed users, `DynamicUser=` units, and root/nobody synthesized when
+/// /etc lacks them). `compat` is accepted only under the extra conditions in
+/// `nss_local`. Everything else is refused: `cache` (libnss-cache: a periodically
+/// synced copy of a remote directory, which can lag it), every remote source
+/// (`sss`, `ldap`, `winbind`, `nis`, ...), whose users may not be enumerable at
+/// all, and any name not listed here, in any case.
+///
+/// `systemd` is local but NOT fully enumerable, so `private_group` adds
+/// conditions when it is listed. Its getpwent leaves out the root/nobody it
+/// synthesizes and the foreign-range users (nss-systemd.c `_nss_systemd_setpwent`:
+/// `USERDB_DONT_SYNTHESIZE_INTRINSIC | USERDB_DONT_SYNTHESIZE_FOREIGN`), all of them
+/// with ids outside 1-60000 (systemd docs/UIDS-GIDS.md). Variables in this
+/// process's environment can hide its records from this process alone. And its
+/// memberships give a user groups at login (`_nss_systemd_initgroups_dyn`)
+/// that `getgrgid` does not show when `files` answers it first.
 const LOCAL_NSS: &[&str] = &["files", "systemd"];
 
+/// The databases that decide who holds a group: `passwd` (primary groups),
+/// `group` (members, and the groups added at login when there is no
+/// `initgroups:` line), `initgroups` (the groups added at login) and `gshadow`
+/// (the members `newgrp` admits; glibc defaults it to `group`'s sources).
+const NSS_DBS: &[&str] = &["passwd", "group", "initgroups", "gshadow"];
+
+/// The databases `compat` sends `+`/`-` entries to.
+const NSS_COMPAT_DBS: &[&str] = &["passwd_compat", "group_compat"];
+
+/// C's `isspace` in the C locale: what glibc splits nsswitch.conf on.
+fn c_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
 /// Ok only when nsswitch.conf provably makes glibc read users and groups from
-/// local sources. Parsed STRICTLY, failing closed wherever this reading could
-/// disagree with glibc's (which might then consult sss or ldap behind our back):
-/// - every non-comment line must be `database: sources` (text after `#` is a
-///   comment); database names are compared case-insensitively, so `PASSWD:` is a
-///   `passwd:` line too;
-/// - EXACTLY one `passwd:` and EXACTLY one `group:` line: none means glibc's
-///   built-in default, two means it is unclear which glibc uses;
-/// - no `[...]` action item on either line;
-/// - every source is `files` or `systemd`, exactly as written, or `compat`, and
-///   `compat` only when there is no `passwd_compat:`/`group_compat:` line and
-///   that database's /etc file (`etc("passwd")`, `etc("group")`) is readable and
-///   has no `+`/`-` NIS entry.
+/// local sources; Ok(true) when one of them is `systemd`. The file is read the way
+/// glibc reads it, with both parsers the agent can meet: the one in glibc 2.33+
+/// (`nss/nss_database.c` `process_line`, `nss/nss_action_parse.c`) and the older
+/// one (2.31/2.32 `nss/nsswitch.c` `nss_parse_file`, `nss_getline`; the Linux
+/// build's floor is glibc 2.31). It fails closed wherever the two differ, or where
+/// this reading might differ from either:
+/// - the file must be ASCII with no NUL. A NUL ends glibc's line early, and
+///   whether a byte above 0x7f is a space depends on the locale;
+/// - it must end in a newline. glibc 2.33+ drops a last line that has none (it
+///   checks `feof` before it parses the line), while 2.32 reads it;
+/// - a line's database name is the text after any leading space, up to the
+///   first space or `:`, compared case-sensitively (`strcmp`), so glibc does not
+///   read `PASSWD:` as `passwd:`. A case variant of a name in `NSS_DBS` or
+///   `NSS_COMPAT_DBS` is refused, not ignored;
+/// - only glibc 2.32 and older treat `#` as a comment (`strchrnul (line, '#')`).
+///   glibc 2.33+ has no comments: a line that starts with `#` is skipped only
+///   because no database has that name, and in `passwd: files # sss` it reads
+///   `#` and `sss` as sources. A `#` anywhere after a name in `NSS_DBS` is refused;
+/// - a name in `NSS_DBS` must be followed directly by `:`, with no second `:`
+///   before its sources. 2.32 skips one character after the name and reads a
+///   further `:` as part of a source name, while 2.33+ skips every space and `:`.
+///   There may be no `[...]` action item;
+/// - there must be EXACTLY one `passwd:` and one `group:` line, and at most one
+///   `initgroups:` and one `gshadow:` line. Without a passwd or group line glibc
+///   uses its built-in default (`compat [NOTFOUND=return] files` on a build with
+///   --enable-obsolete-nsl, as Ubuntu 20.04's), and of two lines the last wins;
+/// - every source is `files` or `systemd`, exactly as written. On `passwd`/`group`
+///   it may also be `compat`, but only when there is no
+///   `passwd_compat:`/`group_compat:` line and that database's /etc file
+///   (`etc("passwd")`, `etc("group")`) is readable and has no `+`/`-` NIS entry.
+///
+/// Other databases' lines cannot change these, so their sources do not matter.
+/// Each still needs a `:`, unless it is blank or starts with `#`.
 ///
 /// A missing /etc/nsswitch.conf (glibc's defaults, or a vendor file such as
 /// openSUSE's /usr/etc/nsswitch.conf) is refused by the caller.
-pub(crate) fn nss_local(conf: &str, etc: &dyn Fn(&str) -> Option<String>) -> Result<(), String> {
-    let mut lines: Vec<(String, &str)> = Vec::new();
-    for (n, raw) in conf.lines().enumerate() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
+pub(crate) fn nss_local(conf: &str, etc: &dyn Fn(&str) -> Option<String>) -> Result<bool, String> {
+    if conf.contains('\0') {
+        return Err("nsswitch.conf has a NUL byte".into());
+    }
+    if !conf.is_ascii() {
+        return Err("nsswitch.conf has a non-ASCII byte".into());
+    }
+    let mut lines: Vec<&str> = conf.split('\n').collect();
+    // What follows the last newline: only space in a file glibc reads whole.
+    if lines.pop().is_some_and(|last| !last.chars().all(c_space)) {
+        return Err("nsswitch.conf does not end in a newline (glibc 2.33+ skips such a last line, older glibc reads it)".into());
+    }
+    let mut found: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut compat_line = None;
+    for (n, raw) in lines.iter().enumerate().map(|(i, l)| (i + 1, l)) {
+        let line = raw.trim_start_matches(c_space);
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((db, sources)) = line.split_once(':') else {
-            return Err(format!("nsswitch.conf line {} is not `database: sources`", n + 1));
+        let (name, rest) = line.split_at(line.find(|c| c_space(c) || c == ':').unwrap_or(line.len()));
+        let Some(&db) = NSS_DBS.iter().chain(NSS_COMPAT_DBS).find(|d| d.eq_ignore_ascii_case(name)) else {
+            if !line.contains(':') {
+                return Err(format!("nsswitch.conf line {n} is not `database: sources`"));
+            }
+            continue;
         };
-        lines.push((db.trim().to_ascii_lowercase(), sources));
-    }
-    let compat_line = lines.iter().find(|(d, _)| d == "passwd_compat" || d == "group_compat").map(|(d, _)| d.clone());
-    for db in ["passwd", "group"] {
-        let found: Vec<&str> = lines.iter().filter(|(d, _)| d == db).map(|(_, s)| *s).collect();
-        let sources = match found[..] {
-            [] => return Err(format!("nsswitch.conf has no {db}: line")),
-            [one] => one,
-            _ => return Err(format!("nsswitch.conf has {} {db}: lines", found.len())),
+        if name != db {
+            return Err(format!("nsswitch.conf line {n} names `{name}`, which glibc does not read as `{db}:` (database names are case-sensitive)"));
+        }
+        if NSS_COMPAT_DBS.contains(&db) {
+            compat_line.get_or_insert(db);
+            continue;
+        }
+        let Some(sources) = rest.strip_prefix(':').filter(|s| !s.trim_start_matches(c_space).starts_with(':')) else {
+            return Err(format!("nsswitch.conf line {n} is not `{db}: sources`"));
         };
+        if sources.contains('#') {
+            return Err(format!("nsswitch.conf line {n} has a `#` after `{db}:` (glibc 2.33+ reads it and what follows as sources, older glibc as a comment)"));
+        }
         if sources.contains(['[', ']']) {
             return Err(format!("nsswitch.conf {db}: has an action item (`[...]`)"));
         }
-        let mut any = false;
-        for src in sources.split_whitespace() {
-            any = true;
+        found.push((db, sources.split(c_space).filter(|s| !s.is_empty()).collect()));
+    }
+    let mut systemd = false;
+    for &db in NSS_DBS {
+        let lines: Vec<&Vec<&str>> = found.iter().filter(|(d, _)| *d == db).map(|(_, s)| s).collect();
+        let required = matches!(db, "passwd" | "group");
+        let sources = match lines[..] {
+            [] if required => return Err(format!("nsswitch.conf has no {db}: line")),
+            [] => continue,
+            [one] => one,
+            _ => return Err(format!("nsswitch.conf has {} {db}: lines", lines.len())),
+        };
+        if sources.is_empty() {
+            return Err(format!("nsswitch.conf {db}: names no source"));
+        }
+        for &src in sources {
             if LOCAL_NSS.contains(&src) {
+                systemd |= src == "systemd";
                 continue;
             }
-            if src != "compat" {
+            if src != "compat" || !required {
                 return Err(format!("nsswitch.conf {db}: uses `{src}`, whose users may not all be enumerable here"));
             }
-            if let Some(d) = &compat_line {
+            if let Some(d) = compat_line {
                 return Err(format!("nsswitch.conf {db}: uses `compat`, and there is a {d}: line"));
             }
             let text = etc(db).ok_or_else(|| format!("nsswitch.conf {db}: uses `compat`, and /etc/{db} cannot be read"))?;
@@ -152,12 +236,14 @@ pub(crate) fn nss_local(conf: &str, etc: &dyn Fn(&str) -> Option<String>) -> Res
                 return Err(format!("nsswitch.conf {db}: uses `compat`, and /etc/{db} has NIS +/- entries"));
             }
         }
-        if !any {
-            return Err(format!("nsswitch.conf {db}: names no source"));
-        }
     }
-    Ok(())
+    Ok(systemd)
 }
+
+/// The highest id of systemd's "regular users" range (docs/UIDS-GIDS.md:
+/// 1000…60000, listed in /etc/passwd or a directory service). Every user that
+/// nss-systemd returns but getpwent does not list has an id of 0 or above this.
+const SYSTEMD_REGULAR_MAX: u32 = 60000;
 
 /// Whether `gid` is the user-private group of `uid`, so that group-write on a
 /// file of `uid`'s in that group gives no one else write access. This is the
@@ -169,18 +255,38 @@ pub(crate) fn nss_local(conf: &str, etc: &dyn Fn(&str) -> Option<String>) -> Res
 /// its group's one member is the file's owner. It FAILS CLOSED: every condition
 /// must be proven, and Err names the first that is not:
 /// - not root (root's paths keep the plain rule: no group-write);
-/// - users and groups come only from local, enumerable NSS sources (`nss_local`),
-///   so the walk below sees every user;
+/// - users and groups come only from local NSS sources (`nss_local`), so the
+///   walks below see every user;
+/// - nscd's socket does not exist (glibc would take lookups from nscd's cache,
+///   filled under its own configuration, while getpwent walks NSS itself);
+/// - with `systemd` among the sources (see `LOCAL_NSS`), nothing in this
+///   process's environment changes what nss-systemd returns, and `gid` is in
+///   1-60000, where nss-systemd has no user that getpwent leaves out;
 /// - `gid` is `uid`'s primary gid, and the group's name is the user's name (the
 ///   private-group convention);
 /// - the group lists no supplementary members (Debian also accepts the owner as
 ///   the single listed member; this does not);
-/// - no other passwd entry has `gid` as its primary group.
+/// - no other passwd entry has `gid` as its primary group, or among its groups
+///   at login (`login_members`: what an nss-systemd membership or an
+///   `initgroups:` source adds, which `getgrgid` may not show).
 pub(crate) fn private_group(uid: u32, gid: u32, db: &dyn GroupDb) -> Result<(), String> {
     if uid == 0 {
         return Err("root's paths never get the private-group exception".into());
     }
-    nss_local(&db.nsswitch().ok_or("/etc/nsswitch.conf cannot be read")?, &|f| db.etc(f))?;
+    let systemd = nss_local(&db.nsswitch().ok_or("/etc/nsswitch.conf cannot be read")?, &|f| db.etc(f))?;
+    if db.nscd() {
+        return Err("nscd's socket exists (/var/run/nscd/socket), so glibc answers from nscd's cache".into());
+    }
+    if systemd {
+        if let Some(var) = db.systemd_env() {
+            return Err(format!("nsswitch.conf uses `systemd`, and {var} is set, which changes what nss-systemd shows this process"));
+        }
+        if !(1..=SYSTEMD_REGULAR_MAX).contains(&gid) {
+            return Err(format!(
+                "nsswitch.conf uses `systemd`, which has users getpwent does not list with ids outside 1-{SYSTEMD_REGULAR_MAX}, and this group is {gid}"
+            ));
+        }
+    }
     let (uname, primary) = db.user(uid).ok_or_else(|| format!("uid {uid} has no passwd entry"))?;
     if primary != gid {
         return Err(format!("it is not uid {uid}'s primary group ({primary})"));
@@ -194,6 +300,9 @@ pub(crate) fn private_group(uid: u32, gid: u32, db: &dyn GroupDb) -> Result<(), 
     }
     if let Some(other) = db.primary_users(gid).into_iter().find(|&u| u != uid) {
         return Err(format!("uid {other} also has it as primary group"));
+    }
+    if let Some(other) = db.login_members(gid)?.into_iter().find(|&u| u != uid) {
+        return Err(format!("uid {other} gets it at login"));
     }
     Ok(())
 }
@@ -214,7 +323,8 @@ fn others_can_write(m: &Meta, db: &dyn GroupDb) -> Option<String> {
 }
 
 /// The system's user and group databases, through NSS (`getpwuid_r`,
-/// `getgrgid_r`, `getpwent`), as ssh's check reads them, and nsswitch.conf.
+/// `getgrgid_r`, `getpwent`, `getgrouplist`), as ssh's check and login read
+/// them, and nsswitch.conf.
 pub(crate) struct SysGroups;
 
 /// Calls `f` with a buffer that grows while it answers ERANGE.
@@ -266,24 +376,36 @@ impl GroupDb for SysGroups {
     }
 
     fn primary_users(&self, gid: u32) -> Vec<u32> {
-        // getpwent walks one process-wide cursor.
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        passwd_entries().into_iter().filter(|e| e.2 == gid).map(|e| e.0).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn login_members(&self, gid: u32) -> Result<Vec<u32>, String> {
         let mut v = Vec::new();
-        unsafe {
-            libc::setpwent();
+        for (uid, name, base) in passwd_entries() {
+            let mut groups: Vec<libc::gid_t> = vec![0; 64];
             loop {
-                let pw = libc::getpwent();
-                if pw.is_null() {
+                let mut n = groups.len() as libc::c_int;
+                if unsafe { libc::getgrouplist(name.as_ptr(), base, groups.as_mut_ptr(), &mut n) } >= 0 {
+                    groups.truncate(n as usize);
                     break;
                 }
-                if (*pw).pw_gid as u32 == gid {
-                    v.push((*pw).pw_uid as u32);
+                // Too small: glibc has set `n` to the number it needs.
+                if n as usize <= groups.len() || n > 1 << 20 {
+                    return Err(format!("the groups of user {} cannot be listed", name.to_string_lossy()));
                 }
+                groups.resize(n as usize, 0);
             }
-            libc::endpwent();
+            if groups.contains(&gid) {
+                v.push(uid);
+            }
         }
-        v
+        Ok(v)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn login_members(&self, _gid: u32) -> Result<Vec<u32>, String> {
+        Err("groups at login are not listed on this OS".into())
     }
 
     fn nsswitch(&self) -> Option<String> {
@@ -293,6 +415,40 @@ impl GroupDb for SysGroups {
     fn etc(&self, name: &str) -> Option<String> {
         std::fs::read_to_string(Path::new("/etc").join(name)).ok()
     }
+
+    fn nscd(&self) -> bool {
+        // glibc's _PATH_NSCDSOCKET. Anything but "not there" counts as there.
+        !matches!(std::fs::symlink_metadata("/var/run/nscd/socket"), Err(e) if e.kind() == io::ErrorKind::NotFound)
+    }
+
+    fn systemd_env(&self) -> Option<String> {
+        // nss-systemd: SYSTEMD_NSS_BYPASS_SYNTHETIC, SYSTEMD_NSS_DYNAMIC_BYPASS (and
+        // SYSTEMD_NSS_BYPASS_BUS before userdb); userdb.c: SYSTEMD_BYPASS_USERDB,
+        // SYSTEMD_ONLY_USERDB.
+        std::env::vars_os()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .find(|k| k.starts_with("SYSTEMD_NSS_") || k == "SYSTEMD_BYPASS_USERDB" || k == "SYSTEMD_ONLY_USERDB")
+    }
+}
+
+/// Every entry getpwent lists: uid, name, primary gid.
+fn passwd_entries() -> Vec<(u32, CString, u32)> {
+    // getpwent walks one process-wide cursor.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v = Vec::new();
+    unsafe {
+        libc::setpwent();
+        loop {
+            let pw = libc::getpwent();
+            if pw.is_null() {
+                break;
+            }
+            v.push(((*pw).pw_uid as u32, std::ffi::CStr::from_ptr((*pw).pw_name).to_owned(), (*pw).pw_gid as u32));
+        }
+        libc::endpwent();
+    }
+    v
 }
 
 pub(crate) fn euid() -> u32 {
