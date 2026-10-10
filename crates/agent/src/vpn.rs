@@ -1224,6 +1224,113 @@ mod tests {
         assert_eq!(clamp([0; 32])[31], 0x40);
     }
 
+    /// The exit end to end, on the real apply/status/disable entry points, against a stock
+    /// kernel WireGuard client in another container. Driven by `scripts/vpn-e2e.sh`; needs
+    /// root, CAP_NET_ADMIN and /dev/net/tun. The hub relay is NOT in the path: the client
+    /// reaches a loopback forwarder standing in for the shim, because the exit's own firewall
+    /// rule drops UDP to the WireGuard port from anywhere but loopback.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root, /dev/net/tun and a WireGuard client container (scripts/vpn-e2e.sh)"]
+    fn e2e_exit_serves_a_stock_wireguard_client() {
+        let dir = std::path::PathBuf::from(std::env::var("E2E_DIR").expect("E2E_DIR"));
+        let wait_for = |name: &str, secs: u64| -> String {
+            for _ in 0..secs * 10 {
+                if let Some(s) = std::fs::read_to_string(dir.join(name)).ok().filter(|s| !s.trim().is_empty()) {
+                    return s.trim().to_string();
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            panic!("timed out waiting for {name}");
+        };
+        let count = |p: &str| std::fs::read_dir(p).unwrap().count();
+        let fd_targets = || {
+            let mut v: Vec<String> = std::fs::read_dir("/proc/self/fd").unwrap().filter_map(|e| e.ok()).map(|e| std::fs::read_link(e.path()).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+            v.sort();
+            v
+        };
+        let tagged = || CHAINS.iter().map(|(t, c)| run("iptables", &["-w", "-t", t, "-S", c]).unwrap_or_default().matches(TAG).count()).sum::<usize>();
+
+        // Stand-in for the shim: UDP in on :51821, out to WireGuard from a loopback socket.
+        let outside = Arc::new(UdpSocket::bind(("0.0.0.0", 51821)).unwrap());
+        let inside = Arc::new(UdpSocket::bind(("127.0.0.1", 0)).unwrap());
+        inside.connect(("127.0.0.1", WG_PORT)).unwrap();
+        let client_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::default();
+        let (o, i, c) = (outside.clone(), inside.clone(), client_addr.clone());
+        std::thread::spawn(move || loop {
+            let mut b = [0u8; 2048];
+            if let Ok((n, from)) = o.recv_from(&mut b) {
+                *c.lock().unwrap() = Some(from);
+                let _ = i.send(&b[..n]);
+            }
+        });
+        let (o, i, c) = (outside.clone(), inside.clone(), client_addr.clone());
+        std::thread::spawn(move || loop {
+            let mut b = [0u8; 2048];
+            if let Ok(n) = i.recv(&mut b) {
+                if let Some(to) = *c.lock().unwrap() {
+                    let _ = o.send_to(&b[..n], to);
+                }
+            }
+        });
+
+        let (threads_before, fds_before, targets_before) = (count("/proc/self/task"), count("/proc/self/fd"), fd_targets());
+        let client = wait_for("client.pub", 180);
+        let psk = wait_for("client.psk", 5);
+        let pass = |ip: &str| json!({"relay": "127.0.0.1:9", "secret": "ab".repeat(16), "peers": [{"publicKey": client, "presharedKey": psk, "allowedIps": ip, "expiresAt": now_secs() + 3600}]}).to_string();
+
+        // First apply creates the device; the second changes the pass (remove + add in
+        // boringtun); the third repeats it (no peer request at all). boringtun 0.7 panics
+        // on a set for an existing peer, so any of these going wrong would show here.
+        for (n, ip) in [(1, "10.77.0.3/32"), (2, "10.77.0.2/32"), (3, "10.77.0.2/32")] {
+            let (r, code) = apply_ep(&pass(ip));
+            println!("[e2e] apply #{n} ({ip}): HTTP {code} backend={} peers={}", r["status"]["backend"], r["status"]["peers"]);
+            assert_eq!(code, 200, "{r}");
+        }
+        let st = status();
+        let want_backend = std::env::var("E2E_BACKEND").unwrap_or_else(|_| "userspace".into());
+        assert_eq!(st["backend"], want_backend.as_str(), "{st}");
+        assert_eq!(st["peers"].as_array().unwrap().len(), 1, "{st}");
+        assert_eq!(st["peers"][0]["allowedIps"], "10.77.0.2/32", "{st}");
+        println!("[e2e] ip -d link: {}", run("ip", &["-d", "link", "show", IFACE]).unwrap_or_default().trim());
+        println!("[e2e] tagged iptables rules while up: {}", tagged());
+        std::fs::write(dir.join("server.pub"), st["publicKey"].as_str().unwrap()).unwrap();
+
+        let mut shook = Value::Null;
+        for _ in 0..90 {
+            let st = status();
+            if st["peers"][0]["latestHandshake"].as_u64().unwrap_or(0) > 0 {
+                shook = st;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(!shook.is_null(), "no handshake within 90s: {}", status());
+        println!("[e2e] handshake seen by the exit: now={} peers={}", now_secs(), shook["peers"]);
+        wait_for("client.done", 180);
+        let end = status();
+        println!("[e2e] after the client's traffic: {}", end["peers"]);
+        assert!(end["peers"][0]["rx"].as_u64().unwrap() > 0 && end["peers"][0]["tx"].as_u64().unwrap() > 0, "{end}");
+
+        let (r, code) = disable_ep();
+        assert_eq!(code, 200, "{r}");
+        assert!(!iface_up(), "{IFACE} must be gone after disable");
+        assert!(wg().is_none());
+        assert_eq!(tagged(), 0, "every tagged rule removed");
+        // The shim thread notices its stop flag within its 1s read timeout.
+        let (mut threads, mut fds) = (0, 0);
+        for _ in 0..50 {
+            (threads, fds) = (count("/proc/self/task"), count("/proc/self/fd"));
+            if threads == threads_before && fds == fds_before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        println!("[e2e] after disable: {IFACE} present={} tagged rules={} threads {threads_before}->{threads} fds {fds_before}->{fds}", iface_up(), tagged());
+        assert_eq!((threads, fds), (threads_before, fds_before), "no boringtun thread or fd left behind; fds before {targets_before:?} after {:?}", fd_targets());
+        std::fs::write(dir.join("exit.done"), "ok").unwrap();
+    }
+
     #[test]
     fn a_peer_with_a_bad_preshared_key_is_refused() {
         let key = "A2+2dpchy903HY/kmF70XH8jsgBgj1Vvf4+64neJqwI=".to_string();

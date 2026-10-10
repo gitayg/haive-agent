@@ -362,6 +362,9 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
 - Apply, disable, the boot resume and the expiry ticker run one at a time. A disable stops a resume
   that is still retrying, and the ticker cannot write back a pass list that a disable or a newer
   apply replaced.
+- `scripts/vpn-e2e.sh [userspace|kernel]` runs the exit in Docker against a stock WireGuard client
+  and checks the handshake, traffic through the NAT, and a clean disable. The hub relay is not part
+  of that test.
 
 ## Operator skill
 
