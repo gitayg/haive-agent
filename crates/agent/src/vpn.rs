@@ -20,7 +20,17 @@
 //! — all privileged). The last applied state is saved, so the exit comes back on
 //! its own after a reboot, and pass expiry is enforced here too, so a pass ends
 //! on time even if the hub is unreachable. Linux only; needs root (`--install`).
+//!
+//! WireGuard itself is the kernel module when the box has it and `wg` is installed,
+//! and otherwise the agent's embedded boringtun device (`vpn/userspace.rs`), which
+//! needs only /dev/net/tun. See `vpn/backend.rs` for the choice.
 
+mod backend;
+mod uapi;
+#[cfg(target_os = "linux")]
+mod userspace;
+
+use backend::Backend;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -373,13 +383,19 @@ fn ensure_prereqs() -> Result<(), String> {
     if !is_root() {
         return Err("the VPN exit needs root — install the agent as a service (--install)".into());
     }
-    if !have("wg") || !have("iptables") {
-        if have("apt-get") {
-            println!("[vpn] installing wireguard-tools + iptables");
-            run("apt-get", &["install", "-y", "-qq", "wireguard-tools", "iptables"])?;
-        } else {
-            return Err("install wireguard-tools and iptables".into());
-        }
+    if have("iptables") {
+        return Ok(());
+    }
+    let pm = backend::pick_pkg_manager(have).ok_or(backend::NO_PKG_MANAGER)?;
+    let (install, refresh) = backend::iptables_install(pm).ok_or(backend::NO_PKG_MANAGER)?;
+    println!("[vpn] installing iptables with {pm}");
+    if run(pm, &install).is_err() {
+        // A fresh image may never have downloaded its package index.
+        let _ = run(pm, &refresh);
+        run(pm, &install).map_err(|e| format!("the VPN exit needs iptables, and installing it failed: {e}"))?;
+    }
+    if !have("iptables") {
+        return Err(format!("the VPN exit needs iptables; {pm} installed it, but there is still no iptables command"));
     }
     Ok(())
 }
@@ -395,49 +411,155 @@ fn wan_iface() -> Option<String> {
     None
 }
 
-fn server_key() -> Result<(String, String), String> {
+/// A WireGuard private key as `wg genkey` makes it: 32 random bytes, clamped.
+fn clamp(mut k: [u8; 32]) -> [u8; 32] {
+    k[0] &= 248;
+    k[31] = (k[31] & 127) | 64;
+    k
+}
+
+fn public_key_of(private: &[u8; 32]) -> [u8; 32] {
+    x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private)).to_bytes()
+}
+
+/// The exit's key: the file (base64, as `wg genkey` writes it — earlier agents' files are
+/// kept), its 32 bytes, and the base64 public key. Made on first use, without `wg`.
+fn server_key() -> Result<(std::path::PathBuf, [u8; 32], String), String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
     let p = dir().join("server.key");
     if !p.exists() {
         let _ = std::fs::create_dir_all(dir());
-        let k = run("wg", &["genkey"])?;
-        std::fs::write(&p, k.trim()).map_err(|e| e.to_string())?;
+        let mut k = [0u8; 32];
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut k)).map_err(|e| format!("/dev/urandom: {e}"))?;
+        std::fs::write(&p, b64.encode(clamp(k))).map_err(|e| format!("writing the server key: {e}"))?;
         restrict(&p);
     }
-    let private = p.to_string_lossy().into_owned();
-    let mut child = Command::new("wg")
-        .arg("pubkey")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    use std::io::Write;
-    let key = std::fs::read(&p).map_err(|e| e.to_string())?;
-    child.stdin.take().unwrap().write_all(&key).map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    Ok((private, String::from_utf8_lossy(&out.stdout).trim().to_string()))
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("reading the server key: {e}"))?;
+    let private: [u8; 32] = b64.decode(text.trim()).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| format!("{} is not a WireGuard key", p.display()))?;
+    let public = b64.encode(public_key_of(&private));
+    Ok((p, private, public))
 }
 
 fn iface_up() -> bool {
     run("ip", &["link", "show", IFACE]).is_ok()
 }
 
-fn ensure_iface() -> Result<(), String> {
-    let (key_file, _) = server_key()?;
-    if !iface_up() {
-        // Some L4T (Jetson) kernels ship without the module; fall back to the
-        // userspace implementation when it is installed.
-        if run("ip", &["link", "add", "dev", IFACE, "type", "wireguard"]).is_err() {
-            if have("wireguard-go") {
-                run("wireguard-go", &[IFACE])?;
-            } else {
-                return Err("this kernel has no WireGuard module and wireguard-go is not installed".into());
+/// The WireGuard implementation behind `itai-wg`, while the agent has it up.
+enum Live {
+    Kernel,
+    #[cfg(target_os = "linux")]
+    Userspace(userspace::Device),
+}
+
+impl Live {
+    fn backend(&self) -> Backend {
+        match self {
+            Live::Kernel => Backend::Kernel,
+            #[cfg(target_os = "linux")]
+            Live::Userspace(_) => Backend::Userspace,
+        }
+    }
+}
+
+/// Lock order: `op()`, then `state()`, then this.
+fn wg() -> MutexGuard<'static, Option<Live>> {
+    static W: OnceLock<Mutex<Option<Live>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn force_userspace() -> bool {
+    std::env::var("HIVE_VPN_USERSPACE").map(|v| v.trim() == "1").unwrap_or(false)
+}
+
+/// Creates the interface for real, for `backend::bring_up`.
+#[derive(Default)]
+struct SysBringup {
+    #[cfg(target_os = "linux")]
+    dev: Option<userspace::Device>,
+}
+
+impl backend::Bringup for SysBringup {
+    fn kernel(&mut self) -> Result<(), String> {
+        run("ip", &["link", "add", "dev", IFACE, "type", "wireguard"]).map(|_| ())
+    }
+    #[cfg(target_os = "linux")]
+    fn userspace(&mut self) -> Result<(), String> {
+        self.dev = Some(userspace::Device::start(IFACE)?);
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn userspace(&mut self) -> Result<(), String> {
+        Err("Linux only".into())
+    }
+}
+
+/// Stops whatever runs `itai-wg` and removes the interface.
+fn iface_down(live: &mut Option<Live>) {
+    #[cfg(target_os = "linux")]
+    if let Some(Live::Userspace(d)) = live.take() {
+        if let Err(e) = d.stop() {
+            println!("[vpn] {e}");
+        }
+    }
+    *live = None;
+    if iface_up() {
+        let _ = run("ip", &["link", "del", IFACE]);
+    }
+}
+
+fn ensure_iface() -> Result<Backend, String> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let (key_file, private, public) = server_key()?;
+    let mut live = wg();
+    if live.is_some() && !iface_up() {
+        println!("[vpn] {IFACE} disappeared; recreating it");
+        iface_down(&mut live);
+    }
+    if live.is_none() && iface_up() {
+        // Left by an earlier run: a kernel interface outlives the agent and is kept; anything
+        // else (3.8's wireguard-go, a stray TUN) is replaced.
+        let kernel = run("ip", &["-d", "link", "show", IFACE]).map(|o| backend::is_kernel_wireguard(&o)).unwrap_or(false);
+        if kernel && have("wg") && !force_userspace() {
+            *live = Some(Live::Kernel);
+        } else {
+            iface_down(&mut live);
+        }
+    }
+    if live.is_none() {
+        let mut b = SysBringup::default();
+        let chosen = backend::bring_up(force_userspace(), have("wg"), &mut b)?;
+        println!("[vpn] {IFACE} is up on the {} WireGuard backend", chosen.name());
+        *live = Some(match chosen {
+            Backend::Kernel => Live::Kernel,
+            #[cfg(target_os = "linux")]
+            Backend::Userspace => Live::Userspace(b.dev.take().ok_or("boringtun did not start")?),
+            #[cfg(not(target_os = "linux"))]
+            Backend::Userspace => return Err("Linux only".into()),
+        });
+    }
+    match live.as_ref() {
+        Some(Live::Kernel) => {
+            run("wg", &["set", IFACE, "private-key", &key_file.to_string_lossy(), "listen-port", &WG_PORT.to_string()])?;
+        }
+        #[cfg(target_os = "linux")]
+        Some(Live::Userspace(d)) => {
+            let have = uapi::parse_get(uapi::check(&d.request(uapi::GET)?)?.trim_end());
+            let want = uapi::b64_to_hex(&public);
+            // Re-setting the port rebinds boringtun's sockets, so only when it differs.
+            if have.public_key != want || have.listen_port != WG_PORT {
+                let hex: String = private.iter().map(|b| format!("{b:02x}")).collect();
+                uapi::check(&d.request(&uapi::set_device(&hex, WG_PORT))?).map_err(|e| format!("boringtun: setting the key and port: {e}"))?;
             }
         }
-        run("ip", &["address", "add", ADDR, "dev", IFACE])?;
+        None => {}
     }
-    run("wg", &["set", IFACE, "private-key", &key_file, "listen-port", &WG_PORT.to_string()])?;
+    let backend = live.as_ref().map(Live::backend).ok_or("no WireGuard interface")?;
+    drop(live);
+    run("ip", &["address", "replace", ADDR, "dev", IFACE])?;
     run("ip", &["link", "set", IFACE, "mtu", &MTU.to_string(), "up"])?;
-    Ok(())
+    Ok(backend)
 }
 
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -596,6 +718,29 @@ fn current_peers() -> Vec<String> {
 }
 
 fn reconcile_peers(peers: &[Peer]) {
+    let live = wg();
+    match live.as_ref() {
+        Some(Live::Kernel) => {
+            drop(live);
+            reconcile_kernel_peers(peers);
+        }
+        #[cfg(target_os = "linux")]
+        Some(Live::Userspace(d)) => {
+            let current = match d.request(uapi::GET).and_then(|r| uapi::check(&r).map(uapi::parse_get)) {
+                Ok(c) => c.peers,
+                Err(e) => return println!("[vpn] boringtun: reading peers: {e}"),
+            };
+            for req in uapi::peer_plan(&current, peers) {
+                if let Err(e) = d.request(&req).and_then(|r| uapi::check(&r).map(|_| ())) {
+                    println!("[vpn] boringtun: updating a peer: {e}");
+                }
+            }
+        }
+        None => {}
+    }
+}
+
+fn reconcile_kernel_peers(peers: &[Peer]) {
     let want: Vec<&str> = peers.iter().map(|p| p.public_key.as_str()).collect();
     for pk in current_peers() {
         if !want.contains(&pk.as_str()) {
@@ -784,14 +929,11 @@ fn session_for(sessions: &Arc<Mutex<HashMap<SocketAddr, Arc<Session>>>>, client:
 
 // ---- endpoints ---------------------------------------------------------------------
 
-pub fn status() -> Value {
-    let supported = cfg!(target_os = "linux");
-    let s = state().lock().unwrap_or_else(|e| e.into_inner());
-    let enabled = s.desired.is_some();
-    let (public_key, peers) = if supported && iface_up() {
-        let pk = server_key().map(|(_, p)| p).unwrap_or_default();
+/// Per peer: base64 public key, allowed IPs, last handshake as a Unix time (0 = never), bytes.
+fn live_peers_status(live: &Live) -> Vec<Value> {
+    match live {
         // wg dump, per peer: pubkey psk endpoint allowed-ips handshake rx tx keepalive
-        let peers: Vec<Value> = run("wg", &["show", IFACE, "dump"])
+        Live::Kernel => run("wg", &["show", IFACE, "dump"])
             .unwrap_or_default()
             .lines()
             .skip(1)
@@ -803,11 +945,40 @@ pub fn status() -> Value {
                     "rx": f[5].parse::<u64>().unwrap_or(0), "tx": f[6].parse::<u64>().unwrap_or(0),
                 }))
             })
-            .collect();
-        (pk, peers)
+            .collect(),
+        #[cfg(target_os = "linux")]
+        Live::Userspace(d) => {
+            let now = now_secs();
+            d.request(uapi::GET)
+                .and_then(|r| uapi::check(&r).map(uapi::parse_get))
+                .map(|dev| dev.peers)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|p| json!({
+                    "publicKey": uapi::hex_to_b64(&p.public_key).unwrap_or_default(),
+                    "allowedIps": p.allowed_ips.join(","),
+                    // boringtun reports seconds since the handshake; wg dump a Unix time.
+                    "latestHandshake": p.handshake_ago_secs.map(|ago| now.saturating_sub(ago)).unwrap_or(0),
+                    "rx": p.rx, "tx": p.tx,
+                }))
+                .collect()
+        }
+    }
+}
+
+pub fn status() -> Value {
+    let supported = cfg!(target_os = "linux");
+    let s = state().lock().unwrap_or_else(|e| e.into_inner());
+    let enabled = s.desired.is_some();
+    let live = wg();
+    let backend = live.as_ref().map(|l| l.backend().name());
+    let (public_key, peers) = if supported && iface_up() {
+        let pk = server_key().map(|(_, _, p)| p).unwrap_or_default();
+        (pk, live.as_ref().map(live_peers_status).unwrap_or_default())
     } else {
         (String::new(), vec![])
     };
+    drop(live);
     let (relay_ok, sessions) = shim()
         .lock()
         .unwrap()
@@ -819,6 +990,7 @@ pub fn status() -> Value {
         "root": supported && is_root(),
         "enabled": enabled,
         "up": supported && iface_up(),
+        "backend": backend,
         "publicKey": public_key,
         "mtu": MTU,
         "wan": s.wan,
@@ -861,9 +1033,7 @@ pub fn disable_ep() -> (Value, u16) {
     // Forwarding goes back off before the isolation rule goes away.
     restore_forwarding();
     remove_rules();
-    if iface_up() {
-        let _ = run("ip", &["link", "del", IFACE]);
-    }
+    iface_down(&mut wg());
     (json!({"ok": true}), 200)
 }
 
@@ -1040,6 +1210,18 @@ mod tests {
         let first = forward_to_record("0", None);
         let second = forward_to_record("1", Some(&first));
         assert_eq!(forward_to_restore(Some(&second)), Some("0"));
+    }
+
+    #[test]
+    fn the_server_key_is_derived_without_wg() {
+        // RFC 7748 §6.1, Alice: the same X25519 as `wg pubkey`.
+        let private: [u8; 32] = hex_decode("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a").unwrap().try_into().unwrap();
+        let public: String = public_key_of(&private).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(public, "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        // `wg genkey` clamping.
+        let k = clamp([0xff; 32]);
+        assert_eq!((k[0], k[31]), (0xf8, 0x7f));
+        assert_eq!(clamp([0; 32])[31], 0x40);
     }
 
     #[test]

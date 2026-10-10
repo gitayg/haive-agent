@@ -26,6 +26,9 @@ clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
 ed25519-dalek = "2"
+# The VPN exit's server key (vpn.rs): X25519 public key from the private key,
+# so neither backend needs `wg genkey`/`wg pubkey`. Same version boringtun uses.
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 # Capability tokens for the LAN-direct path — the op/argument canonicalization
 # and token format shared with the controller side (crates/direct).
 it-ai-cap = { path = "../cap" }
@@ -102,3 +105,9 @@ windows = { version = "0.59", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = "5"
 pipewire = "0.9"
+# VPN exit (vpn.rs): Cloudflare's userspace WireGuard (BSD-3-Clause), used when
+# the kernel has no WireGuard module (Jetson/Tegra, some WSL2 and container
+# kernels). `device` is the TUN + UDP + UAPI layer; it needs only /dev/net/tun.
+# Pinned exactly: vpn/userspace.rs closes fds this release leaks on teardown, which
+# is only safe while the crate is known not to close them itself.
+boringtun = { version = "=0.7.1", features = ["device"] }

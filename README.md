@@ -332,17 +332,24 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
 `/vpn/status`, `/vpn/apply` and `/vpn/disable` endpoints.
 
 - **Linux only.** Other platforms answer `/vpn/apply` with 400.
-- **Needs root**, meaning the service install (`--install`). The agent checks for uid 0, so
-  `CAP_NET_ADMIN` alone is not enough. It installs `wireguard-tools` and `iptables` with `apt-get`
-  when they are missing.
-- It creates the `itai-wg` interface (`10.77.0.1/24`, falling back to `wireguard-go` when the
-  kernel has no WireGuard module), turns on IPv4 forwarding, and adds iptables NAT and filter
-  rules tagged `it-ai-vpn`. Those rules block the device itself, private and CGNAT ranges, and
-  peer-to-peer traffic, and drop any other forwarded traffic to or from `itai-wg`. Every apply,
-  and every uplink change (Wi-Fi to Ethernet), first deletes all tagged rules whatever interface
-  they named, then inserts the full set at fixed positions at the top of each chain, so the
+- **Requirements: root, `/dev/net/tun`, and iptables, which the agent installs.** No WireGuard
+  package is needed. Root means the service install (`--install`); the agent checks for uid 0, so
+  `CAP_NET_ADMIN` alone is not enough. When `iptables` is missing it installs it with `apt-get`,
+  `dnf`, `pacman` or `apk`, whichever is present. If it cannot, or no WireGuard interface can be
+  created, `/vpn/apply` fails with the reason, and the hub dashboard shows it.
+- WireGuard is the kernel module when the kernel has it and `wg` (wireguard-tools) is already
+  installed. Otherwise it is the agent's built-in userspace WireGuard (Cloudflare's
+  [boringtun](https://github.com/cloudflare/boringtun), BSD-3-Clause), which needs only
+  `/dev/net/tun`. That covers kernels without the module, such as Jetson (Tegra) and some WSL2 and
+  container kernels. `HIVE_VPN_USERSPACE=1` forces the built-in one. `/vpn/status` reports which
+  one is running as `backend` (`kernel` or `userspace`).
+- It creates the `itai-wg` interface (`10.77.0.1/24`), turns on IPv4 forwarding, and adds iptables
+  NAT and filter rules tagged `it-ai-vpn`. Those rules block the device itself, private and CGNAT
+  ranges, and peer-to-peer traffic, and drop any other forwarded traffic to or from `itai-wg`.
+  Every apply, and every uplink change (Wi-Fi to Ethernet), first deletes all tagged rules whatever
+  interface they named, then inserts the full set at fixed positions at the top of each chain, so the
   peer-to-peer and private-range drops always sit above the accepts. Disabling removes the interface
-  and every tagged rule.
+  and every tagged rule, and stops the built-in WireGuard's threads.
 - **IPv4 forwarding is put back.** Before turning it on, the agent records the previous
   `ip_forward` value in `~/.it-ai/vpn/ip_forward.before`. If it was `0`, the agent is the reason
   forwarding is on: a tagged rule then drops every forwarded packet that does not involve
