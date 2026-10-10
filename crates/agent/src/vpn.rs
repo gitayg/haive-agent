@@ -703,12 +703,22 @@ fn listings() -> Vec<(&'static str, &'static str, String)> {
 }
 
 fn ensure_rules(wan: &str, isolate: bool) -> Result<(), String> {
-    for cmd in apply_plan(wan, isolate, &listings()) {
+    run_plan(&apply_plan(wan, isolate, &listings()), |args| run("iptables", args))
+}
+
+/// Runs `apply_plan`'s commands through `iptables`.
+fn run_plan(plan: &[Vec<String>], mut iptables: impl FnMut(&[&str]) -> Result<String, String>) -> Result<(), String> {
+    for cmd in plan {
         let args: Vec<&str> = cmd.iter().map(String::as_str).collect();
-        let done = run("iptables", &args);
-        // A delete may race a rule that is already gone; an insert must land.
-        if args[3] == "-I" {
-            done.map_err(|e| format!("iptables: could not add {e}"))?;
+        let done = iptables(&args);
+        // A delete may race a rule that is already gone; an insert must land, except an MSS
+        // clamp: some kernels have no TCPMSS target (Jetson's Tegra builds), and the clamp only
+        // spares clients a broken path-MTU discovery. They sit alone in mangle/FORWARD, so
+        // skipping them moves no other rule.
+        match done {
+            Err(e) if args[3] == "-I" && args.contains(&"TCPMSS") => println!("[vpn] no MSS clamping (this kernel has no TCPMSS target): {e}"),
+            Err(e) if args[3] == "-I" => return Err(format!("iptables: could not add {e}")),
+            _ => {}
         }
     }
     Ok(())
@@ -1317,6 +1327,38 @@ mod tests {
             let got: Vec<String> = fwd[last_accept + 1..].iter().map(|r| r.trim_end_matches(" -m comment --comment it-ai-vpn").to_string()).collect();
             assert_eq!(got, below, "isolate={isolate}");
         }
+    }
+
+    /// A Jetson Orin's Tegra 5.15 kernel is built without the TCPMSS target
+    /// (`# CONFIG_NETFILTER_XT_TARGET_TCPMSS is not set`), so iptables refuses the two MSS-clamp
+    /// rules. The exit must still come up with every other rule in place.
+    #[test]
+    fn a_kernel_without_tcpmss_gets_every_other_rule() {
+        for isolate in [false, true] {
+            let plan = apply_plan("eth0", isolate, &old_listings());
+            let mut added: Vec<String> = vec![];
+            let refused = "iptables v1.8.7 (legacy): unknown option \"--clamp-mss-to-pmtu\"";
+            let r = run_plan(&plan, |a| {
+                if a.contains(&"TCPMSS") {
+                    return Err(format!("iptables {}: {refused}", a.join(" ")));
+                }
+                if a[3] == "-I" {
+                    added.push(a[6..].join(" "));
+                }
+                Ok(String::new())
+            });
+            assert_eq!(r, Ok(()), "isolate={isolate}");
+            let want: Vec<String> = rules("eth0", isolate).into_iter().filter(|(_, _, r)| !r.contains(&"TCPMSS".to_string())).map(|(_, _, r)| r.join(" ")).collect();
+            assert_eq!(added, want, "isolate={isolate}: every rule but the MSS clamps, in order");
+        }
+        // Skipping them moves no other rule: they are the only ones in their chain.
+        assert!(rules("eth0", true).iter().all(|(t, c, r)| (*t, *c) == ("mangle", "FORWARD") || !r.contains(&"TCPMSS".to_string())));
+        assert!(rules("eth0", true).iter().filter(|(t, c, _)| (*t, *c) == ("mangle", "FORWARD")).all(|(_, _, r)| r.contains(&"TCPMSS".to_string())));
+
+        // Control: any other refused rule still fails the apply.
+        let plan = apply_plan("eth0", false, &old_listings());
+        let r = run_plan(&plan, |a| if a[3] == "-I" && a.contains(&"MASQUERADE") { Err("no NAT".into()) } else { Ok(String::new()) });
+        assert!(r.as_ref().is_err_and(|e| e.contains("no NAT")), "{r:?}");
     }
 
     #[test]

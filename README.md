@@ -379,6 +379,10 @@ ciphertext. It is enabled per device from the hub dashboard, which drives the pr
   interface they named, then inserts the full set at fixed positions at the top of each chain, so the
   peer-to-peer and private-range drops always sit above the accepts. Disabling removes the interface
   and every tagged rule, and stops the built-in WireGuard's threads.
+- **MSS clamping is optional.** The two `mangle` rules that clamp TCP MSS to the path MTU need the
+  kernel's TCPMSS target, which some kernels lack (a Jetson Orin's Tegra 5.15 build has
+  `# CONFIG_NETFILTER_XT_TARGET_TCPMSS is not set`). There the agent logs `no MSS clamping` and
+  brings the exit up without them; before, the apply failed. Every other rule must still go in.
 - **IPv4 forwarding is put back.** Before turning it on, the agent records the previous
   `ip_forward` value in `~/.it-ai/vpn/ip_forward.before`. If it was `0`, the agent is the reason
   forwarding is on: a tagged rule then drops every forwarded packet that does not involve
