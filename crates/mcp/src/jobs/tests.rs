@@ -31,13 +31,13 @@ fn server_lists_the_four_job_tools_with_their_schemas() {
     // Resolved through the ServerHandler, i.e. what a client's tools/list sees.
     let get = |n: &str| ServerHandler::get_tool(&srv, n).unwrap_or_else(|| panic!("handler has no {n}"));
     let start = get("job_start");
-    assert_eq!(props(&start), ["command", "cwd", "device"]);
+    assert_eq!(props(&start), ["command", "cwd", "device", "dry_run"]);
     assert_eq!(required(&start), ["command", "device"]);
     let logs = get("job_logs");
     assert_eq!(props(&logs), ["device", "id", "offset"]);
     assert_eq!(required(&logs), ["device", "id"]);
     let stop = get("job_stop");
-    assert_eq!(props(&stop), ["device", "id"]);
+    assert_eq!(props(&stop), ["device", "dry_run", "id"]);
     assert_eq!(required(&stop), ["device", "id"]);
     let list = get("job_list");
     assert_eq!(props(&list), ["device"]);

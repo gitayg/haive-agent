@@ -8,5 +8,12 @@ license.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "time"] }
 it-ai-cap = { path = "../cap" }
+
+[features]
+# A scripted stand-in for the hub, for the client crates' tests.
+test-hub = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }

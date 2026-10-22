@@ -25,10 +25,14 @@ use std::time::Duration;
 use serde::Deserialize;
 
 pub mod op;
+pub mod reply;
 pub mod route;
+#[cfg(any(test, feature = "test-hub"))]
+pub mod testhub;
 
 pub use op::{Body, Method, Op, TargetIn};
 use op::{encode_query, urlencode};
+use reply::{Reply, Settled, Wait};
 use route::{Route, RouteCache};
 
 /// TCP+TLS budget for reaching an agent on the LAN. A same-subnet handshake is a
@@ -184,14 +188,17 @@ impl Controller {
             Ok(v) => v,
             Err(_) => return Ok(None),
         };
+        // A privileged op answers `{ok:true, cap:null, route:"relay"}`: no grant,
+        // because one is good for 60 s and a human takes longer. `None` sends the
+        // call over the relay, where the hub files the approval request.
         if v.get("ok").and_then(|x| x.as_bool()) == Some(true) {
             return Ok(v.get("cap").and_then(|x| x.as_str()).map(String::from));
         }
-        Err(v
-            .get("error")
-            .and_then(|x| x.as_str())
-            .unwrap_or("the hub refused this operation")
-            .to_string())
+        let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("the hub refused this operation");
+        if v.get("tier").and_then(|x| x.as_str()) == Some("blocked") {
+            return Err(reply::refused_text(error, true));
+        }
+        Err(error.to_string())
     }
 
     pub async fn call_device(&self, target: &str, op: Op) -> Result<reqwest::Response, String> {
@@ -348,6 +355,70 @@ impl Controller {
         attach_body(rb.timeout(op.timeout), &op.body, None).send().await
     }
 
+    /// Run `op` through the hub relay only, never LAN-direct.
+    pub async fn call_relay(&self, target: &str, op: Op) -> Result<reqwest::Response, String> {
+        self.send_relay(target, &op).await
+    }
+
+    /// Ask the hub what `op` would do — its tier, devices and command — without
+    /// running it. Always over the relay: the LAN-direct leg has no gate to ask.
+    pub async fn dry_run(&self, target: &str, op: Op) -> Result<reqwest::Response, String> {
+        self.send_relay(target, &op.query("dry_run", "1")).await
+    }
+
+    /// Send a hub request and classify the answer. The error carries no URL.
+    pub async fn hub_send(&self, rb: reqwest::RequestBuilder) -> Result<Reply, String> {
+        let r = rb.send().await.map_err(|e| e.without_url().to_string())?;
+        reply::read(r).await
+    }
+
+    /// `GET /m/approval?id=`: one of this owner's approvals.
+    pub async fn approval(&self, id: &str) -> Result<serde_json::Value, String> {
+        let url = self.hub_url("approval", &format!("id={}", urlencode(id)));
+        // Bounded, so one hung poll cannot outlast the caller's whole wait.
+        let r = self.client.get(url).timeout(Duration::from_secs(10)).send().await.map_err(|e| e.without_url().to_string())?;
+        let status = r.status();
+        let text = r.text().await.map_err(|e| e.without_url().to_string())?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
+            let snippet: String = text.chars().take(200).collect();
+            format!("hub returned HTTP {status}: {snippet}")
+        })?;
+        if !status.is_success() || v.get("ok").and_then(|x| x.as_bool()) == Some(false) {
+            return Err(v.get("error").and_then(|x| x.as_str()).unwrap_or("approval lookup failed").to_string());
+        }
+        Ok(v)
+    }
+
+    /// Poll a pending approval every `wait.every` until it is decided or
+    /// `wait.max` has passed. A poll that fails is retried until the deadline:
+    /// the approval id is the caller's to keep either way.
+    pub async fn wait_approval(&self, p: reply::Pending, wait: Wait) -> Settled {
+        let deadline = tokio::time::Instant::now() + wait.max;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Settled::Pending(p);
+            }
+            tokio::time::sleep(wait.every.min(deadline - now)).await;
+            if let Ok(v) = self.approval(&p.id).await {
+                if let Some(s) = Settled::from_view(&v) {
+                    return s;
+                }
+            }
+        }
+    }
+
+    /// Where `reply` ends up: as is, or — when it is waiting for a human — after
+    /// up to `wait` of polling for the decision.
+    pub async fn settle(&self, reply: Reply, wait: Wait) -> Settled {
+        match reply {
+            Reply::Done(v) => Settled::Done(v),
+            Reply::DryRun(v) => Settled::DryRun(v),
+            Reply::Refused { error, blocked } => Settled::Refused { error, blocked },
+            Reply::Pending(p) => self.wait_approval(p, wait).await,
+        }
+    }
+
     async fn send_relay(&self, target: &str, op: &Op) -> Result<reqwest::Response, String> {
         let action = op.hub_action.as_deref().unwrap_or(&op.path);
         let mut q = op.query.clone();
@@ -398,3 +469,6 @@ fn attach_body(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

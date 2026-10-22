@@ -5,12 +5,14 @@
 // job_stop, job_list. Jobs are relay-only in this version, so these call the
 // hub's `/m/job/*` routes directly rather than `Controller::call_device`.
 use it_ai_direct::op::urlencode;
+use it_ai_direct::reply::Reply;
 use it_ai_direct::Controller;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{tool, tool_router, ErrorData};
 use serde::Deserialize;
 
+use crate::approval::with_note;
 use crate::{DeviceArg, Srv};
 
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -23,6 +25,9 @@ pub struct JobStartArgs {
     /// working directory on the device (optional)
     #[serde(default)]
     cwd: Option<String>,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct JobLogsArgs {
@@ -38,6 +43,16 @@ pub struct JobIdArgs {
     device: String,
     /// job id returned by job_start
     id: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[cfg(test)]
+impl JobStartArgs {
+    pub fn for_test(device: &str, command: &str, dry_run: bool) -> Self {
+        JobStartArgs { device: device.into(), command: command.into(), cwd: None, dry_run }
+    }
 }
 
 pub fn start_url(ctl: &Controller, target: &str) -> String {
@@ -89,16 +104,10 @@ fn jerr(e: impl ToString) -> ErrorData {
     ErrorData::internal_error(redact_token(&e.to_string()), None)
 }
 
-/// Send a hub request and return its JSON. reqwest errors are stripped of their
-/// URL, which carries the `mtok` token.
-async fn send(rb: reqwest::RequestBuilder) -> Result<serde_json::Value, ErrorData> {
-    let r = rb.timeout(REQUEST_TIMEOUT).send().await.map_err(|e| jerr(e.without_url()))?;
-    let status = r.status();
-    let text = r.text().await.map_err(|e| jerr(e.without_url()))?;
-    serde_json::from_str(&text).map_err(|_| {
-        let snippet: String = text.chars().take(200).collect();
-        jerr(format!("hub returned HTTP {status}: {snippet}"))
-    })
+/// Send a hub request and classify its answer. reqwest errors are stripped of
+/// their URL, which carries the `mtok` token.
+async fn send(srv: &Srv, rb: reqwest::RequestBuilder) -> Result<Reply, ErrorData> {
+    srv.ctl.hub_send(rb.timeout(REQUEST_TIMEOUT)).await.map_err(jerr)
 }
 
 fn text(s: String) -> CallToolResult {
@@ -158,26 +167,39 @@ pub fn fmt_list(v: &serde_json::Value) -> String {
 
 #[tool_router(router = job_router, vis = "pub(crate)")]
 impl Srv {
-    #[tool(description = "Start a long-running command on the named device in the background (dev servers, builds, anything past run_command's ~65s limit). Returns the job id; read its output with job_logs and end it with job_stop.")]
-    async fn job_start(&self, Parameters(a): Parameters<JobStartArgs>) -> Result<CallToolResult, ErrorData> {
+    #[tool(description = "Start a long-running command on the named device in the background (dev servers, builds, anything past run_command's ~65s limit). Returns the job id; read its output with job_logs and end it with job_stop. Like run_command, a command that is not on the hub's read-only allowlist needs a human's approval in the IT-AI dashboard (the tool waits up to 60 s, then returns an approval id for approval_status).")]
+    pub(crate) async fn job_start(&self, Parameters(a): Parameters<JobStartArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(jerr)?;
         let body = start_body(&a.command, a.cwd.as_deref());
-        let v = send(self.client().post(start_url(&self.ctl, &target)).json(&body)).await?;
+        let mut url = start_url(&self.ctl, &target);
+        if a.dry_run {
+            url.push_str("&dry_run=1");
+        }
+        let (v, note) = match self.settled(send(self, self.client().post(url).json(&body)).await?).await {
+            Ok(x) => x,
+            Err(r) => return Ok(r),
+        };
         if let Some(r) = refused(&v) {
             return Ok(r);
         }
-        Ok(text(format!(
-            "started job {} (pid {}, log {})",
-            v["id"].as_str().unwrap_or(""),
-            v["pid"].as_u64().unwrap_or(0),
-            v["log"].as_str().unwrap_or("")
+        Ok(text(with_note(
+            note,
+            format!(
+                "started job {} (pid {}, log {})",
+                v["id"].as_str().unwrap_or(""),
+                v["pid"].as_u64().unwrap_or(0),
+                v["log"].as_str().unwrap_or("")
+            ),
         )))
     }
 
     #[tool(description = "Read a background job's output from a byte offset. Returns a JSON line with the next `offset`, `running`, `exit_code` and `eof`, then the output text. Call again with the returned offset to read what was written since; stop when eof is true.")]
     async fn job_logs(&self, Parameters(a): Parameters<JobLogsArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(jerr)?;
-        let v = send(self.client().get(logs_url(&self.ctl, &target, &a.id, a.offset.unwrap_or(0)))).await?;
+        let (v, _) = match self.settled(send(self, self.client().get(logs_url(&self.ctl, &target, &a.id, a.offset.unwrap_or(0)))).await?).await {
+            Ok(x) => x,
+            Err(r) => return Ok(r),
+        };
         if let Some(r) = refused(&v) {
             return Ok(r);
         }
@@ -187,18 +209,28 @@ impl Srv {
     #[tool(description = "Stop a background job (and its child processes) on the named device.")]
     async fn job_stop(&self, Parameters(a): Parameters<JobIdArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(jerr)?;
-        let v = send(self.client().post(stop_url(&self.ctl, &target, &a.id))).await?;
+        let mut url = stop_url(&self.ctl, &target, &a.id);
+        if a.dry_run {
+            url.push_str("&dry_run=1");
+        }
+        let (v, note) = match self.settled(send(self, self.client().post(url)).await?).await {
+            Ok(x) => x,
+            Err(r) => return Ok(r),
+        };
         if let Some(r) = refused(&v) {
             return Ok(r);
         }
         let verb = if v["stopped"].as_bool().unwrap_or(false) { "stopped" } else { "was not running" };
-        Ok(text(format!("{} {verb} (exit {})", a.id, exit_label(&v["exit_code"]))))
+        Ok(text(with_note(note, format!("{} {verb} (exit {})", a.id, exit_label(&v["exit_code"])))))
     }
 
     #[tool(description = "List the background jobs on the named device: id, running or exit code, pid, start time (unix secs) and command.")]
     async fn job_list(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(jerr)?;
-        let v = send(self.client().get(list_url(&self.ctl, &target))).await?;
+        let (v, _) = match self.settled(send(self, self.client().get(list_url(&self.ctl, &target))).await?).await {
+            Ok(x) => x,
+            Err(r) => return Ok(r),
+        };
         if let Some(r) = refused(&v) {
             return Ok(r);
         }

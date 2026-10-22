@@ -18,3 +18,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 base64 = "0.22"
 anyhow = "1"
 it-ai-direct = { path = "../direct" }
+
+[dev-dependencies]
+it-ai-direct = { path = "../direct", features = ["test-hub"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "time"] }

@@ -12,19 +12,31 @@
 //   HIVE_MCP_TOKEN  token for the hub's /m API (matches the hub's MCP_TOKEN)
 //   HIVE_OWNER      owner id to act as (per-user hub scoping)
 //   HAIVE_CAFILE    optional PEM to verify a self-signed hub cert
+mod approval;
 mod jobs;
+mod policy;
 
+use approval::{text, with_note};
 use base64::Engine;
+use it_ai_direct::reply::{self, Reply, Wait};
 use it_ai_direct::{Controller, Op};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Deserialize, schemars::JsonSchema)]
 struct DeviceArg {
     device: String,
+}
+#[derive(Deserialize, schemars::JsonSchema)]
+struct AgentArgs {
+    device: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RunArgs {
@@ -33,6 +45,9 @@ struct RunArgs {
     /// launch fire-and-forget (don't wait for output) — use for GUI apps or long tasks that would otherwise block
     #[serde(default)]
     detach: bool,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct DownloadArgs {
@@ -47,6 +62,9 @@ struct UploadArgs {
     local_path: String,
     #[serde(default)]
     remote_dir: Option<String>,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct PushArgs {
@@ -54,6 +72,9 @@ struct PushArgs {
     local_path: String,
     #[serde(default)]
     remote_dir: Option<String>,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct ClickArgs {
@@ -65,17 +86,26 @@ struct ClickArgs {
     /// "left" (default), "right", or "middle"
     #[serde(default)]
     button: Option<String>,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct TypeArgs {
     device: String,
     text: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct KeyArgs {
     device: String,
     /// key name, e.g. Enter, Tab, Escape, Backspace, ArrowDown, F5
     key: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct CameraArgs {
@@ -95,22 +125,40 @@ struct ActionArgs {
     device: String,
     /// one of: reboot, shutdown, sleep, logoff, firewall_on, firewall_off, usb_lock, usb_unlock
     action: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct MessageArgs {
     device: String,
     text: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct PackageArgs {
     device: String,
     /// package id (winget id on Windows, brew formula on macOS, apt package on Linux)
     package: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FleetRunArgs {
     /// shell command to run on every device you own, in parallel
     command: String,
+    /// at most this many devices; the hub lowers it under its own cap, and a fleet bigger than this is refused, not trimmed
+    #[serde(default)]
+    max: Option<u32>,
+    /// how many devices run first as a canary; if one fails the rest are skipped (the hub raises it to its own minimum)
+    #[serde(default)]
+    canary: Option<u32>,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct FleetReportArgs {
@@ -127,11 +175,23 @@ struct RunScriptArgs {
     device: String,
     /// the script filename returned by search_scripts (e.g. "Win_Bitlocker_Status.ps1")
     script: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct RunScriptFleetArgs {
     /// the script filename returned by search_scripts, to run on every device you own
     script: String,
+    /// at most this many devices; the hub lowers it under its own cap, and a fleet bigger than this is refused, not trimmed
+    #[serde(default)]
+    max: Option<u32>,
+    /// how many devices run first as a canary; if one fails the rest are skipped (the hub raises it to its own minimum)
+    #[serde(default)]
+    canary: Option<u32>,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 #[derive(Deserialize, schemars::JsonSchema)]
 struct CveArgs {
@@ -146,6 +206,9 @@ struct RunPluginArgs {
     /// optional argument passed to the plugin's {{arg}} placeholder
     #[serde(default)]
     arg: String,
+    /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
+    #[serde(default)]
+    dry_run: bool,
 }
 
 #[derive(Clone)]
@@ -155,6 +218,8 @@ struct Srv {
     /// Shared LAN-direct/relay transport. Owns the hub client, the per-device
     /// route cache, and the `/m` URL construction — `itai` drives the same one.
     ctl: std::sync::Arc<Controller>,
+    /// How long a tool waits for a human to approve a privileged action.
+    wait: Wait,
 }
 
 fn err(e: impl ToString) -> ErrorData {
@@ -170,34 +235,88 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
+/// `&dry_run=1` when asked for.
+fn dry(dry_run: bool) -> &'static str {
+    if dry_run {
+        "&dry_run=1"
+    } else {
+        ""
+    }
+}
+
+/// `&max=N&canary=M` for the ones given.
+fn fleet_limits(max: Option<u32>, canary: Option<u32>) -> String {
+    let mut s = String::new();
+    if let Some(m) = max {
+        s.push_str(&format!("&max={m}"));
+    }
+    if let Some(c) = canary {
+        s.push_str(&format!("&canary={c}"));
+    }
+    s
+}
+
+/// The hub client: `X-IT-AI-Client: mcp` on every request, so the hub attributes
+/// a shared-token call to an AI agent.
+fn build_client() -> reqwest::Client {
+    let mut b = reqwest::Client::builder().default_headers(reply::client_headers("mcp"));
+    // Trust an explicitly-provided hub CA (for LAN-direct connections to an agent
+    // carrying a hub-signed leaf cert). The public hub endpoint has a real,
+    // CA-issued cert and verifies against the system roots with no cafile.
+    if let Some(cert) = std::env::var("HAIVE_CAFILE")
+        .ok()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|p| reqwest::Certificate::from_pem(&p).ok())
+    {
+        b = b.add_root_certificate(cert);
+    }
+    // TLS verification is ON by default now. Previously it was silently DISABLED
+    // whenever no cafile was set — a MITM of the entire control channel. Insecure
+    // mode is now an explicit, logged opt-in for self-signed LAN use only.
+    if std::env::var("HAIVE_INSECURE_TLS").ok().as_deref() == Some("1") {
+        eprintln!("warning: TLS verification DISABLED (HAIVE_INSECURE_TLS=1) — LAN use only");
+        b = b.danger_accept_invalid_certs(true);
+    }
+    b.build().expect("build http client")
+}
+
+/// A `/m/exec` answer, the way run_command shows it.
+fn fmt_exec(out: &Value) -> String {
+    if out["detached"].as_bool().unwrap_or(false) {
+        format!("launched (pid {})", out["pid"].as_i64().unwrap_or(0))
+    } else if out["ok"].as_bool().unwrap_or(false) {
+        let s = format!("{}{}", out["stdout"].as_str().unwrap_or(""), out["stderr"].as_str().unwrap_or(""));
+        if s.is_empty() {
+            format!("(exit {})", out["code"].as_i64().unwrap_or(0))
+        } else {
+            s
+        }
+    } else {
+        format!("[error] {}", out["error"].as_str().unwrap_or("failed"))
+    }
+}
+
+/// A `/m/sys` or `/m/script` answer: the output, else the error.
+fn fmt_output(v: &Value) -> String {
+    v["output"].as_str().or_else(|| v["error"].as_str()).unwrap_or("failed").to_string()
+}
+
 impl Srv {
     fn new() -> Self {
-        let mut b = reqwest::Client::builder();
-        // Trust an explicitly-provided hub CA (for LAN-direct connections to an agent
-        // carrying a hub-signed leaf cert). The public hub endpoint has a real,
-        // CA-issued cert and verifies against the system roots with no cafile.
-        if let Some(cert) = std::env::var("HAIVE_CAFILE")
-            .ok()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|p| reqwest::Certificate::from_pem(&p).ok())
-        {
-            b = b.add_root_certificate(cert);
-        }
-        // TLS verification is ON by default now. Previously it was silently DISABLED
-        // whenever no cafile was set — a MITM of the entire control channel. Insecure
-        // mode is now an explicit, logged opt-in for self-signed LAN use only.
-        if std::env::var("HAIVE_INSECURE_TLS").ok().as_deref() == Some("1") {
-            eprintln!("warning: TLS verification DISABLED (HAIVE_INSECURE_TLS=1) — LAN use only");
-            b = b.danger_accept_invalid_certs(true);
-        }
         let owner = std::env::var("HIVE_OWNER").unwrap_or_default();
         let ctl = Controller::new(
             std::env::var("HAIVE_HUB").unwrap_or_else(|_| "http://localhost:8770".to_string()),
             std::env::var("HIVE_MCP_TOKEN").unwrap_or_default(),
             owner.clone(),
-            b.build().expect("build http client"),
+            build_client(),
         );
-        Self { tool_router: Self::tool_router() + Self::job_router(), owner, ctl: std::sync::Arc::new(ctl) }
+        Self::with(ctl, owner, Wait::default())
+    }
+
+    fn with(ctl: Controller, owner: String, wait: Wait) -> Self {
+        let mut tool_router = Self::tool_router() + Self::job_router() + Self::approval_router();
+        policy::annotate(&mut tool_router);
+        Self { tool_router, owner, ctl: std::sync::Arc::new(ctl), wait }
     }
 
     /// The hub client, for the `/m` actions the hub composes itself (fleet
@@ -216,11 +335,32 @@ impl Srv {
         self.ctl.resolve(name).await
     }
 
-    async fn input(&self, target: &str, ev: serde_json::Value) -> Result<(), ErrorData> {
+    /// Send one input event. `Some` = stop here and return this, because the hub
+    /// did not simply run it (a dry run, a refusal, or an approval request). Input
+    /// is not held while a human decides: the rest of the sequence is not sent.
+    async fn input(&self, target: &str, ev: Value, dry_run: bool) -> Result<Option<CallToolResult>, ErrorData> {
         // The agent's /input takes the bare event; the hub wraps it as {target, ev}.
         let op = Op::post_json("input", ev.clone()).relay_json(serde_json::json!({"ev": ev}));
-        self.ctl.call_device(target, op).await.map_err(err)?;
-        Ok(())
+        Ok(match self.device_reply(target, op, dry_run).await? {
+            Reply::Done(_) => None,
+            Reply::Pending(p) => Some(text(format!(
+                "{} Input is not held for approval: the rest of this input was not sent, and approving runs only this one event.",
+                reply::pending_text(&p, &approval::check_hint(&p.id))
+            ))),
+            other => Some(approval::settled_result(self.ctl.settle(other, Wait::secs(0)).await, &reply::result_text)),
+        })
+    }
+
+    /// A JPEG from the device (frame, camera), or the hub's answer when it is not one.
+    async fn device_image(&self, target: &str, op: Op) -> Result<CallToolResult, ErrorData> {
+        let resp = self.ctl.call_device(target, op).await.map_err(err)?;
+        match reply::bytes_or_reply(resp).await.map_err(err)? {
+            Ok(bytes) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                Ok(CallToolResult::success(vec![ContentBlock::image(b64, "image/jpeg")]))
+            }
+            Err(r) => self.finish(r, &reply::result_text).await,
+        }
     }
 }
 
@@ -228,56 +368,38 @@ impl Srv {
 impl Srv {
     #[tool(description = "List devices you own on the hub, with full details (OS, user, CPU, memory, live CPU load + free RAM, interfaces, cameras, mics, last-seen). Returns JSON.")]
     async fn list_devices(&self) -> Result<CallToolResult, ErrorData> {
-        let v: serde_json::Value = self.client().get(self.m("agents", "")).send().await.map_err(err)?.json().await.map_err(err)?;
-        let agents = v.get("agents").cloned().unwrap_or_else(|| serde_json::json!([]));
-        // Surface the owner-scoping hint on an empty list so it self-diagnoses.
-        if agents.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-            let hint = if self.owner.is_empty() {
-                "No devices are registered on the hub yet.".to_string()
-            } else {
-                format!(
+        let r = self.hub(self.client().get(self.m("agents", ""))).await?;
+        let fmt = |v: &Value| {
+            let agents = v.get("agents").cloned().unwrap_or_else(|| serde_json::json!([]));
+            // Surface the owner-scoping hint on an empty list so it self-diagnoses.
+            if agents.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                if self.owner.is_empty() {
+                    return "No devices are registered on the hub yet.".to_string();
+                }
+                return format!(
                     "No devices visible for this owner ('{}'). HIVE_OWNER must match the email the device enrolled under (--owner …); unset HIVE_OWNER to see all devices for this token.",
                     self.owner
-                )
-            };
-            return Ok(CallToolResult::success(vec![ContentBlock::text(hint)]));
-        }
-        let text = serde_json::to_string_pretty(&agents).unwrap_or_else(|_| "[]".to_string());
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+                );
+            }
+            serde_json::to_string_pretty(&agents).unwrap_or_else(|_| "[]".to_string())
+        };
+        self.finish(r, &fmt).await
     }
 
-    #[tool(description = "Run a shell command on the named device and return its output. Windows caveat: the typed-input path can drop `$`, `%`, and quote characters (and cmd.exe expands `%VAR%`), so a PowerShell command with variables or quotes may echo instead of run — wrap it as `powershell -NoProfile -EncodedCommand <base64-UTF16LE-of-the-command>` (base64 contains none of those characters) to run it verbatim.")]
+    #[tool(description = "Run a shell command on the named device and return its output. A command whose programs are all on the hub's read-only allowlist runs at once; anything else needs a human's approval in the IT-AI dashboard (the tool waits up to 60 s, then returns an approval id for approval_status). Windows caveat: the typed-input path can drop `$`, `%`, and quote characters (and cmd.exe expands `%VAR%`), so a PowerShell command with variables or quotes may echo instead of run — wrap it as `powershell -NoProfile -EncodedCommand <base64-UTF16LE-of-the-command>` (base64 contains none of those characters) to run it verbatim.")]
     async fn run_command(&self, Parameters(a): Parameters<RunArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
         let op = Op::post_json("exec", serde_json::json!({"cmd": a.command, "detach": a.detach}))
             .target_in_body()
             .timeout(std::time::Duration::from_secs(65));
-        let out: serde_json::Value =
-            self.ctl.call_device(&target, op).await.map_err(err)?.json().await.map_err(err)?;
-        let text = if out["detached"].as_bool().unwrap_or(false) {
-            format!("launched (pid {})", out["pid"].as_i64().unwrap_or(0))
-        } else if out["ok"].as_bool().unwrap_or(false) {
-            let s = format!("{}{}", out["stdout"].as_str().unwrap_or(""), out["stderr"].as_str().unwrap_or(""));
-            if s.is_empty() { format!("(exit {})", out["code"].as_i64().unwrap_or(0)) } else { s }
-        } else {
-            format!("[error] {}", out["error"].as_str().unwrap_or("failed"))
-        };
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        let r = self.device_reply(&target, op, a.dry_run).await?;
+        self.finish(r, &fmt_exec).await
     }
 
     #[tool(description = "Capture the current screen of the named device as an image.")]
     async fn screenshot(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
-        let bytes = self
-            .ctl
-            .call_device(&target, Op::get("frame"))
-            .await
-            .map_err(err)?
-            .bytes()
-            .await
-            .map_err(err)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Ok(CallToolResult::success(vec![ContentBlock::image(b64, "image/jpeg")]))
+        self.device_image(&target, Op::get("frame")).await
     }
 
     #[tool(description = "Capture a photo from the device's camera (webcam). Optional index selects the camera (default 0).")]
@@ -287,42 +409,50 @@ impl Srv {
         if let Some(i) = a.index {
             op = op.query("index", i.to_string());
         }
-        let bytes = self.ctl.call_device(&target, op).await.map_err(err)?.bytes().await.map_err(err)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Ok(CallToolResult::success(vec![ContentBlock::image(b64, "image/jpeg")]))
+        self.device_image(&target, op).await
     }
 
-    #[tool(description = "Update the agent on the device to the latest build hosted by the hub (self-replace + restart).")]
-    async fn update_agent(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
+    #[tool(description = "Update the agent on the device to the latest build hosted by the hub (self-replace + restart). Needs a human's approval in the IT-AI dashboard by default.")]
+    async fn update_agent(&self, Parameters(a): Parameters<AgentArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
-        let text = self.client().get(self.m("update", &format!("target={}", urlencode(&target)))).send().await.map_err(err)?.text().await.map_err(err)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        let r = self.hub(self.client().get(self.m("update", &format!("target={}{}", urlencode(&target), dry(a.dry_run))))).await?;
+        self.finish(r, &reply::result_text).await
     }
 
-    #[tool(description = "Dissolve the agent on the device — stop it and remove its autostart (the binary is not deleted).")]
-    async fn dissolve_agent(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
+    #[tool(description = "Dissolve the agent on the device — stop it and remove its autostart (the binary is not deleted). Needs a human's approval in the IT-AI dashboard by default.")]
+    async fn dissolve_agent(&self, Parameters(a): Parameters<AgentArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
-        let text = self.client().get(self.m("dissolve", &format!("target={}", urlencode(&target)))).send().await.map_err(err)?.text().await.map_err(err)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        let r = self.hub(self.client().get(self.m("dissolve", &format!("target={}{}", urlencode(&target), dry(a.dry_run))))).await?;
+        self.finish(r, &reply::result_text).await
     }
 
     #[tool(description = "Download a file from the device to the Mac. Returns the local path.")]
     async fn download_file(&self, Parameters(a): Parameters<DownloadArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
         let op = Op::get("download").query("path", a.remote_path.clone());
-        let bytes = self.ctl.call_device(&target, op).await.map_err(err)?.bytes().await.map_err(err)?;
+        let resp = self.ctl.call_device(&target, op).await.map_err(err)?;
+        let bytes = match reply::bytes_or_reply(resp).await.map_err(err)? {
+            Ok(b) => b,
+            Err(r) => return self.finish(r, &reply::result_text).await,
+        };
         let local = a.save_as.filter(|s| !s.is_empty()).unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_default();
             let name = std::path::Path::new(&a.remote_path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "download".to_string());
             format!("{home}/Downloads/{name}")
         });
         std::fs::write(&local, &bytes).map_err(err)?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!("saved to {local}"))]))
+        Ok(text(format!("saved to {local}")))
     }
 
     #[tool(description = "Upload a local file (up to 100 MB) to the device. Returns the saved remote path. For files larger than 100 MB use push_file instead — this direct path is capped and will reject them.")]
     async fn upload_file(&self, Parameters(a): Parameters<UploadArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
+        let name = std::path::Path::new(&a.local_path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "upload.bin".to_string());
+        if a.dry_run {
+            // The hub decides on the request line; the file itself is not sent.
+            let r = self.device_reply(&target, Op::post_file("upload", name, Vec::new()), true).await?;
+            return self.finish(r, &reply::result_text).await;
+        }
         // The hub caps direct /upload at 100 MB (it buffers the whole body in RAM and
         // the relay ships it as one message). Reject oversize files HERE, before a
         // doomed transfer — on a flaky tunnel the upload would otherwise die with an
@@ -330,100 +460,95 @@ impl Srv {
         const MAX_DIRECT_UPLOAD: u64 = 100 * 1024 * 1024;
         let size = std::fs::metadata(&a.local_path).map_err(err)?.len();
         if size > MAX_DIRECT_UPLOAD {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            return Ok(text(format!(
                 "[error] {} is {:.1} MB, over the {} MB direct-upload limit. Use push_file (stage-and-pull) instead — it streams to disk and handles multi-GB files: push_file(device, local_path, remote_dir).",
                 a.local_path,
                 size as f64 / 1_048_576.0,
                 MAX_DIRECT_UPLOAD / 1_048_576
-            ))]));
+            )));
         }
         let data = std::fs::read(&a.local_path).map_err(err)?;
-        let name = std::path::Path::new(&a.local_path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "upload.bin".to_string());
         let mut op = Op::post_file("upload", name, data);
         if let Some(dir) = a.remote_dir.filter(|d| !d.is_empty()) {
             op = op.field("dir", dir);
         }
-        let out: serde_json::Value =
-            self.ctl.call_device(&target, op).await.map_err(err)?.json().await.map_err(err)?;
-        let text = if out["ok"].as_bool().unwrap_or(false) {
-            out["saved"].as_str().unwrap_or("").to_string()
-        } else {
-            format!("[error] {}", out["error"].as_str().unwrap_or("failed"))
+        let r = self.device_reply(&target, op, false).await?;
+        let fmt = |out: &Value| {
+            if out["ok"].as_bool().unwrap_or(false) {
+                out["saved"].as_str().unwrap_or("").to_string()
+            } else {
+                format!("[error] {}", out["error"].as_str().unwrap_or("failed"))
+            }
         };
-        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+        self.finish(r, &fmt).await
     }
 
     #[tool(description = "Push a local file to the device via stage-and-pull: the hub stages the bytes and the device pulls them over HTTP with a sha256 integrity check. Robust for large files (won't wedge the relay tunnel like a base64-over-command hack would). Returns the saved remote path.")]
     async fn push_file(&self, Parameters(a): Parameters<PushArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
-        let data = std::fs::read(&a.local_path).map_err(err)?;
         let name = std::path::Path::new(&a.local_path)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "push.bin".to_string());
+        let dir_q = a.remote_dir.as_deref().filter(|d| !d.is_empty()).map(|d| format!("&dir={}", urlencode(d))).unwrap_or_default();
+        if a.dry_run {
+            let extra = format!("target={}&name={}{dir_q}&dry_run=1", urlencode(&target), urlencode(&name));
+            let r = self.hub(self.client().post(self.m("push-file", &extra))).await?;
+            return self.finish(r, &reply::result_text).await;
+        }
+        let data = std::fs::read(&a.local_path).map_err(err)?;
         // 1) Stage the bytes on the hub (owner-scoped, sha256-hashed, 1h TTL).
-        let staged: serde_json::Value = self
-            .client()
-            .post(self.m("stage", ""))
-            .body(data)
-            .send()
-            .await
-            .map_err(err)?
-            .json()
-            .await
-            .map_err(err)?;
+        let r = self.hub(self.client().post(self.m("stage", "")).body(data)).await?;
+        let (staged, _) = match self.settled(r).await {
+            Ok(v) => v,
+            Err(done) => return Ok(done),
+        };
         let token = staged["token"].as_str().unwrap_or("");
         if token.is_empty() {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "[error] stage failed: {}",
-                staged["error"].as_str().unwrap_or("unknown")
-            ))]));
+            return Ok(text(format!("[error] stage failed: {}", staged["error"].as_str().unwrap_or("unknown"))));
         }
         // 2) Tell the device to pull it (out-of-band GET, not through the tunnel).
-        let mut extra = format!("target={}&token={}&name={}", urlencode(&target), urlencode(token), urlencode(&name));
-        if let Some(dir) = a.remote_dir.as_deref().filter(|d| !d.is_empty()) {
-            extra.push_str(&format!("&dir={}", urlencode(dir)));
-        }
-        let push: serde_json::Value =
-            self.client().post(self.m("push-file", &extra)).send().await.map_err(err)?.json().await.map_err(err)?;
+        let extra = format!("target={}&token={}&name={}{dir_q}", urlencode(&target), urlencode(token), urlencode(&name));
+        let r = self.hub(self.client().post(self.m("push-file", &extra))).await?;
+        let (push, note) = match self.settled(r).await {
+            Ok(v) => v,
+            Err(done) => return Ok(done),
+        };
         if !push["ok"].as_bool().unwrap_or(false) {
-            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "[error] {}",
-                push["error"].as_str().unwrap_or("push failed")
-            ))]));
+            return Ok(text(format!("[error] {}", push["error"].as_str().unwrap_or("push failed"))));
         }
         let job = push["job"].as_str().unwrap_or("").to_string();
         // 3) Poll the device's job status until the pull completes (~10 min cap).
         let status_extra = format!("target={}&job={}&token={}", urlencode(&target), urlencode(&job), urlencode(token));
         for _ in 0..300 {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let st: serde_json::Value = match self.client().get(self.m("file-status", &status_extra)).send().await {
+            let st: Value = match self.client().get(self.m("file-status", &status_extra)).send().await {
                 Ok(r) => r.json().await.unwrap_or_else(|_| serde_json::json!({})),
                 Err(_) => continue,
             };
             if st["done"].as_bool().unwrap_or(false) {
-                let text = if st["success"].as_bool().unwrap_or(false) {
-                    format!(
-                        "pushed {} bytes to {}",
-                        st["bytes"].as_u64().unwrap_or(0),
-                        st["path"].as_str().unwrap_or("device")
-                    )
+                let t = if st["success"].as_bool().unwrap_or(false) {
+                    format!("pushed {} bytes to {}", st["bytes"].as_u64().unwrap_or(0), st["path"].as_str().unwrap_or("device"))
                 } else {
                     format!("[error] transfer failed: {}", st["error"].as_str().unwrap_or("unknown"))
                 };
-                return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
+                return Ok(text(with_note(note, t)));
             }
         }
-        Ok(CallToolResult::success(vec![ContentBlock::text("[error] transfer timed out after 10 minutes".to_string())]))
+        Ok(text("[error] transfer timed out after 10 minutes".to_string()))
     }
 
     #[tool(description = "Click at a position on the device's screen. x and y are fractions 0.0-1.0 from the top-left.")]
     async fn click(&self, Parameters(a): Parameters<ClickArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
         let btn = match a.button.as_deref() { Some("right") => 2, Some("middle") => 1, _ => 0 };
-        self.input(&target, serde_json::json!({"type":"down","button":btn,"x":a.x,"y":a.y})).await?;
-        self.input(&target, serde_json::json!({"type":"up","button":btn})).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!("clicked at ({:.3}, {:.3})", a.x, a.y))]))
+        if let Some(r) = self.input(&target, serde_json::json!({"type":"down","button":btn,"x":a.x,"y":a.y}), a.dry_run).await? {
+            return Ok(r);
+        }
+        if let Some(r) = self.input(&target, serde_json::json!({"type":"up","button":btn}), false).await? {
+            return Ok(r);
+        }
+        Ok(text(format!("clicked at ({:.3}, {:.3})", a.x, a.y)))
     }
 
     #[tool(description = "Type text on the device as keystrokes.")]
@@ -431,196 +556,211 @@ impl Srv {
         let target = self.resolve(&a.device).await.map_err(err)?;
         for c in a.text.chars() {
             let k = c.to_string();
-            self.input(&target, serde_json::json!({"type":"key","action":"down","key":k})).await?;
-            self.input(&target, serde_json::json!({"type":"key","action":"up","key":k})).await?;
+            if let Some(r) = self.input(&target, serde_json::json!({"type":"key","action":"down","key":k}), a.dry_run).await? {
+                return Ok(r);
+            }
+            if let Some(r) = self.input(&target, serde_json::json!({"type":"key","action":"up","key":k}), false).await? {
+                return Ok(r);
+            }
         }
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!("typed {} chars", a.text.chars().count()))]))
+        Ok(text(format!("typed {} chars", a.text.chars().count())))
     }
 
     #[tool(description = "Press a named key on the device (e.g. Enter, Tab, Escape, Backspace, ArrowDown).")]
     async fn press_key(&self, Parameters(a): Parameters<KeyArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
-        self.input(&target, serde_json::json!({"type":"key","action":"down","key":a.key})).await?;
-        self.input(&target, serde_json::json!({"type":"key","action":"up","key":a.key})).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!("pressed {}", a.key))]))
+        if let Some(r) = self.input(&target, serde_json::json!({"type":"key","action":"down","key":a.key}), a.dry_run).await? {
+            return Ok(r);
+        }
+        if let Some(r) = self.input(&target, serde_json::json!({"type":"key","action":"up","key":a.key}), false).await? {
+            return Ok(r);
+        }
+        Ok(text(format!("pressed {}", a.key)))
     }
 
-    async fn sys(&self, device: &str, kind: &str, arg: &str) -> Result<String, ErrorData> {
+    async fn sys(&self, device: &str, kind: &str, arg: &str, dry_run: bool) -> Result<Reply, ErrorData> {
         let target = self.resolve(device).await.map_err(err)?;
         let mut extra = format!("kind={}&target={}", urlencode(kind), urlencode(&target));
         if !arg.is_empty() {
             extra.push_str(&format!("&arg={}", urlencode(arg)));
         }
-        let v: serde_json::Value = self.client().get(self.m("sys", &extra)).send().await.map_err(err)?.json().await.map_err(err)?;
-        Ok(v["output"].as_str().or_else(|| v["error"].as_str()).unwrap_or("failed").to_string())
+        extra.push_str(dry(dry_run));
+        self.hub(self.client().get(self.m("sys", &extra))).await
     }
 
     #[tool(description = "Get a system report from a device. kind: hardware, av (antivirus status), encryption (disk encryption), firewall, processes, services, network (ARP neighbors), packages (installed software).")]
     async fn system_report(&self, Parameters(a): Parameters<ReportArgs>) -> Result<CallToolResult, ErrorData> {
-        let out = self.sys(&a.device, &a.kind, "").await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let r = self.sys(&a.device, &a.kind, "", false).await?;
+        self.finish(r, &fmt_output).await
     }
 
-    #[tool(description = "Run a device action: reboot, shutdown, sleep, logoff, firewall_on, firewall_off, usb_lock, usb_unlock (USB storage lock is Windows-only).")]
+    #[tool(description = "Run a device action: reboot, shutdown, sleep, logoff, firewall_on, firewall_off, usb_lock, usb_unlock (USB storage lock is Windows-only). reboot, shutdown, logoff, firewall_off and usb_unlock need a human's approval in the IT-AI dashboard by default.")]
     async fn device_action(&self, Parameters(a): Parameters<ActionArgs>) -> Result<CallToolResult, ErrorData> {
-        let out = self.sys(&a.device, &a.action, "").await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{}: {}", a.action, out))]))
+        let r = self.sys(&a.device, &a.action, "", a.dry_run).await?;
+        let fmt = |v: &Value| format!("{}: {}", a.action, fmt_output(v));
+        self.finish(r, &fmt).await
     }
 
     #[tool(description = "Show a popup message to the logged-in user on the device.")]
     async fn message_user(&self, Parameters(a): Parameters<MessageArgs>) -> Result<CallToolResult, ErrorData> {
-        let out = self.sys(&a.device, "message", &a.text).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let r = self.sys(&a.device, "message", &a.text, a.dry_run).await?;
+        self.finish(r, &fmt_output).await
     }
 
     #[tool(description = "Install a software package on the device (winget on Windows, brew on macOS, apt on Linux).")]
     async fn install_package(&self, Parameters(a): Parameters<PackageArgs>) -> Result<CallToolResult, ErrorData> {
-        let out = self.sys(&a.device, "install", &a.package).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let r = self.sys(&a.device, "install", &a.package, a.dry_run).await?;
+        self.finish(r, &fmt_output).await
     }
 
-    #[tool(description = "Uninstall a software package from the device (winget/brew/apt).")]
+    #[tool(description = "Uninstall a software package from the device (winget/brew/apt). Needs a human's approval in the IT-AI dashboard by default.")]
     async fn uninstall_package(&self, Parameters(a): Parameters<PackageArgs>) -> Result<CallToolResult, ErrorData> {
-        let out = self.sys(&a.device, "uninstall", &a.package).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let r = self.sys(&a.device, "uninstall", &a.package, a.dry_run).await?;
+        self.finish(r, &fmt_output).await
     }
 
     #[tool(description = "Check for available OS/app updates on the device (winget upgrade / softwareupdate -l / apt upgradable). Use device_action 'update_all' to apply them.")]
     async fn check_updates(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
-        let out = self.sys(&a.device, "updates", "").await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let r = self.sys(&a.device, "updates", "", false).await?;
+        self.finish(r, &fmt_output).await
     }
 
     #[tool(description = "Run a security compliance check on the device (disk encryption, firewall, antivirus, OS updates) and return a score/grade with per-check pass/fail.")]
     async fn compliance_posture(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
-        let target = self.resolve(&a.device).await.map_err(err)?;
-        let v: serde_json::Value = self.client().get(self.m("sys", &format!("kind=posture&target={}", urlencode(&target)))).send().await.map_err(err)?.json().await.map_err(err)?;
-        let mut s = format!("Compliance: {} ({}/100)\n", v["grade"].as_str().unwrap_or("?"), v["score"].as_i64().unwrap_or(0));
-        if let Some(cs) = v["checks"].as_array() {
-            for c in cs {
-                s.push_str(&format!("  [{}] {}\n", if c["pass"].as_bool().unwrap_or(false) { "PASS" } else { "FAIL" }, c["check"].as_str().unwrap_or("")));
+        let r = self.sys(&a.device, "posture", "", false).await?;
+        let fmt = |v: &Value| {
+            let mut s = format!("Compliance: {} ({}/100)\n", v["grade"].as_str().unwrap_or("?"), v["score"].as_i64().unwrap_or(0));
+            if let Some(cs) = v["checks"].as_array() {
+                for c in cs {
+                    s.push_str(&format!("  [{}] {}\n", if c["pass"].as_bool().unwrap_or(false) { "PASS" } else { "FAIL" }, c["check"].as_str().unwrap_or("")));
+                }
             }
-        }
-        Ok(CallToolResult::success(vec![ContentBlock::text(s)]))
+            s
+        };
+        self.finish(r, &fmt).await
     }
 
-    async fn fleet(&self, extra: &str) -> Result<String, ErrorData> {
-        let v: serde_json::Value = self.client().get(self.m("fleet", extra)).send().await.map_err(err)?.json().await.map_err(err)?;
-        let out = v["results"]
-            .as_array()
-            .map(|arr| arr.iter().map(|r| format!("### {}\n{}", r["device"].as_str().unwrap_or("?"), r["output"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n\n"))
-            .unwrap_or_else(|| "no devices".to_string());
-        Ok(out)
+    async fn fleet(&self, extra: &str) -> Result<CallToolResult, ErrorData> {
+        let r = self.hub(self.client().get(self.m("fleet", extra))).await?;
+        self.finish(r, &reply::fmt_fleet).await
     }
 
-    #[tool(description = "Run a shell command on EVERY device you own, in parallel, and return each device's output.")]
+    #[tool(description = "Run a shell command on EVERY device you own, in parallel, and return each device's output. The hub caps the run (refusing a fleet bigger than its limit) and runs canary devices first: if a canary fails, the rest are skipped and listed. Needs a human's approval unless every program in the command is on the hub's read-only allowlist.")]
     async fn fleet_run(&self, Parameters(a): Parameters<FleetRunArgs>) -> Result<CallToolResult, ErrorData> {
-        let out = self.fleet(&format!("kind=exec&cmd={}", urlencode(&a.command))).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        self.fleet(&format!("kind=exec&cmd={}{}{}", urlencode(&a.command), fleet_limits(a.max, a.canary), dry(a.dry_run))).await
     }
 
     #[tool(description = "Run a system report (hardware, av, encryption, firewall, processes, services, network, packages) on EVERY device you own, in parallel.")]
     async fn fleet_report(&self, Parameters(a): Parameters<FleetReportArgs>) -> Result<CallToolResult, ErrorData> {
-        let out = self.fleet(&format!("kind={}", urlencode(&a.kind))).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        self.fleet(&format!("kind={}", urlencode(&a.kind))).await
     }
 
     #[tool(description = "Search the TacticalRMM community-scripts library (amidaware) for a maintenance/diagnostic script. Returns matching scripts with their filename, shell, platforms and name — pass a filename to run_script or run_script_fleet to execute it.")]
     async fn search_scripts(&self, Parameters(a): Parameters<SearchScriptsArgs>) -> Result<CallToolResult, ErrorData> {
-        let v: serde_json::Value = self.client().get(self.m("scripts", &format!("q={}", urlencode(&a.query)))).send().await.map_err(err)?.json().await.map_err(err)?;
-        let list = v["scripts"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .take(40)
-                    .map(|s| {
-                        let plats = s["platforms"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
-                        format!("- {} ({}) — {}", s["filename"].as_str().unwrap_or(""), plats, s["name"].as_str().unwrap_or(""))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{} of {} scripts match:\n{}", v["count"].as_i64().unwrap_or(0), v["total"].as_i64().unwrap_or(0), list))]))
+        let r = self.hub(self.client().get(self.m("scripts", &format!("q={}", urlencode(&a.query))))).await?;
+        let fmt = |v: &Value| {
+            let list = v["scripts"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .take(40)
+                        .map(|s| {
+                            let plats = s["platforms"].as_array().map(|p| p.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+                            format!("- {} ({}) — {}", s["filename"].as_str().unwrap_or(""), plats, s["name"].as_str().unwrap_or(""))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            format!("{} of {} scripts match:\n{}", v["count"].as_i64().unwrap_or(0), v["total"].as_i64().unwrap_or(0), list)
+        };
+        self.finish(r, &fmt).await
     }
 
-    #[tool(description = "Run a community script (from search_scripts) on the named device. Pass the script filename. It is fetched from GitHub and run on the device; its output is returned. Subject to a ~65s execution cap.")]
+    #[tool(description = "Run a community script (from search_scripts) on the named device. Pass the script filename. It is fetched from GitHub and run on the device; its output is returned. Subject to a ~65s execution cap. Needs a human's approval in the IT-AI dashboard by default.")]
     async fn run_script(&self, Parameters(a): Parameters<RunScriptArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
-        let v: serde_json::Value = self.client().get(self.m("script", &format!("target={}&file={}", urlencode(&target), urlencode(&a.script)))).send().await.map_err(err)?.json().await.map_err(err)?;
-        let out = v["output"].as_str().or_else(|| v["error"].as_str()).unwrap_or("failed").to_string();
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let r = self.hub(self.client().get(self.m("script", &format!("target={}&file={}{}", urlencode(&target), urlencode(&a.script), dry(a.dry_run))))).await?;
+        self.finish(r, &fmt_output).await
     }
 
     #[tool(description = "Run the security-compliance posture check (disk encryption, firewall, antivirus, OS updates) on EVERY device you own, in parallel. Returns each device's grade + per-check pass/fail. Checks map to CIS / NIST 800-53 / PCI-DSS / HIPAA / ISO 27001 / Essential Eight controls.")]
     async fn fleet_compliance(&self) -> Result<CallToolResult, ErrorData> {
-        let v: serde_json::Value = self.client().get(self.m("compliance-fleet", "")).send().await.map_err(err)?.json().await.map_err(err)?;
-        let out = v["results"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|d| {
-                        let checks = d["checks"]
-                            .as_array()
-                            .map(|cs| cs.iter().map(|c| format!("{} {}", if c["pass"].as_bool().unwrap_or(false) { "PASS" } else { "FAIL" }, c["check"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", "))
-                            .unwrap_or_default();
-                        format!("{} — {} ({}/100): {}", d["device"].as_str().unwrap_or("?"), d["grade"].as_str().unwrap_or("?"), d["score"].as_i64().unwrap_or(0), checks)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_else(|| "no devices".to_string());
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let r = self.hub(self.client().get(self.m("compliance-fleet", ""))).await?;
+        let fmt = |v: &Value| {
+            v["results"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .map(|d| {
+                            let checks = d["checks"]
+                                .as_array()
+                                .map(|cs| cs.iter().map(|c| format!("{} {}", if c["pass"].as_bool().unwrap_or(false) { "PASS" } else { "FAIL" }, c["check"].as_str().unwrap_or(""))).collect::<Vec<_>>().join(", "))
+                                .unwrap_or_default();
+                            format!("{} — {} ({}/100): {}", d["device"].as_str().unwrap_or("?"), d["grade"].as_str().unwrap_or("?"), d["score"].as_i64().unwrap_or(0), checks)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| match v["error"].as_str() {
+                    Some(e) => format!("[error] {e}"),
+                    None => "no devices".to_string(),
+                })
+        };
+        self.finish(r, &fmt).await
     }
 
     #[tool(description = "Look up known CVEs for a product/keyword via the NVD database. Returns CVE id, CVSS score/severity and summary, highest severity first. A lookup, not an automated scan.")]
     async fn cve_lookup(&self, Parameters(a): Parameters<CveArgs>) -> Result<CallToolResult, ErrorData> {
-        let v: serde_json::Value = self.client().get(self.m("cve", &format!("q={}", urlencode(&a.query)))).send().await.map_err(err)?.json().await.map_err(err)?;
-        let list = v["cves"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .take(20)
-                    .map(|c| format!("{} [{} {}] {} — {}", c["id"].as_str().unwrap_or(""), c["severity"].as_str().unwrap_or("?"), c["score"].as_f64().map(|s| s.to_string()).unwrap_or_default(), c["published"].as_str().unwrap_or(""), c["summary"].as_str().unwrap_or("")))
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-            })
-            .unwrap_or_default();
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{} CVEs:\n{}", v["count"].as_i64().unwrap_or(0), list))]))
+        let r = self.hub(self.client().get(self.m("cve", &format!("q={}", urlencode(&a.query))))).await?;
+        let fmt = |v: &Value| {
+            let list = v["cves"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .take(20)
+                        .map(|c| format!("{} [{} {}] {} — {}", c["id"].as_str().unwrap_or(""), c["severity"].as_str().unwrap_or("?"), c["score"].as_f64().map(|s| s.to_string()).unwrap_or_default(), c["published"].as_str().unwrap_or(""), c["summary"].as_str().unwrap_or("")))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })
+                .unwrap_or_default();
+            format!("{} CVEs:\n{}", v["count"].as_i64().unwrap_or(0), list)
+        };
+        self.finish(r, &fmt).await
     }
 
     #[tool(description = "List command-plugins registered on the hub — custom named actions added via JSON manifests. Returns each plugin's id, platforms and name. Run one with run_plugin.")]
     async fn list_plugins(&self) -> Result<CallToolResult, ErrorData> {
-        let v: serde_json::Value = self.client().get(self.m("plugins", "")).send().await.map_err(err)?.json().await.map_err(err)?;
-        let list = v["plugins"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|p| {
-                        let plats = p["platforms"].as_array().map(|x| x.iter().filter_map(|y| y.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
-                        format!("- {} ({}) — {}", p["id"].as_str().unwrap_or(""), plats, p["name"].as_str().unwrap_or(""))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!("{} plugins:\n{}", v["count"].as_i64().unwrap_or(0), list))]))
+        let r = self.hub(self.client().get(self.m("plugins", ""))).await?;
+        let fmt = |v: &Value| {
+            let list = v["plugins"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|p| {
+                            let plats = p["platforms"].as_array().map(|x| x.iter().filter_map(|y| y.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+                            format!("- {} ({}) — {}", p["id"].as_str().unwrap_or(""), plats, p["name"].as_str().unwrap_or(""))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            format!("{} plugins:\n{}", v["count"].as_i64().unwrap_or(0), list)
+        };
+        self.finish(r, &fmt).await
     }
 
     #[tool(description = "Run a hub command-plugin (from list_plugins) on the named device. Pass the plugin id and an optional arg.")]
     async fn run_plugin(&self, Parameters(a): Parameters<RunPluginArgs>) -> Result<CallToolResult, ErrorData> {
-        let out = self.sys(&a.device, &a.plugin, &a.arg).await?;
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let r = self.sys(&a.device, &a.plugin, &a.arg, a.dry_run).await?;
+        self.finish(r, &fmt_output).await
     }
 
-    #[tool(description = "Run a community script (from search_scripts) on EVERY device you own, in parallel. Pass the script filename.")]
+    #[tool(description = "Run a community script (from search_scripts) on EVERY device you own, in parallel. Pass the script filename. Capped and canary-first like fleet_run; needs a human's approval in the IT-AI dashboard by default.")]
     async fn run_script_fleet(&self, Parameters(a): Parameters<RunScriptFleetArgs>) -> Result<CallToolResult, ErrorData> {
-        let v: serde_json::Value = self.client().get(self.m("script-fleet", &format!("file={}", urlencode(&a.script)))).send().await.map_err(err)?.json().await.map_err(err)?;
-        let out = v["results"]
-            .as_array()
-            .map(|arr| arr.iter().map(|r| format!("### {}\n{}", r["device"].as_str().unwrap_or("?"), r["output"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n\n"))
-            .unwrap_or_else(|| "no devices".to_string());
-        Ok(CallToolResult::success(vec![ContentBlock::text(out)]))
+        let extra = format!("file={}{}{}", urlencode(&a.script), fleet_limits(a.max, a.canary), dry(a.dry_run));
+        let r = self.hub(self.client().get(self.m("script-fleet", &extra))).await?;
+        self.finish(r, &reply::fmt_fleet).await
     }
 }
 
@@ -630,7 +770,7 @@ impl ServerHandler for Srv {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), camera_snapshot, update_agent, dissolve_agent, job_start/job_logs/job_stop/job_list (background commands past run_command's ~65s limit).".to_string(),
+            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), camera_snapshot, update_agent, dissolve_agent, job_start/job_logs/job_stop/job_list (background commands past run_command's ~65s limit). The hub tiers every action: read and change run, blocked is refused, and privileged waits for a human's approval in the IT-AI dashboard — a tool waits up to 60 s, then returns an approval id to check with approval_status. Never route around a pending or blocked action. Change tools take dry_run=true to see the hub's verdict without running anything.".to_string(),
         );
         info
     }

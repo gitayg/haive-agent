@@ -1,6 +1,6 @@
 ---
 name: it-ai
-description: Operate an IT-AI fleet (self-hosted IT management hub + endpoint agents) through the it-ai-mcp MCP tools or the itai CLI. Use when asked to run commands on, inspect, update, move files to or from, or control devices enrolled in an IT-AI / HaiveControl hub, or to set up itai on a dev box. Covers picking the right tool, long-running jobs, large-file transfer, agent updates, and working within the hub's deny-list and audit log.
+description: Operate an IT-AI fleet (self-hosted IT management hub + endpoint agents) through the it-ai-mcp MCP tools or the itai CLI. Use when asked to run commands on, inspect, update, move files to or from, or control devices enrolled in an IT-AI / HaiveControl hub, or to set up itai on a dev box. Covers picking the right tool, long-running jobs, large-file transfer, agent updates, human approvals for privileged actions, dry runs, and working within the hub's deny-list and audit log.
 ---
 
 # Operating IT-AI
@@ -18,7 +18,8 @@ otherwise. Either way the hub authorizes, deny-list-checks and audits the call f
    repeating it. Never put a token in a command line (`--mtok` is visible in `ps`), a command
    you run on a device, a file, or a message. Read it from the environment only.
 2. **A refusal is policy, not a bug.** The hub refuses before the device is contacted:
-   - `command blocked by hub policy (matched '<pattern>')` / `action '<kind>' is blocked by hub policy` - deny-list
+   - `Blocked by the hub's policy: …` (403, tier `blocked`) - the deny-list or an admin override,
+     e.g. `command blocked by hub policy (matched '<pattern>')` / `action '<kind>' is blocked by hub policy`
    - `this MCP token is read-only` (403) - the token cannot do write actions
    - `forbidden` - this owner may not control that device
    - `remote exec disabled` (403) - the agent runs with exec turned off
@@ -26,6 +27,9 @@ otherwise. Either way the hub authorizes, deny-list-checks and audits the call f
    Report the refusal and the matched rule to the user and stop. Do **not** reword, split,
    alias, base64-encode, wrap in a script, move to `run_script`/`run_plugin`/`fleet_run`/
    `job_start`/`detach`, or type it into a terminal with `type_text` to get past it.
+   The same goes for an action **waiting for approval** or **denied** (see "Approvals" below):
+   never look for another tool, another command or another device that gets the same result
+   without the human's yes.
 3. **Everything is audited.** The hub records actor, source (`mcp` or `browser`), action,
    device and the full command text. Assume an admin reads it: no secrets in command text,
    and say what you're about to do before you do it.
@@ -57,10 +61,48 @@ otherwise. Either way the hub authorizes, deny-list-checks and audits the call f
 | Same thing on every device | `fleet_run(command)`, `fleet_report(kind)`, `run_script_fleet(script)` |
 | Known CVEs for a product | `cve_lookup(query)` (an NVD lookup, not a scan) |
 | Agent lifecycle | `update_agent(device)`, `dissolve_agent(device)` |
+| A privileged action came back with an approval id | `approval_status(id)` |
 
 Device names resolve exact first, then by substring; an ambiguous substring errors, so use
 the full name from `list_devices`. An empty `list_devices` usually means `HIVE_OWNER` doesn't
 match the email the device enrolled under; the tool says so.
+
+## Approvals, tiers and dry runs (hub 3.18.0+)
+
+The hub puts every action in a tier before anything reaches a device:
+
+| Tier | What happens | Examples (hub defaults) |
+|---|---|---|
+| read | runs | `list_devices`, `screenshot`, `system_report`, `download_file`, `job_logs` |
+| change | runs; the device owner is notified | `upload_file`, `push_file`, `click`/`type_text`, `message_user`, `install_package`, `job_stop`, a `run_command` whose programs are all on the hub's read-only allowlist (`ls`, `df`, `uname`, …) |
+| privileged | **does not run until a human approves it in the IT-AI dashboard** | any other `run_command` / `job_start` / `fleet_run`, `run_script`, `run_script_fleet`, `uninstall_package`, `device_action` reboot/shutdown/logoff/firewall_off/usb_unlock, `update_agent`, `dissolve_agent` |
+| blocked | refused (403) | the deny-list, or an admin override |
+
+An admin can move actions between tiers, so the hub's answer at call time is what counts.
+Each MCP tool's `readOnlyHint`/`destructiveHint` shows its default tier (destructive = privileged).
+
+- **Waiting.** A privileged call waits up to 60 s for the decision. Approved in time, you get the
+  result, after a line `Approved by <who> in the IT-AI dashboard (approval id apr_…); it ran:`.
+  Otherwise you get `Waiting for approval in the IT-AI dashboard (approval id apr_…): …`.
+  Tell the user it is waiting for their approval in the dashboard, then check with
+  `approval_status(id)` when they say they have decided (or after a while). **Do not resend the
+  action**: every call files a new approval request, and the stored one still runs once if
+  approved. An approval runs exactly the request that filed it, once.
+- **Denied** (`Denied by … The action did not run.`) and **expired** (no decision within 1 h) are
+  final. Report them. Do not retry or reach the same result another way; a new request is the
+  user's call.
+- **Input** (`click`, `type_text`, `press_key`) is never held: if an event needs approval, the tool
+  stops and reports the id, and the rest of the input is not sent.
+- **Fleet runs** are capped and canary-first. `fleet_run` / `run_script_fleet` take `max` (refuse
+  rather than touch more devices than this; the hub caps it at its own limit, default 10) and
+  `canary` (how many devices go first; default 1). If a canary fails the run stops: the result
+  starts `STOPPED: …` and lists the devices it did not run on. A fleet bigger than the cap is
+  refused with `[error] blast-radius cap: …`. Narrow it or ask an admin, don't loop over devices
+  one by one to get around it.
+- **Dry run.** Every change tool takes `dry_run: true` (CLI `--dry-run`): the hub answers with
+  the tier, whether it needs approval, which devices it would touch and what it would do, and
+  nothing runs. Use it before a fleet-wide or unfamiliar action, and to tell the user up front
+  that something will need their approval.
 
 ## Commands: short vs long-running
 
@@ -131,7 +173,15 @@ itai put  <device> <local> [remote_dir]    # upload (direct path; same size cave
 itai job start <device> [--cwd DIR] -- <command…>   # new
 itai job logs  <device> <id> [--offset N] [--follow] # new; --follow polls every 2 s to eof
 itai job stop  <device> <id>  ·  itai job list <device>   # new
+itai approval <id> [--wait SECS]           # check an approval request
+itai --dry-run exec|put|job start|job stop …   # the hub's plan, nothing runs
+itai --wait SECS …                         # how long to wait for an approval (default 60)
 ```
+
+A privileged action prints `Waiting for approval in the IT-AI dashboard (approval id …)` on
+stderr while it waits. Exit codes: the remote exit code (`exec`) or 0 on success; **75** = still
+waiting for approval (the id and `itai approval <id>` are on stderr); 1 = denied, expired,
+blocked or another error. `itai approval <id>` waits only when `--wait` is given.
 
 Global flags and their env equivalents: `--hub`/`HAIVE_HUB`, `--mtok`/`HIVE_MCP_TOKEN`,
 `--owner`/`HIVE_OWNER`, `--password`/`SCREEN_PW`, `--cafile`/`HAIVE_CAFILE`. **Always use the

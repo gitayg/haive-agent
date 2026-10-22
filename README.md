@@ -288,11 +288,46 @@ which is why the win here is bandwidth (screen, files) rather than latency on ti
 
 Set `HIVE_LAN=0` on the agent to opt out and bind loopback only.
 
+A **privileged** action (see below) is never sent LAN-direct: the hub answers the capability
+request with `cap: null`, because a 60 s grant would expire long before a human approves, and the
+controller sends the call over the relay, where the hub files the approval request.
+
 `itai` talks to the hub's `/m/*` API, so it needs a token: `--mtok` / `HIVE_MCP_TOKEN`, plus
 `--owner` / `HIVE_OWNER` when a hub serves several users.
 
 The token travels as `?mtok=` in the request URL, and transport errors quote that URL. `itai`
 and `it-ai-mcp` mask the value (`mtok=***`) in every error they print or return.
+
+## Approvals, tiers and dry runs
+
+From hub 3.18.0 the hub sorts every `/m` action into a tier before anything reaches a device, and
+`itai` / `it-ai-mcp` 3.10.0 understand its answers:
+
+| Tier | Hub answer | `it-ai-mcp` | `itai` |
+|---|---|---|---|
+| read, change | runs (change also notifies the owner) | the result | the result |
+| privileged | `202 {pending_approval, approval_id, poll}`; nothing runs until a human approves it in the dashboard | waits up to 60 s, polling `GET /m/approval?id=` every 2 s; returns the result if approved, else `Waiting for approval in the IT-AI dashboard (approval id apr_…)` and how to check with `approval_status` | says `Waiting for approval …` on stderr, waits `--wait SECS` (default 60); the result if approved, else the id and exit **75** |
+| blocked | `403` | `Blocked by the hub's policy: …` (tool error) | the same on stderr, exit 1 |
+
+A denied or expired approval is reported as such (MCP tool error; `itai` exit 1). Check one later
+with the `approval_status(id)` tool or `itai approval <id>` (which waits only with `--wait`). An
+approval runs the one stored request, once; re-sending the action files a new request.
+
+- **Fleet runs** (`fleet_run`, `run_script_fleet`) take `max` and `canary`, passed to the hub,
+  which refuses a fleet bigger than `max` (capped at its `fleet_max_devices`) and runs `canary`
+  devices first. A canary failure is shown as `STOPPED: …` with the devices that were skipped; a
+  refusal is shown as an error, not as "no devices".
+- **Dry run**: every MCP tool that changes something takes `dry_run: true`, and `itai` takes
+  `--dry-run` on `exec`, `put`, `job start` and `job stop`. The request goes to the hub relay with
+  `dry_run=1` (never LAN-direct, and `put` sends no file), and the hub's plan is printed: tier,
+  whether it needs approval, devices, and what it would do.
+- **Attribution**: both binaries send `X-IT-AI-Client: cli` or `mcp` on every hub request, so a
+  call made with the shared `MCP_TOKEN` is recorded as a CLI or an AI agent. A scoped token
+  carries its own kind.
+- **MCP tool annotations**: every tool carries `readOnlyHint` / `destructiveHint` from the hub's
+  default tier for the action it performs (`crates/mcp/src/policy.rs`, mirroring the hub's
+  `/m/policy`): read = read-only, privileged = destructive. An admin can change tiers on the hub;
+  the hub's answer at call time decides.
 
 ## Background jobs
 
@@ -319,7 +354,7 @@ MCP tools, same operations:
 
 | Tool | Returns |
 |---|---|
-| `job_start(device, command, cwd?)` | job id, pid and log path |
+| `job_start(device, command, cwd?, dry_run?)` | job id, pid and log path (a command off the hub's allowlist waits for approval first) |
 | `job_logs(device, id, offset?)` | a JSON line with the next `offset`, `running`, `exit_code`, `eof`, `size`, then the output text |
 | `job_stop(device, id)` | whether it was running, and the exit code |
 | `job_list(device)` | id, running or exit code, pid, start time (unix secs), command |

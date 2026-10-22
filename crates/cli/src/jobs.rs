@@ -11,7 +11,11 @@ use std::time::Duration;
 
 use clap::Subcommand;
 use it_ai_direct::op::urlencode;
+use it_ai_direct::reply::{self, Reply};
 use it_ai_direct::Controller;
+
+use crate::approval::{self, Step};
+use crate::Opts;
 
 const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -85,20 +89,40 @@ pub fn start_body(command: &[String], cwd: Option<&str>) -> serde_json::Value {
     body
 }
 
-/// Send a hub request and return its JSON, turning `{"ok":false}` into an error.
-/// reqwest errors are stripped of their URL: it carries the `mtok` token.
-async fn send(rb: reqwest::RequestBuilder) -> Result<serde_json::Value, String> {
-    let r = rb.timeout(REQUEST_TIMEOUT).send().await.map_err(|e| e.without_url().to_string())?;
-    let status = r.status();
-    let text = r.text().await.map_err(|e| e.without_url().to_string())?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|_| {
-        let snippet: String = text.chars().take(200).collect();
-        format!("hub returned HTTP {status}: {snippet}")
-    })?;
-    if !v["ok"].as_bool().unwrap_or(false) {
-        return Err(v["error"].as_str().unwrap_or("failed").to_string());
+/// Send a hub request and classify the answer. reqwest errors are stripped of
+/// their URL: it carries the `mtok` token.
+async fn send(ctl: &Controller, rb: reqwest::RequestBuilder) -> Result<Reply, String> {
+    ctl.hub_send(rb.timeout(REQUEST_TIMEOUT)).await
+}
+
+/// A read's answer as JSON, turning `{"ok":false}`, a refusal or an approval
+/// request into an error (a read is never held for a human).
+pub fn value(r: Reply) -> Result<serde_json::Value, String> {
+    match r {
+        Reply::Done(v) if v["ok"].as_bool() == Some(true) => Ok(v),
+        Reply::Done(v) => Err(v["error"].as_str().map(String::from).unwrap_or_else(|| reply::result_text(&v))),
+        Reply::Refused { error, blocked } => Err(reply::refused_text(&error, blocked)),
+        Reply::Pending(p) => Err(reply::pending_text(&p, &approval::check_hint(&p.id))),
+        Reply::DryRun(v) => Err(reply::dry_run_text(&v)),
     }
-    Ok(v)
+}
+
+/// An action: settle it (waiting for an approval, or printing a dry run and
+/// exiting), then require `{"ok":true}`.
+async fn act(ctl: &Controller, rb: reqwest::RequestBuilder, o: Opts) -> Result<serde_json::Value, String> {
+    let r = send(ctl, rb).await?;
+    match approval::resolve(ctl, r, o.wait, &mut std::io::stderr()).await {
+        Step::Run(v) => value(Reply::Done(v)),
+        Step::Stop { text, code } => approval::stop(&text, code),
+    }
+}
+
+/// `url` with `&dry_run=1` when asked for.
+fn dry(mut url: String, o: Opts) -> String {
+    if o.dry_run {
+        url.push_str("&dry_run=1");
+    }
+    url
 }
 
 /// Print one log chunk and return the offset to read from next. A response with
@@ -140,15 +164,15 @@ fn exit_label(code: Option<i64>) -> String {
     code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string())
 }
 
-pub async fn run(ctl: &Controller, target: &str, cmd: &JobCmd) -> R {
+pub async fn run(ctl: &Controller, target: &str, cmd: &JobCmd, o: Opts) -> R {
     let client = ctl.client();
     match cmd {
         JobCmd::Start { cwd, command, .. } => {
-            let v = send(client.post(start_url(ctl, target)).json(&start_body(command, cwd.as_deref()))).await?;
+            let v = act(ctl, client.post(dry(start_url(ctl, target), o)).json(&start_body(command, cwd.as_deref())), o).await?;
             println!("{}", v["id"].as_str().unwrap_or(""));
         }
         JobCmd::Logs { id, offset, follow: false, .. } => {
-            let v = send(client.get(logs_url(ctl, target, id, *offset))).await?;
+            let v = value(send(ctl, client.get(logs_url(ctl, target, id, *offset))).await?)?;
             print!("{}", v["data"].as_str().unwrap_or(""));
             let state = if v["running"].as_bool().unwrap_or(false) {
                 "running".to_string()
@@ -158,13 +182,13 @@ pub async fn run(ctl: &Controller, target: &str, cmd: &JobCmd) -> R {
             eprintln!("[next offset {} · {state}]", next_offset(&v)?);
         }
         JobCmd::Logs { id, offset, follow: true, .. } => {
-            let fetch = |off: u64| send(client.get(logs_url(ctl, target, id, off)));
+            let fetch = |off: u64| async move { value(send(ctl, client.get(logs_url(ctl, target, id, off))).await?) };
             let pause = || tokio::time::sleep(FOLLOW_INTERVAL);
             let code = follow(*offset, fetch, pause, &mut std::io::stdout()).await?;
             eprintln!("exit code: {}", exit_label(code));
         }
         JobCmd::Stop { id, .. } => {
-            let v = send(client.post(stop_url(ctl, target, id))).await?;
+            let v = act(ctl, client.post(dry(stop_url(ctl, target, id), o)), o).await?;
             if v["stopped"].as_bool().unwrap_or(false) {
                 println!("stopped {id} (exit {})", exit_label(v["exit_code"].as_i64()));
             } else {
@@ -172,7 +196,7 @@ pub async fn run(ctl: &Controller, target: &str, cmd: &JobCmd) -> R {
             }
         }
         JobCmd::List { .. } => {
-            let v = send(client.get(list_url(ctl, target))).await?;
+            let v = value(send(ctl, client.get(list_url(ctl, target))).await?)?;
             for j in v["jobs"].as_array().into_iter().flatten() {
                 let state = if j["running"].as_bool().unwrap_or(false) {
                     "running".to_string()
