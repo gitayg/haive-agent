@@ -14,6 +14,7 @@
 //   HAIVE_CAFILE    optional PEM to verify a self-signed hub cert
 mod approval;
 mod jobs;
+mod moorai;
 mod policy;
 
 use approval::{text, with_note};
@@ -21,9 +22,11 @@ use base64::Engine;
 use it_ai_direct::reply::{self, Reply, Wait};
 use it_ai_direct::{Controller, Op};
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler, ServiceExt};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::service::RequestContext;
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -214,6 +217,8 @@ struct RunPluginArgs {
 #[derive(Clone)]
 struct Srv {
     tool_router: ToolRouter<Srv>,
+    hub: String,
+    mtok: String,
     owner: String,
     /// Shared LAN-direct/relay transport. Owns the hub client, the per-device
     /// route cache, and the `/m` URL construction — `itai` drives the same one.
@@ -257,9 +262,11 @@ fn fleet_limits(max: Option<u32>, canary: Option<u32>) -> String {
 }
 
 /// The hub client: `X-IT-AI-Client: mcp` on every request, so the hub attributes
-/// a shared-token call to an AI agent.
-fn build_client() -> reqwest::Client {
-    let mut b = reqwest::Client::builder().default_headers(reply::client_headers("mcp"));
+/// a shared-token call to an AI agent, plus `extra` (a tool call's MoorAI headers).
+fn build_client(extra: reqwest::header::HeaderMap) -> reqwest::Client {
+    let mut headers = reply::client_headers("mcp");
+    headers.extend(extra);
+    let mut b = reqwest::Client::builder().default_headers(headers);
     // Trust an explicitly-provided hub CA (for LAN-direct connections to an agent
     // carrying a hub-signed leaf cert). The public hub endpoint has a real,
     // CA-issued cert and verifies against the system roots with no cafile.
@@ -303,20 +310,26 @@ fn fmt_output(v: &Value) -> String {
 
 impl Srv {
     fn new() -> Self {
-        let owner = std::env::var("HIVE_OWNER").unwrap_or_default();
-        let ctl = Controller::new(
+        Self::with(
             std::env::var("HAIVE_HUB").unwrap_or_else(|_| "http://localhost:8770".to_string()),
             std::env::var("HIVE_MCP_TOKEN").unwrap_or_default(),
-            owner.clone(),
-            build_client(),
-        );
-        Self::with(ctl, owner, Wait::default())
+            std::env::var("HIVE_OWNER").unwrap_or_default(),
+            Wait::default(),
+        )
     }
 
-    fn with(ctl: Controller, owner: String, wait: Wait) -> Self {
+    fn with(hub: String, mtok: String, owner: String, wait: Wait) -> Self {
         let mut tool_router = Self::tool_router() + Self::job_router() + Self::approval_router();
         policy::annotate(&mut tool_router);
-        Self { tool_router, owner, ctl: std::sync::Arc::new(ctl), wait }
+        let ctl = std::sync::Arc::new(Controller::new(hub.clone(), mtok.clone(), owner.clone(), build_client(Default::default())));
+        Self { tool_router, hub, mtok, owner, ctl, wait }
+    }
+
+    /// This server for one tool call whose hub requests all carry `headers`. The
+    /// call gets its own hub client, and so its own LAN-direct route cache.
+    fn with_headers(&self, headers: reqwest::header::HeaderMap) -> Self {
+        let ctl = Controller::new(self.hub.clone(), self.mtok.clone(), self.owner.clone(), build_client(headers));
+        Self { ctl: std::sync::Arc::new(ctl), ..self.clone() }
     }
 
     /// The hub client, for the `/m` actions the hub composes itself (fleet
@@ -766,6 +779,12 @@ impl Srv {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Srv {
+    async fn call_tool(&self, mut request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
+        let receipt = moorai::take(&request.name, &mut request.arguments).map(|h| self.with_headers(h));
+        let srv = receipt.as_ref().unwrap_or(self);
+        self.tool_router.call(ToolCallContext::new(srv, request, context)).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();

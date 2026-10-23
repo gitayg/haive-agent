@@ -103,6 +103,9 @@ Each MCP tool's `readOnlyHint`/`destructiveHint` shows its default tier (destruc
   the tier, whether it needs approval, which devices it would touch and what it would do, and
   nothing runs. Use it before a fleet-wide or unfamiliar action, and to tell the user up front
   that something will need their approval.
+- **`_moorai`.** A tool input may carry `_moorai: {"receipt": …}`, which MoorAI adds through
+  Claude Code, not you. Never write, copy or change it yourself. The tool never sees it; the hub
+  checks the receipt and still decides what runs.
 
 ## Commands: short vs long-running
 

@@ -20,7 +20,7 @@ fn hub(f: impl Fn(&Req) -> Option<Resp> + Send + Sync + 'static) -> FakeHub {
 }
 
 fn srv(h: &FakeHub) -> Srv {
-    Srv::with(Controller::new(h.url.clone(), "TOK".into(), "me@x.io".into(), reqwest::Client::new()), "me@x.io".into(), FAST)
+    Srv::with(h.url.clone(), "TOK".into(), "me@x.io".into(), FAST)
 }
 
 fn pending(id: &str, action: &str) -> Resp {
@@ -215,7 +215,7 @@ async fn dry_run_passes_the_flag_and_runs_nothing() {
 #[tokio::test]
 async fn the_client_header_is_sent() {
     let h = hub(|_| None);
-    let s = Srv::with(Controller::new(h.url.clone(), "TOK".into(), String::new(), build_client()), String::new(), FAST);
+    let s = Srv::with(h.url.clone(), "TOK".into(), String::new(), FAST);
     s.list_devices().await.unwrap();
     let r = &h.hits("/m/agents")[0];
     assert_eq!(r.header("X-IT-AI-Client"), Some("mcp"));

@@ -328,6 +328,24 @@ approval runs the one stored request, once; re-sending the action files a new re
   default tier for the action it performs (`crates/mcp/src/policy.rs`, mirroring the hub's
   `/m/policy`): read = read-only, privileged = destructive. An admin can change tiers on the hub;
   the hub's answer at call time decides.
+- **MoorAI approval receipts** (`it-ai-mcp` 3.11.0): any tool input may carry
+  `_moorai: {"receipt": "<receipt>"}`, which MoorAI adds through Claude Code. `it-ai-mcp` removes
+  the key before the tool runs, so the tool never sees it, and adds three headers to every hub
+  request that tool call makes (lookups, LAN-direct capability mints, relay calls, fleet calls,
+  approval polls):
+
+  | Header | Value |
+  |---|---|
+  | `X-MoorAI-Receipt` | the receipt, verbatim |
+  | `X-MoorAI-Tool` | the tool name, e.g. `run_command` |
+  | `X-MoorAI-Args` | base64url, no padding, of the tool input as received with only `_moorai` removed: no defaults from the typed arguments are added. Keys come out in sorted order (rmcp hands the server a sorted map), and numbers are re-rendered by serde_json |
+
+  No headers are sent for a dry run, when the encoded args exceed 16384 bytes, or when
+  `_moorai` is not an object with a string `receipt`; the call then runs exactly as it does
+  without one. The headers go to the hub only, never to a device on the LAN-direct leg. A
+  receipt-carrying call uses its own hub client, so it probes the LAN-direct route afresh rather
+  than reusing the cached one. `it-ai-mcp` never logs the receipt or the args; the hub decides
+  what a receipt is worth.
 
 ## Background jobs
 
