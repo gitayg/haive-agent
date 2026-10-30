@@ -29,6 +29,11 @@ pub fn run(rx: Receiver<Ev>, geo: (i32, i32, u32, u32)) {
         _ => Button::Left,
     };
     while let Ok(ev) = rx.recv() {
+        // Inject into whichever desktop has input right now. A user-session agent
+        // can follow Default <-> Screen-saver; only the SYSTEM screen helper can
+        // also reach Winlogon (UAC prompt, lock screen). On failure we stay put,
+        // exactly as before.
+        let _ = crate::securedesk::follow_input_desktop();
         let _ = match ev {
             Ev::Move(x, y) => {
                 let (ax, ay) = abs(x, y);
@@ -47,6 +52,29 @@ pub fn run(rx: Receiver<Ev>, geo: (i32, i32, u32, u32)) {
             },
         };
     }
+}
+
+/// One `/input` JSON body → an event (same fields as the viewer sends to http.rs).
+/// Used by the Windows SYSTEM screen helper, which receives the body forwarded
+/// from the session-0 service.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_body(body: &str) -> Option<Ev> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let t = v.get("type")?.as_str()?;
+    let x = v.get("x").and_then(|n| n.as_f64()).unwrap_or(0.0);
+    let y = v.get("y").and_then(|n| n.as_f64()).unwrap_or(0.0);
+    let btn = v.get("button").and_then(|n| n.as_u64()).unwrap_or(0) as u8;
+    Some(match t {
+        "move" => Ev::Move(x, y),
+        "down" => Ev::Down(btn, x, y),
+        "up" => Ev::Up(btn),
+        "scroll" => Ev::Scroll(v.get("dy").and_then(|n| n.as_i64()).unwrap_or(0) as i32),
+        "key" => Ev::Key(
+            v.get("action").and_then(|a| a.as_str()) == Some("down"),
+            v.get("key").and_then(|k| k.as_str()).unwrap_or("").to_string(),
+        ),
+        _ => return None,
+    })
 }
 
 fn map_key(k: &str) -> Option<Key> {
@@ -91,4 +119,21 @@ fn map_key(k: &str) -> Option<Key> {
             Key::Unicode(c)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_body_reads_every_event_kind() {
+        assert!(matches!(parse_body(r#"{"type":"move","x":0.5,"y":0.25}"#), Some(Ev::Move(x, y)) if x == 0.5 && y == 0.25));
+        assert!(matches!(parse_body(r#"{"type":"down","button":2,"x":0.1,"y":0.2}"#), Some(Ev::Down(2, _, _))));
+        assert!(matches!(parse_body(r#"{"type":"up","button":1}"#), Some(Ev::Up(1))));
+        assert!(matches!(parse_body(r#"{"type":"scroll","dy":-3}"#), Some(Ev::Scroll(-3))));
+        assert!(matches!(parse_body(r#"{"type":"key","action":"down","key":"a"}"#), Some(Ev::Key(true, k)) if k == "a"));
+        assert!(matches!(parse_body(r#"{"type":"key","action":"up","key":"Enter"}"#), Some(Ev::Key(false, _))));
+        assert!(parse_body(r#"{"type":"teleport"}"#).is_none());
+        assert!(parse_body("not json").is_none());
+    }
 }

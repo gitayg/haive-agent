@@ -11,6 +11,14 @@ pub struct Grabber {
     pub index: usize,
 }
 
+/// One capture scaled to the output width, with the size it was captured at (for
+/// mapping the pointer, which is read in captured pixels).
+pub struct Frame {
+    pub img: image::RgbImage,
+    pub src_w: u32,
+    pub src_h: u32,
+}
+
 /// Why a capture failed when the machine simply has no screen to copy. Windows
 /// composes the desktop through a display output; with the lid shut, the panel
 /// powered off, or no monitor attached at all, Desktop Duplication has nothing to
@@ -56,7 +64,7 @@ fn gdi_grab() -> Option<image::RgbImage> {
                     bi.bmiHeader.biHeight = -h; // negative = top-down rows
                     bi.bmiHeader.biPlanes = 1;
                     bi.bmiHeader.biBitCount = 32;
-                    bi.bmiHeader.biCompression = BI_RGB as u32;
+                    bi.bmiHeader.biCompression = BI_RGB;
                     let mut buf = vec![0u8; (w as usize) * (h as usize) * 4];
                     if GetDIBits(mem, bmp, 0, h as u32, buf.as_mut_ptr() as *mut c_void, &mut bi, DIB_RGB_COLORS) != 0
                         && buf.iter().any(|&b| b != 0)
@@ -136,26 +144,39 @@ impl Grabber {
         })
     }
 
+    /// Capture → JPEG without the pointer arrow (the MJPEG `/stream`).
     pub fn grab_jpeg(&self, quality: u8, max_width: u32) -> Option<Vec<u8>> {
-        self.grab(quality, max_width).ok()
+        self.grab_rgb(max_width).ok().map(|f| jpeg(&f.img, quality))
     }
 
-    /// Capture → JPEG, or a human-readable reason it couldn't. Tries xcap first
-    /// (X11 + wlroots-Wayland); on a Wayland session where that fails (GNOME/KDE
-    /// have no wlr-screencopy), falls back to the xdg-desktop-portal ScreenCast
-    /// path, whose reason (e.g. "consent pending") is surfaced to the caller.
+    /// Capture → JPEG, or a human-readable reason it couldn't. Draws a small arrow
+    /// at the pointer when it can be read, so the model reading `/frame` sees where
+    /// the mouse is. Same fallbacks and messages as `grab_rgb`.
     pub fn grab(&self, quality: u8, max_width: u32) -> Result<Vec<u8>, String> {
+        let frame = self.grab_rgb(max_width)?;
+        let pos = crate::cursor::position(self.index);
+        Ok(jpeg(&with_arrow(frame, pos), quality))
+    }
+
+    /// Capture → RGB scaled down to `max_width` (0 = no limit), plus the size it was
+    /// captured at. Tries xcap first (X11 + wlroots-Wayland); on a Wayland session
+    /// where that fails (GNOME/KDE have no wlr-screencopy), falls back to the
+    /// xdg-desktop-portal ScreenCast path, whose reason (e.g. "consent pending") is
+    /// surfaced to the caller.
+    pub fn grab_rgb(&self, max_width: u32) -> Result<Frame, String> {
+        let raw = self.grab_full()?;
+        let (src_w, src_h) = raw.dimensions();
+        Ok(Frame { img: scale(raw, max_width), src_w, src_h })
+    }
+
+    fn grab_full(&self) -> Result<image::RgbImage, String> {
         if let Some(img) = no_panic(|| self.monitor().and_then(|m| m.capture_image().ok())) {
-            return Ok(encode_rgb(image::DynamicImage::ImageRgba8(img).to_rgb8(), quality, max_width));
+            return Ok(image::DynamicImage::ImageRgba8(img).to_rgb8());
         }
         #[cfg(target_os = "linux")]
         if crate::wayland::is_wayland() {
             return match crate::wayland::capture_rgb() {
-                Ok((w, h, rgb)) => {
-                    let buf = image::RgbImage::from_raw(w, h, rgb)
-                        .ok_or_else(|| "malformed Wayland frame".to_string())?;
-                    Ok(encode_rgb(buf, quality, max_width))
-                }
+                Ok((w, h, rgb)) => image::RgbImage::from_raw(w, h, rgb).ok_or_else(|| "malformed Wayland frame".to_string()),
                 Err(e) => Err(e.message()),
             };
         }
@@ -163,7 +184,7 @@ impl Grabber {
         // still works on some setups DXGI gives up on.
         #[cfg(windows)]
         if let Some(img) = no_panic(gdi_grab) {
-            return Ok(encode_rgb(img, quality, max_width));
+            return Ok(img);
         }
         #[cfg(windows)]
         if no_display() {
@@ -179,6 +200,14 @@ impl Grabber {
             None => (0, 0, 1920, 1080),
         }
     }
+}
+
+/// Geometry of the monitor `Grabber { index }` captures (falling back to the first,
+/// as `Grabber::monitor` does): (x, y, width, height, scale_factor), in the
+/// platform's desktop coordinates — points on macOS, pixels on Windows and X11.
+pub fn monitor_geometry(index: usize) -> Option<(i32, i32, u32, u32, f32)> {
+    let m = Grabber { index }.monitor()?;
+    no_panic(|| Some((m.x().ok()?, m.y().ok()?, m.width().ok()?, m.height().ok()?, m.scale_factor().unwrap_or(1.0))))
 }
 
 /// Grab a single frame from the given camera index → JPEG. Grabs a few frames
@@ -240,17 +269,32 @@ pub fn frame_to_jpeg(cam: &mut nokhwa::Camera, quality: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Resize (if wider than max_width) and JPEG-encode an RGB image.
-fn encode_rgb(mut rgb: image::RgbImage, quality: u8, max_width: u32) -> Vec<u8> {
+/// Resize down to `max_width` keeping aspect ratio (never up; 0 = no limit).
+pub fn scale(rgb: image::RgbImage, max_width: u32) -> image::RgbImage {
     if max_width > 0 && rgb.width() > max_width {
         let h = rgb.height() * max_width / rgb.width();
-        rgb = image::imageops::resize(&rgb, max_width, h, image::imageops::FilterType::Triangle);
+        return image::imageops::resize(&rgb, max_width, h, image::imageops::FilterType::Triangle);
     }
-    let (w, h) = (rgb.width(), rgb.height());
+    rgb
+}
+
+/// JPEG-encode an RGB image.
+pub fn jpeg(rgb: &image::RgbImage, quality: u8) -> Vec<u8> {
     let mut out = Vec::new();
     let mut enc = JpegEncoder::new_with_quality(&mut out, quality);
-    let _ = enc.encode(rgb.as_raw(), w, h, image::ExtendedColorType::Rgb8);
+    let _ = enc.encode(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8);
     out
+}
+
+/// The `/frame` image: the scaled capture with the pointer arrow drawn at `pos`
+/// (physical pixels on the captured monitor), when it is on screen.
+fn with_arrow(frame: Frame, pos: Option<(i32, i32)>) -> image::RgbImage {
+    let mut img = frame.img;
+    let out = img.dimensions();
+    if let Some((x, y)) = crate::cursor::to_output(pos, (frame.src_w, frame.src_h), out) {
+        crate::cursor::draw_arrow(&mut img, x, y);
+    }
+    img
 }
 
 pub fn camera_snapshot(index: u32, quality: u8) -> Option<Vec<u8>> {
@@ -279,5 +323,34 @@ mod capture_panic_tests {
     fn working_backend_still_returns_its_value() {
         assert_eq!(no_panic(|| Some(42u32)), Some(42));
         assert_eq!(no_panic(|| None::<u32>), None);
+    }
+}
+
+#[cfg(test)]
+mod frame_arrow_tests {
+    use super::{with_arrow, Frame};
+    use image::{Rgb, RgbImage};
+
+    fn frame(w: u32, h: u32, src_w: u32, src_h: u32) -> Frame {
+        Frame { img: RgbImage::from_pixel(w, h, Rgb([128, 128, 128])), src_w, src_h }
+    }
+
+    /// `/frame` draws the arrow at the pointer, mapped from captured pixels into
+    /// the scaled output (2x retina capture shown at half size here).
+    #[test]
+    fn frame_gets_the_arrow_at_the_scaled_pointer() {
+        let img = with_arrow(frame(800, 500, 1600, 1000), Some((400, 300)));
+        assert_eq!(img.get_pixel(200, 150).0, [0, 0, 0], "arrow tip at the scaled pointer");
+        assert_eq!(img.get_pixel(201, 153).0, [255, 255, 255], "white body below-right of the tip");
+        let marked = img.pixels().filter(|p| p.0 != [128, 128, 128]).count();
+        assert!(marked > 80, "only {marked} px drawn");
+    }
+
+    #[test]
+    fn no_pointer_or_off_monitor_leaves_the_frame_alone() {
+        for pos in [None, Some((1600, 10)), Some((-3, 4))] {
+            let img = with_arrow(frame(800, 500, 1600, 1000), pos);
+            assert!(img.pixels().all(|p| p.0 == [128, 128, 128]), "{pos:?} drew");
+        }
     }
 }

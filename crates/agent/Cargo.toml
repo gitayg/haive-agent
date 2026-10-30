@@ -86,6 +86,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     # capture.rs: GDI BitBlt fallback for when DXGI Desktop Duplication refuses.
     "Win32_Graphics_Gdi",
+    # securedesk.rs: OpenInputDesktop/SetThreadDesktop (follow the UAC / lock
+    # screen desktop) and LoadLibrary for SendSAS (sas.dll). cursor.rs: GetCursorInfo.
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # winbootstrap.rs (native winget bootstrap via the WinRT AppX PackageManager) +
 # winupdate.rs (native OS-update check/install via the Windows Update Agent COM
@@ -98,6 +103,11 @@ windows = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_UpdateAgent",
+    # h264.rs: the Media Foundation H.264 encoder MFT.
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Variant",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
 ] }
 
 # Wayland screen capture on GNOME/KDE (no wlr-screencopy): the xdg-desktop-portal

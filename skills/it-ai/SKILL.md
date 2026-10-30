@@ -48,7 +48,7 @@ otherwise. Either way the hub authorizes, deny-list-checks and audits the call f
 | File from device → local | `download_file(device, remote_path, save_as?)` (default `~/Downloads/<name>`) |
 | Small file (≤ 100 MB) local → device | `upload_file(device, local_path, remote_dir?)` |
 | Large file local → device | `push_file(device, local_path, remote_dir?)` |
-| See / drive the screen | `screenshot`, `click(x, y, button?)`, `type_text`, `press_key` |
+| See / drive the screen | `screenshot` (agents 3.13.0+ draw an arrow at the pointer), `click(x, y, button?)`, `type_text`, `press_key` |
 | Webcam photo | `camera_snapshot(device, index?)` |
 | Inventory / state | `system_report(device, kind)` kind: hardware, av, encryption, firewall, processes, services, network, packages |
 | Security score | `compliance_posture(device)`; all devices: `fleet_compliance` |

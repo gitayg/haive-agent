@@ -290,6 +290,35 @@ stderr. This covers the `--background` relaunch, the trim at every start and the
 a root agent whose `~/.it-ai/agent.log`, or `~/.it-ai`, another user turned into a link never
 appends to, chmods or truncates the file it points at. Windows opens the path as before.
 
+## Live screen
+
+From agent 3.13.0 the live view is delta-encoded (`GET /screen`; wire format in
+[docs/SCREEN-PROTOCOL.md](docs/SCREEN-PROTOCOL.md)). `/frame` and the MJPEG `/stream` are
+unchanged, so older hubs keep working.
+
+- **Only what changed travels.** The screen is diffed in 64-pixel tiles; changed tiles are merged
+  into rectangles and sent as JPEGs. An idle desktop sends a few KB per update instead of a full
+  frame, and the agent long-polls (up to 1 s) instead of re-sending an unchanged screen.
+- **H.264 where the OS has an encoder.** macOS (VideoToolbox) and Windows (Media Foundation's
+  software encoder) encode Constrained Baseline H.264 that the browser decodes with WebCodecs.
+  No codec is bundled. Linux, or any encoder failure, falls back to tiles for that session.
+- **The viewer sets quality.** Each request carries `q` (JPEG quality) and `w` (maximum width);
+  the hub's viewer adjusts them from measured round-trip time. The agent reports `enc_ms` and
+  `wait_ms` so network time can be told apart from capture time.
+- **The pointer is visible.** `/screen` reports the pointer position for the viewer to draw;
+  `/frame` (what the `screenshot` tool returns) has a small arrow drawn at the pointer.
+- **Windows secure desktop.** When the agent runs as a LocalSystem service in session 0, it starts
+  one helper process as SYSTEM inside the console session. The helper follows the input desktop,
+  so UAC prompts, the lock screen and the Ctrl+Alt+Del screen can be seen and clicked. Every
+  request to the helper is authenticated with a per-launch key (HMAC, replay-checked) — loopback
+  alone is never trusted — and the helper exits when the service does or after 10 idle minutes.
+  If the helper can't start, screenshots fall back to the one-shot user-session capture.
+- **Ctrl+Alt+Del (`POST /sas`).** Windows service only. Windows blocks software-generated
+  Ctrl+Alt+Del by default; the agent never changes that policy. An admin can allow it with
+  `reg add HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System /v SoftwareSASGeneration /t REG_DWORD /d 1 /f`
+  (or Group Policy: *Disable or enable software Secure Attention Sequence* → Services). Until
+  then `/sas` answers 409 with that instruction.
+
 ## LAN-direct
 
 When a controller and an agent share a network, traffic goes **straight over the LAN** instead of

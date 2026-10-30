@@ -21,9 +21,13 @@
 // impossible to diagnose remotely.
 #![cfg(windows)]
 
+mod client;
+mod helper;
+
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::{
@@ -101,6 +105,15 @@ fn ensure_helper(exe: &Path, dir: &str) -> Result<String, String> {
 /// reason it couldn't. The caller stays online regardless — only this screenshot
 /// fails.
 pub fn capture_once() -> Result<Vec<u8>, String> {
+    // Preferred: the persistent SYSTEM helper (follows the lock screen / UAC).
+    // Anything short of a frame from it falls through to the one-shot user-token
+    // path below — screenshots never get worse than before the helper existed.
+    // The no-display reason is final either way, so don't pay for a second try.
+    match capture_via_helper() {
+        Ok(jpeg) => return Ok(jpeg),
+        Err(reason) if reason == crate::capture::NO_DISPLAY => return Err(reason),
+        Err(_) => {}
+    }
     // A locked desktop has nothing to capture — say so plainly instead of
     // spawning a helper that can only fail.
     if workstation_locked() {
@@ -199,4 +212,41 @@ unsafe fn run_in_active_session(cmdline: &str) -> Result<(), String> {
     }
     CloseHandle(primary);
     result
+}
+
+/// Session 0: serve one `/screen` request through the SYSTEM helper running in
+/// the active console session (it can follow the secure desktop). Err = the
+/// helper isn't available; the reason is shown to the operator.
+pub fn screen(query: &str) -> Result<crate::screen::Reply, String> {
+    // /screen long-polls up to ~1 s on the helper; leave room for the encode.
+    let (status, ctype, body) = client::call("GET", &format!("/screen?{query}"), b"", Duration::from_secs(10))?;
+    Ok(crate::screen::Reply { status, ctype: static_ctype(&ctype), body })
+}
+
+/// The protocol only ever answers these two content types.
+fn static_ctype(ctype: &str) -> &'static str {
+    if ctype.eq_ignore_ascii_case("application/x-itai-screen") {
+        "application/x-itai-screen"
+    } else {
+        "text/plain; charset=utf-8"
+    }
+}
+
+/// Session 0: forward one `/input` JSON body to the helper. False = not delivered.
+pub fn forward_input(body: &str) -> bool {
+    matches!(client::call("POST", "/input", body.as_bytes(), Duration::from_secs(3)), Ok((204, _, _)))
+}
+
+/// `--screen-helper <SPEC>`: run as the SYSTEM helper inside the console session.
+pub fn run_screen_helper(spec: &str) -> ! {
+    helper::run(spec)
+}
+
+/// One JPEG from the SYSTEM helper. Unlike the user-token one-shot it also sees
+/// the lock screen and UAC prompts.
+fn capture_via_helper() -> Result<Vec<u8>, String> {
+    match client::call("GET", "/frame", b"", Duration::from_secs(15))? {
+        (200, _, jpeg) if !jpeg.is_empty() => Ok(jpeg),
+        (_, _, reason) => Err(String::from_utf8_lossy(&reason).into_owned()),
+    }
 }

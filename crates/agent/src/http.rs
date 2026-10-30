@@ -437,6 +437,8 @@ fn privileged_path(path: &str) -> bool {
         path,
         "/exec"
             | "/frame"
+            | "/screen"
+            | "/sas"
             | "/camera"
             | "/stream"
             | "/camstream"
@@ -524,6 +526,8 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         (Method::Post, "/ai/chat") => ai_chat_forward(&mut req),
         (Method::Post, "/ai/apply") => ai_apply_forward(&mut req),
         (Method::Get, "/frame") => frame_ep(cfg),
+        (Method::Get, "/screen") => screen_ep(cfg, &url),
+        (Method::Post, "/sas") => sas_ep(),
         (Method::Get, "/camera") => camera_ep(&url, cfg),
         (Method::Post, "/input") => {
             input_ep(&prebody, tx);
@@ -904,6 +908,32 @@ fn frame_ep(cfg: &Config) -> Resp {
     }
 }
 
+/// GET /screen → one delta update (docs/SCREEN-PROTOCOL.md). A session-0
+/// service has no desktop, so it goes through the console-session helper.
+fn screen_ep(cfg: &Config, url: &str) -> Resp {
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    #[cfg(windows)]
+    let reply = if crate::winsession::is_session0() {
+        match crate::winsession::screen(query) {
+            Ok(r) => r,
+            Err(reason) => return Response::from_string(reason).with_status_code(503),
+        }
+    } else {
+        crate::screen::handle(&cfg.grabber, cfg.quality, cfg.max_width, query)
+    };
+    #[cfg(not(windows))]
+    let reply = crate::screen::handle(&cfg.grabber, cfg.quality, cfg.max_width, query);
+    Response::from_data(reply.body).with_header(hdr("Content-Type", reply.ctype)).with_status_code(reply.status)
+}
+
+/// POST /sas → Ctrl+Alt+Del (Windows service only).
+fn sas_ep() -> Resp {
+    match crate::securedesk::sas() {
+        Ok(()) => Response::from_string("").with_status_code(204),
+        Err(reason) => Response::from_string(reason).with_status_code(409),
+    }
+}
+
 /// Boundary header for one JPEG frame in a multipart/x-mixed-replace stream.
 fn frame_head(len: usize) -> Vec<u8> {
     format!("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len}\r\n\r\n").into_bytes()
@@ -1061,6 +1091,10 @@ fn camera_ep(url: &str, cfg: &Config) -> Resp {
 /// `body` is read by `handle` rather than here: the LAN-direct capability binds to
 /// the event kind inside it, and tiny_http's request reader can only be drained once.
 fn input_ep(body: &str, tx: &Sender<Ev>) {
+    #[cfg(windows)]
+    if crate::winsession::is_session0() && crate::winsession::forward_input(body) {
+        return;
+    }
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(ev) = parse_ev(&v) {
             let _ = tx.send(ev);

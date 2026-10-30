@@ -4,10 +4,12 @@
 // IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
 mod analysis;
 mod capture;
+mod cursor;
 mod config;
 mod discovery;
 mod entryclean;
 mod entrytoken;
+mod h264;
 mod http;
 mod input;
 mod jobs;
@@ -26,6 +28,8 @@ mod vpn;
 #[cfg(windows)]
 mod tray;
 mod schedule;
+mod screen;
+mod securedesk;
 mod shell;
 mod tls;
 #[cfg(target_os = "linux")]
@@ -90,6 +94,14 @@ struct Args {
     /// Windows session-0 service to capture from the active user's session.
     #[arg(long, hide = true, value_name = "FILE")]
     capture_once: Option<String>,
+    /// internal: run as the Windows SYSTEM screen helper inside the console
+    /// session (spawned by the session-0 service). Windows only.
+    #[arg(long, hide = true, value_name = "SPEC")]
+    screen_helper: Option<String>,
+    /// internal: encode a few seconds of the screen to this Annex-B .h264 file
+    /// with the OS encoder, print a summary and exit (field check of h264.rs).
+    #[arg(long, hide = true, value_name = "FILE")]
+    h264_selftest: Option<String>,
 }
 
 /// Where a detached agent's stdout/stderr land, so "it just vanished" is always
@@ -334,6 +346,7 @@ fn collect_sysinfo() -> serde_json::Value {
         "cameras": cameras,
         "cameras_present": cameras_present,
         "microphones": microphones,
+        "screen": screen::capabilities(),
     })
 }
 
@@ -495,6 +508,24 @@ fn main() {
     // One-shot capture mode: grab a single frame to a file and exit. The Windows
     // session-0 service invokes this inside the active user's session (which can
     // reach the desktop) and reads back the file.
+    if let Some(out) = args.h264_selftest.clone() {
+        match h264::selftest(&out) {
+            Ok(summary) => {
+                println!("{summary}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("h264 selftest failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    if let Some(spec) = args.screen_helper.clone() {
+        winsession::run_screen_helper(&spec);
+    }
+
     if let Some(file) = args.capture_once.clone() {
         let quality: u8 = env_or("SCREEN_QUALITY", "60").parse().unwrap_or(60);
         let max_width: u32 = env_or("SCREEN_MAXW", "1600").parse().unwrap_or(1600);
