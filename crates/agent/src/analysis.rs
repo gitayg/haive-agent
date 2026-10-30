@@ -123,26 +123,18 @@ fn snapshot() -> BTreeMap<String, String> {
         .collect()
 }
 
-fn base_of(hub: &str) -> String {
-    let h = hub.trim_end_matches('/');
-    if h.starts_with("http://") || h.starts_with("https://") {
-        h.to_string()
-    } else {
-        format!("http://{h}")
-    }
-}
-
 /// POST the given sections to the hub. Returns whether the hub wants a full
 /// snapshot (it has no record for us — e.g. it restarted).
 pub(crate) fn analysis_url(base: &str, relay_id: &str, token: &str) -> String {
     format!("{base}/relay/analysis?{}", auth_query(relay_id, token))
 }
 
-fn post(base: &str, cred: &RelayCred, sections: &BTreeMap<String, String>, full: bool) -> bool {
+fn post(cred: &RelayCred, sections: &BTreeMap<String, String>, full: bool) -> bool {
     let relay_id = cred.relay_id();
-    let url = analysis_url(base, relay_id, &cred.token());
-    let body = serde_json::json!({ "relay_id": relay_id, "sections": sections, "full": full });
-    match ureq::post(&url).timeout(Duration::from_secs(20)).send_json(body) {
+    let url = analysis_url(&cred.base(), relay_id, &cred.token());
+    let body = serde_json::json!({ "relay_id": relay_id, "sections": sections, "full": full }).to_string();
+    let body = crate::relay_redirect::Body::Bytes(Some("application/json"), body.as_bytes());
+    match crate::relay_redirect::post(cred, &url, body, Some(Duration::from_secs(20))) {
         Ok(r) => r
             .into_json::<serde_json::Value>()
             .ok()
@@ -153,9 +145,8 @@ fn post(base: &str, cred: &RelayCred, sections: &BTreeMap<String, String>, full:
 }
 
 /// Spawn the analysis loop: full snapshot now, then every INTERVAL push deltas.
-pub fn start(hub: String, cred: Arc<RelayCred>) {
+pub fn start(cred: Arc<RelayCred>) {
     std::thread::spawn(move || {
-        let base = base_of(&hub);
         let mut last: BTreeMap<String, String> = BTreeMap::new();
         let mut cycle: u32 = 0;
         loop {
@@ -171,9 +162,9 @@ pub fn start(hub: String, cred: Arc<RelayCred>) {
             };
             // Always POST at least once (an empty ping still lets the hub ask for
             // a full resync if it lost our record); resend full if it does.
-            let want_full = post(&base, &cred, &changed, full_due);
+            let want_full = post(&cred, &changed, full_due);
             if want_full && !full_due {
-                post(&base, &cred, &snap, true);
+                post(&cred, &snap, true);
             }
             last = snap;
             cycle = cycle.wrapping_add(1);

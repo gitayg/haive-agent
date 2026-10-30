@@ -76,6 +76,11 @@ or dissolving a device also deletes its entry.
 supplied on this start (flag or env), fall back to it with `ds=1` to re-enroll. Otherwise
 keep retrying slowly (≥ 60 s); never exit.
 
+**A hub redirect (agent 3.12.0) never changes `relay.cred`.** A `307`/`308` followed within
+the hub's https host family moves the address relay calls go to for this run only; `relay.cred`
+keeps `hub` = the normalized `--relay`, so rule 1 above still finds the device secret on the
+next start.
+
 **Every relay URL carries `id=<relay_id>`.** Add it where it is missing today: config
 poll, cap-key, hub cert.
 

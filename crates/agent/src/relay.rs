@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use base64::Engine;
 
+use crate::relay_redirect::{self, Body, Rule};
 use crate::relaycred::{auth_query, urlencode, RelayCred};
 
 fn hello_payload(relay_id: &str, name: &str, sysinfo: &serde_json::Value) -> Vec<u8> {
@@ -56,14 +57,18 @@ pub(crate) fn loopback_url(lp: u16, path: &str, cred: &RelayCred) -> String {
 
 /// One hello. Always asks for a device secret (`ds=1`); a 200 carrying one
 /// switches every caller to it. Serialized on `hello_lock` so two hellos can't
-/// both mint and leave us on the secret the hub already replaced.
-fn post_hello(base: &str, name: &str, sysinfo: &serde_json::Value, cred: &RelayCred) -> bool {
+/// both mint and leave us on the secret the hub already replaced. A redirect not
+/// followed is a failure (`relay_redirect`), never "connected".
+fn post_hello(name: &str, sysinfo: &serde_json::Value, cred: &RelayCred) -> bool {
+    hello(name, sysinfo, cred, relay_redirect::same_family)
+}
+
+fn hello(name: &str, sysinfo: &serde_json::Value, cred: &RelayCred, follow: Rule) -> bool {
     let _g = cred.hello_lock.lock().unwrap_or_else(|e| e.into_inner());
     let (token, was_device) = (cred.token(), cred.is_device());
     let rid = cred.relay_id();
-    let sent = ureq::post(&hello_url(base, rid, &token))
-        .timeout(Duration::from_secs(10))
-        .send_bytes(&hello_payload(rid, name, sysinfo));
+    let payload = hello_payload(rid, name, sysinfo);
+    let sent = relay_redirect::send(cred, "POST", &hello_url(&cred.base(), rid, &token), Body::Bytes(None, &payload), Some(Duration::from_secs(10)), follow);
     match sent {
         Ok(resp) => {
             let status = resp.status();
@@ -89,38 +94,37 @@ fn post_hello(base: &str, name: &str, sysinfo: &serde_json::Value, cred: &RelayC
     }
 }
 
-pub fn relay_loop(hub: String, name: String, sysinfo: serde_json::Value, cred: Arc<RelayCred>) {
-    let base = crate::relaycred::normalize_hub(&hub);
+pub fn relay_loop(name: String, sysinfo: serde_json::Value, cred: Arc<RelayCred>) {
     let relay_id = cred.relay_id().to_string();
 
     // Register (retry until the hub is reachable) before polling.
-    while !post_hello(&base, &name, &sysinfo, &cred) {
+    while !post_hello(&name, &sysinfo, &cred) {
         std::thread::sleep(Duration::from_secs(3));
     }
-    println!("relay: connected to {base} as {relay_id}");
+    println!("relay: connected to {} as {relay_id}", cred.base());
 
     // Heartbeat: re-send HELLO (fresh CPU/RAM) so the hub keeps us live. 10s keeps
     // us well inside the hub's staleness window (tolerates a few missed beats) and
     // acts as an app-level keepalive so NAT/proxy idle timeouts don't drop us.
     {
-        let (b, nm, si, c) = (base.clone(), name.clone(), sysinfo.clone(), Arc::clone(&cred));
+        let (nm, si, c) = (name.clone(), sysinfo.clone(), Arc::clone(&cred));
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_secs(10));
-            let _ = post_hello(&b, &nm, &si, &c);
+            let _ = post_hello(&nm, &si, &c);
         });
     }
 
     loop {
-        // Rebuilt every time: the credential may have switched since the last poll.
-        match ureq::get(&poll_url(&base, &relay_id, &cred.token())).timeout(Duration::from_secs(35)).call() {
+        // Rebuilt every time: the credential or the base may have switched since the last poll.
+        match relay_redirect::get(&cred, &poll_url(&cred.base(), &relay_id, &cred.token()), Some(Duration::from_secs(35))) {
             Ok(resp) => {
                 if resp.status() == 204 {
                     continue;
                 }
                 let mut body = String::new();
                 if resp.into_reader().read_to_string(&mut body).is_ok() && !body.is_empty() {
-                    let (b, c) = (base.clone(), Arc::clone(&cred));
-                    std::thread::spawn(move || handle_req(&b, &c, &body));
+                    let c = Arc::clone(&cred);
+                    std::thread::spawn(move || handle_req(&c, &body));
                 }
             }
             Err(_) => {
@@ -130,7 +134,7 @@ pub fn relay_loop(hub: String, name: String, sysinfo: serde_json::Value, cred: A
                 // not on the next 10s heartbeat — so the hub's wait-for-reconnect
                 // lands the command instead of reporting us unreachable. Jitter
                 // keeps a fleet from reconnecting in lockstep.
-                while !post_hello(&base, &name, &sysinfo, &cred) {
+                while !post_hello(&name, &sysinfo, &cred) {
                     let jitter = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| (d.subsec_nanos() as u64) % 250)
@@ -142,7 +146,7 @@ pub fn relay_loop(hub: String, name: String, sysinfo: serde_json::Value, cred: A
     }
 }
 
-fn handle_req(base: &str, cred: &RelayCred, body: &str) {
+fn handle_req(cred: &RelayCred, body: &str) {
     let relay_id = cred.relay_id();
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let req_id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -155,11 +159,14 @@ fn handle_req(base: &str, cred: &RelayCred, body: &str) {
         .filter(|s| !s.is_empty())
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok());
 
-    let reply = |status: u16, ctype: &str| reply_url(base, relay_id, &cred.token(), req_id, status, ctype);
+    let reply = |status: u16, ctype: &str| reply_url(&cred.base(), relay_id, &cred.token(), req_id, status, ctype);
+    let short = |status: u16, msg: &str| {
+        let _ = relay_redirect::post(cred, &reply(status, "text/plain"), Body::Bytes(None, msg.as_bytes()), None);
+    };
 
     let lp = crate::http::loopback_port();
     if lp == 0 {
-        let _ = ureq::post(&reply(503, "text/plain")).send_string("agent loopback not ready");
+        short(503, "agent loopback not ready");
         return;
     }
 
@@ -179,15 +186,17 @@ fn handle_req(base: &str, cred: &RelayCred, body: &str) {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
         Err(e) => {
-            let _ = ureq::post(&reply(502, "text/plain")).send_string(&format!("relay self-call failed: {e}"));
+            short(502, &format!("relay self-call failed: {e}"));
             return;
         }
     };
     let status = resp.status();
     let ctype = resp.header("Content-Type").unwrap_or("application/octet-stream").to_string();
     // Stream the response body straight up as the reply's (chunked) upload; if
-    // the hub stops reading (browser gone), this write fails and we stop.
-    let _ = ureq::post(&reply(status, &ctype)).send(resp.into_reader());
+    // the hub stops reading (browser gone), this write fails and we stop. A
+    // streamed body can't be re-sent, so a redirect here fails (and is logged);
+    // the next hello follows it and moves the base for the replies after it.
+    let _ = relay_redirect::post(cred, &reply(status, &ctype), Body::Stream(None, Box::new(resp.into_reader())), None);
 }
 
 #[cfg(test)]
@@ -223,6 +232,64 @@ mod tests {
         assert!(before.ends_with(&format!("dtok={}", crate::agent_direct_token("htok_e", "hc-1"))));
         cred.issued("hdev_x").unwrap();
         assert_eq!(super::loopback_url(9, "/exec", &cred), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn cred(hub: &str, tag: &str) -> (crate::relaycred::RelayCred, std::path::PathBuf) {
+        use crate::relaycred::{RelayCred, Resolved};
+        let dir = std::env::temp_dir().join(format!("it-ai-relay-{tag}-{}", std::process::id()));
+        let r = Resolved { token: "htok_e".into(), is_device: false, supplied_enroll: Some("htok_e".into()) };
+        (RelayCred::new(hub, "hc-1", dir.join("relay.cred"), r), dir)
+    }
+
+    #[test]
+    fn a_hello_answered_with_a_redirect_is_not_connected() {
+        use crate::relay_redirect::testhub;
+        for (st, to) in [(308, "https://evil.example{path}?{query}"), (307, "http://127.0.0.1:{port}/moved{path}?{query}"), (301, "https://evil.example{path}")] {
+            let (hub, seen) = testhub::start(st, to, r#"{"device_secret":"hdev_new"}"#);
+            let (c, dir) = cred(&hub, &format!("no{st}"));
+            assert!(!super::post_hello("n", &serde_json::json!({}), &c), "{st} to {to} must not count as connected");
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            assert_eq!((c.token(), c.base()), ("htok_e".to_string(), hub));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_hello_follows_the_hub_within_its_family_and_keeps_the_saved_hub() {
+        use crate::relay_redirect::testhub;
+        use crate::relaycred::{load, resolve};
+        let (hub, seen) = testhub::start(308, "http://127.0.0.1:{port}/moved{path}?{query}", r#"{"device_secret":"hdev_new"}"#);
+        let (c, dir) = cred(&hub, "follow");
+        assert!(super::hello("n", &serde_json::json!({}), &c, testhub::same_host));
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[1].0, "/moved/relay/hello");
+            assert_eq!(seen[0].2, seen[1].2, "the hello body is re-sent unchanged");
+            assert!(String::from_utf8_lossy(&seen[1].2).contains("\"relay_id\":\"hc-1\""));
+        }
+        assert_eq!(c.base(), format!("{hub}/moved"));
+        assert_eq!((c.token(), c.is_device()), ("hdev_new".to_string(), true));
+        // The next start still finds the secret under the --relay it was given.
+        let r = resolve(&hub, None, None, load(c.file()).as_ref()).unwrap();
+        assert_eq!((r.token.as_str(), r.is_device), ("hdev_new", true));
+        // Later calls go straight to the new base.
+        assert!(super::post_hello("n", &serde_json::json!({}), &c));
+        assert_eq!(seen.lock().unwrap().last().unwrap().0, "/moved/relay/hello");
+        assert!(super::reply_url(&c.base(), "hc-1", &c.token(), 1, 200, "x").starts_with(&format!("{hub}/moved/relay/reply?")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reply_answered_with_a_redirect_fails() {
+        use crate::relay_redirect::{post, testhub, Body};
+        let (hub, seen) = testhub::start(308, "https://evil.example{path}?{query}", "");
+        let (c, dir) = cred(&hub, "reply");
+        let url = super::reply_url(&c.base(), "hc-1", &c.token(), 7, 200, "text/plain");
+        assert!(matches!(post(&c, &url, Body::Stream(None, Box::new(&b"out"[..])), None), Err(ureq::Error::Status(308, _))));
+        assert!(matches!(post(&c, &url, Body::Bytes(None, b"short"), None), Err(ureq::Error::Status(308, _))));
+        assert_eq!(seen.lock().unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

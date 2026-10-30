@@ -201,6 +201,29 @@ From agent 3.7.0, with hub 3.16.0 or later:
   `POST /persist` never do this — they keep a working secret even though they carry the
   original start's arguments.
 
+From agent 3.12.0, **a hub that answers with a redirect is not a hub that answered.** Before
+3.12.0 a hello answered with `307`/`308` counted as connected, so when the hub's address moved
+the agent kept logging `relay: connected` while no check-in or reply reached the hub. Now, on
+every `/relay/*` call (hello, poll, reply, config, cap-key, hub cert, analysis, AI relay):
+- **A `307`/`308` is followed only to `https` on the same host or a subdomain of it**, on the
+  same port or 443, at most 3 hops, re-sending the same method and body. For example
+  `https://crane.glick.run/x` → `https://haivecontrol-sandbox.crane.glick.run/x` is followed;
+  `evil.com`, `crane.glick.run.evil.com`, `notcrane.glick.run`, another port and any `http://`
+  target are not. The relay token is in the query string and the redirect keeps it, which is
+  why the target must be inside the host the token was given to. The agent logs
+  `relay: hub moved — 308 from … to …; following it for this run, update --relay to the new
+  address`, and after the first call that lands it sends every later call straight to the new
+  address. It does **not** rewrite `relay.cred` or the autostart entry: both keep the `--relay`
+  address, so the device secret is still found on the next start. Update `--relay` (re-run the
+  enrollment command with the new URL) to make the move permanent.
+- **Any other redirect is a failure.** A `301`/`302`/`303` on a POST, a target outside the
+  host, a reply body that was streamed and cannot be re-sent, or a fourth hop: the call fails,
+  the agent never logs `connected`, and it logs
+  `relay: hub answered 308 redirect for POST https://host/path to https://other/path — check-ins
+  are NOT reaching the hub (not followed: …); update --relay to the new address`. URLs in these
+  lines never include the query string (it carries the token). The line is logged on the first
+  occurrence and on any change, then at most once every 10 minutes while it persists.
+
 ## Verify what you downloaded
 
 **Integrity** — every release ships a `SHA256SUMS`:

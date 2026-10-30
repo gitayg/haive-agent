@@ -29,11 +29,11 @@ pub(crate) fn cert_url(hub: &str, relay_id: &str, token: &str) -> String {
 }
 
 /// Poll `{hub}/relay/config` every 60s and apply the returned config. The token
-/// is read from the shared credential on every poll, so a switch is picked up.
-pub fn start_poll(hub: String, cred: Arc<RelayCred>) {
+/// and base are read from the shared credential on every poll, so a switch is picked up.
+pub fn start_poll(cred: Arc<RelayCred>) {
     std::thread::spawn(move || loop {
-        let url = config_url(&hub, cred.relay_id(), &cred.token());
-        if let Ok(r) = ureq::get(&url).call() {
+        let url = config_url(&cred.base(), cred.relay_id(), &cred.token());
+        if let Ok(r) = crate::relay_redirect::get(&cred, &url, None) {
             if let Ok(v) = r.into_json::<serde_json::Value>() {
                 if let Some(tray) = v.get("tray").and_then(|x| x.as_bool()) {
                     TRAY.store(tray, Ordering::Relaxed);
@@ -81,8 +81,9 @@ fn unauthorized(e: ureq::Error) -> bool {
 ///
 /// Beyond the rejected-secret fallback there is no retry: None means the direct
 /// path stays closed (see `http::CAP_PUBKEY`), and the agent runs on the relay.
-pub fn fetch_cap_key(hub: &str, cred: &RelayCred) -> Option<String> {
-    let get = |tok: &str| ureq::get(&cap_key_url(hub, cred.relay_id(), tok)).timeout(std::time::Duration::from_secs(10)).call().map_err(unauthorized);
+pub fn fetch_cap_key(cred: &RelayCred) -> Option<String> {
+    let timeout = Some(std::time::Duration::from_secs(10));
+    let get = |tok: &str| crate::relay_redirect::get(cred, &cap_key_url(&cred.base(), cred.relay_id(), tok), timeout).map_err(unauthorized);
     let body = call_with_fallback(cred, get)?.into_string().ok()?;
     let key = body.trim().to_string();
     (key.len() == 64).then_some(key)
@@ -91,9 +92,12 @@ pub fn fetch_cap_key(hub: &str, cred: &RelayCred) -> Option<String> {
 /// Ask the hub to sign a leaf cert for this agent (SANs = our LAN IPs + a stable
 /// name), so a same-LAN controller can validate a direct connection against the
 /// hub CA. Returns (cert_pem, key_pem) bytes, or None to fall back to self-signed.
-pub fn fetch_hub_cert(hub: &str, cred: &RelayCred, sans: Vec<String>) -> Option<(Vec<u8>, Vec<u8>)> {
-    let body = serde_json::json!({ "relay_id": cred.relay_id(), "sans": sans });
-    let post = |tok: &str| ureq::post(&cert_url(hub, cred.relay_id(), tok)).timeout(std::time::Duration::from_secs(10)).send_json(body.clone()).map_err(unauthorized);
+pub fn fetch_hub_cert(cred: &RelayCred, sans: Vec<String>) -> Option<(Vec<u8>, Vec<u8>)> {
+    let body = serde_json::json!({ "relay_id": cred.relay_id(), "sans": sans }).to_string();
+    let (timeout, json) = (Some(std::time::Duration::from_secs(10)), crate::relay_redirect::Body::Bytes);
+    let post = |tok: &str| {
+        crate::relay_redirect::post(cred, &cert_url(&cred.base(), cred.relay_id(), tok), json(Some("application/json"), body.as_bytes()), timeout).map_err(unauthorized)
+    };
     let r = call_with_fallback(cred, post)?;
     let v: serde_json::Value = r.into_json().ok()?;
     let cert = v.get("cert")?.as_str()?.as_bytes().to_vec();
@@ -144,13 +148,13 @@ mod tests {
         // fetches fall back to it, and the credential the first hello will use
         // (with ds=1) is the enrollment token, so it re-enrolls.
         let c = cred(&hub, "cap", Some("htok_e"));
-        assert_eq!(fetch_cap_key(&hub, &c).as_deref(), Some(KEY));
+        assert_eq!(fetch_cap_key(&c).as_deref(), Some(KEY));
         assert_eq!((c.token(), c.is_device()), ("htok_e".to_string(), false));
         let c = cred(&hub, "cert", Some("htok_e"));
-        assert_eq!(fetch_hub_cert(&hub, &c, vec![]), Some((b"C".to_vec(), b"K".to_vec())));
+        assert_eq!(fetch_hub_cert(&c, vec![]), Some((b"C".to_vec(), b"K".to_vec())));
         // Nothing to fall back to: no key, and the secret is kept.
         let c = cred(&hub, "none", None);
-        assert_eq!(fetch_cap_key(&hub, &c), None);
+        assert_eq!(fetch_cap_key(&c), None);
         assert_eq!((c.token(), c.is_device()), ("hdev_revoked".to_string(), true));
     }
 }

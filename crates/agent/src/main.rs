@@ -17,6 +17,7 @@ mod wakelock;
 mod presence;
 mod reap;
 mod relay;
+mod relay_redirect;
 mod relaycred;
 mod selfheal;
 mod updatecheck;
@@ -645,7 +646,7 @@ fn main() {
         // every privileged request arriving on the LAN listener is refused (the
         // controller then uses the relay, where the hub applies the same checks
         // itself), so a fetch failure costs the shortcut, never correctness.
-        match config::fetch_cap_key(&relay_addr, &cred) {
+        match config::fetch_cap_key(&cred) {
             Some(k) if http::set_capability_key(&rid, &k) => {
                 println!("   lan-direct: capability key loaded");
             }
@@ -670,23 +671,23 @@ fn main() {
                 })
                 .unwrap_or_default();
             sans.push(format!("{rid}.it-ai.lan"));
-            if let Some(c) = config::fetch_hub_cert(&relay_addr, &cred, sans) {
+            if let Some(c) = config::fetch_hub_cert(&cred, sans) {
                 println!("   lan-direct: using hub-signed cert");
                 cert = Some(c);
             }
         }
         println!("   relay: dialing {relay_addr} as {rid}");
-        config::start_poll(relay_addr.clone(), Arc::clone(&cred));
-        analysis::start(relay_addr.clone(), Arc::clone(&cred));
+        config::start_poll(Arc::clone(&cred));
+        analysis::start(Arc::clone(&cred));
         let asset = agent_asset();
         discovery::auto_update_relay(relay_addr.clone(), asset);
         // Give the loopback /ai/chat handler what it needs to reach the hub's
         // relay AI endpoint on the user's behalf (the tray chat talks to this).
-        http::set_ai_relay(&relay_addr, Arc::clone(&cred));
+        http::set_ai_relay(Arc::clone(&cred));
         // VPN exit: names itself to the hub's UDP relay by this id, and brings a
         // previously enabled exit back after a reboot.
         vpn::start(rid.clone());
-        std::thread::spawn(move || relay::relay_loop(relay_addr, nm, si, cred));
+        std::thread::spawn(move || relay::relay_loop(nm, si, cred));
     }
 
     let registering = if mac_id.is_some() { format!("registering to '{mac_id_disp}'") } else { "relay-only".to_string() };

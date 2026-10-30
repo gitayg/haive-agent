@@ -24,7 +24,6 @@ pub fn loopback_port() -> u16 {
 
 // Set once at startup (relay mode only) so the loopback /ai/chat handler can reach
 // the hub's relay AI endpoint on the user's behalf — the tray chat posts here.
-static AI_HUB: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static AI_CRED: std::sync::OnceLock<std::sync::Arc<crate::relaycred::RelayCred>> = std::sync::OnceLock::new();
 
 /// The hub's ed25519 capability public key and this agent's own relay id, both
@@ -83,8 +82,7 @@ fn capability_ok(req: &Request, path: &str, body: Option<&serde_json::Value>) ->
     replay_cache().lock().unwrap().claim(&p.nonce, p.exp, now)
 }
 
-pub fn set_ai_relay(hub: &str, cred: std::sync::Arc<crate::relaycred::RelayCred>) {
-    let _ = AI_HUB.set(hub.trim_end_matches('/').to_string());
+pub fn set_ai_relay(cred: std::sync::Arc<crate::relaycred::RelayCred>) {
     let _ = AI_CRED.set(cred);
 }
 
@@ -113,17 +111,14 @@ fn request_admin_forward(req: &mut Request) -> Resp {
 /// owns the API key and the tool loop; the endpoint never sees the key. `endpoint`
 /// picks the hub route: `ai-chat` (diagnose) or `ai-apply` (run an approved fix).
 fn ai_forward(req: &mut Request, endpoint: &str) -> Resp {
-    let (Some(hub), Some(cred)) = (AI_HUB.get(), AI_CRED.get()) else {
+    let Some(cred) = AI_CRED.get() else {
         return json_resp(&serde_json::json!({"ok": false, "error": "The AI assistant needs relay mode (this agent was started without --relay)."}), 200);
     };
     let mut body = String::new();
     let _ = req.as_reader().read_to_string(&mut body);
-    let url = ai_url(hub, endpoint, cred.relay_id(), &cred.token());
-    match ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(150))
-        .send_string(&body)
-    {
+    let url = ai_url(&cred.base(), endpoint, cred.relay_id(), &cred.token());
+    let json = crate::relay_redirect::Body::Bytes(Some("application/json"), body.as_bytes());
+    match crate::relay_redirect::post(cred, &url, json, Some(std::time::Duration::from_secs(150))) {
         Ok(r) => Response::from_string(r.into_string().unwrap_or_default())
             .with_status_code(200)
             .with_header(hdr("Content-Type", "application/json")),

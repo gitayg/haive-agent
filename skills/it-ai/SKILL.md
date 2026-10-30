@@ -163,6 +163,12 @@ when it differs. That checksum file isn't signed. A lying hub can delay an updat
 can't install one. So a device on an old version is usually waiting for its next check, not
 broken.
 
+A whole fleet going unreachable at once usually means the hub's address moved. Agents 3.12.0+
+follow a `307`/`308` only within the hub's https host and otherwise log
+`relay: hub answered 3xx redirect … check-ins are NOT reaching the hub` in their own log; agents
+before 3.12.0 keep logging `relay: connected` while nothing reaches the hub. Either way the fix
+is to re-enroll with the new `--relay` URL. Report it; don't keep retrying commands.
+
 `dissolve_agent` stops the agent and removes its autostart (the binary stays). The device then
 leaves the fleet until someone re-runs the agent on it. Confirm first.
 

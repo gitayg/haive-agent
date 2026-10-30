@@ -227,7 +227,11 @@ struct Current {
 
 /// The one shared relay credential. Clone the `Arc`, never the token.
 pub struct RelayCred {
+    /// The normalized `--relay`: what `relay.cred` is saved under and matched against.
     hub: String,
+    /// Where relay calls go. Starts as `hub`; a hub redirect followed to a 2xx moves
+    /// it for this run only (`relay_redirect`), never `hub` or the file.
+    base: RwLock<String>,
     relay_id: String,
     file: PathBuf,
     current: RwLock<Current>,
@@ -246,6 +250,7 @@ impl RelayCred {
         let direct_token = crate::agent_direct_token(&r.token, relay_id);
         RelayCred {
             hub: normalize_hub(hub),
+            base: RwLock::new(normalize_hub(hub)),
             relay_id: relay_id.to_string(),
             file,
             current: RwLock::new(Current { token: r.token, is_device: r.is_device }),
@@ -261,6 +266,14 @@ impl RelayCred {
 
     pub fn is_device(&self) -> bool {
         self.current.read().unwrap().is_device
+    }
+
+    pub fn base(&self) -> String {
+        self.base.read().unwrap().clone()
+    }
+
+    pub(crate) fn moved_to(&self, base: String) {
+        *self.base.write().unwrap() = base;
     }
 
     pub fn relay_id(&self) -> &str {

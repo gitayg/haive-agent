@@ -25,6 +25,9 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
+# Relay redirect targets (relay_redirect.rs): resolve a Location against the
+# request URL and compare hosts. Already in the tree through ureq.
+url = "2"
 ed25519-dalek = "2"
 # The VPN exit's server key (vpn.rs): X25519 public key from the private key,
 # so neither backend needs `wg genkey`/`wg pubkey`. Same version boringtun uses.
