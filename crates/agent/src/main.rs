@@ -632,7 +632,8 @@ fn main() {
     }
     if let Some(mid) = mac_id.clone() {
         let (primary, fid, nm, si) = (mid.clone(), args.id.clone(), name.clone(), sysinfo.clone());
-        std::thread::spawn(move || discovery::register_loop(primary, fid, nm, port, scheme, si));
+        let tok = args.relay_token.clone().or_else(|| std::env::var(relaycred::ENV_TOKEN).ok()).filter(|t| !t.is_empty());
+        std::thread::spawn(move || discovery::register_loop(primary, fid, nm, port, scheme, si, tok));
         let asset = agent_asset();
         let fid = args.id.clone();
         std::thread::spawn(move || discovery::auto_update_loop(mid, fid, asset));

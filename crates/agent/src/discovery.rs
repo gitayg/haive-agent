@@ -22,7 +22,9 @@ pub fn local_ip() -> String {
 // `primary` is the hub target: a direct IP / host:port, OR a Bonjour Mac ID.
 // `fallback_id` is an optional Mac ID used for mDNS when `primary` is an IP that
 // can't be reached — so the agent supports IP, ID, or both (IP first, ID fallback).
-pub fn register_loop(primary: String, fallback_id: Option<String>, name: String, port: u16, scheme: &'static str, info: serde_json::Value) {
+// `tok` is sent as `/register?tok=`: hub 3.24.0+ refuses a registration without an
+// enrollment token (the device is that owner's) or the hub's relay token.
+pub fn register_loop(primary: String, fallback_id: Option<String>, name: String, port: u16, scheme: &'static str, info: serde_json::Value, tok: Option<String>) {
     let mut enrolled = false;
     loop {
         // Merge freshly-sampled CPU load + free RAM into the static sysinfo each cycle.
@@ -34,7 +36,7 @@ pub fn register_loop(primary: String, fallback_id: Option<String>, name: String,
         }
         let mut ok = false;
         if let Some((ip, hport)) = direct_addr(&primary) {
-            ok = post_register(&ip, hport, &name, port, scheme, &payload);
+            ok = post_register(&ip, hport, &name, port, scheme, &payload, tok.as_deref());
         }
         if !ok {
             let id = if direct_addr(&primary).is_some() {
@@ -44,7 +46,7 @@ pub fn register_loop(primary: String, fallback_id: Option<String>, name: String,
             };
             if let Some(id) = id {
                 if let Some((ip, hport)) = mdns_resolve(id) {
-                    ok = post_register(&ip, hport, &name, port, scheme, &payload);
+                    ok = post_register(&ip, hport, &name, port, scheme, &payload, tok.as_deref());
                 }
             }
         }
@@ -56,7 +58,7 @@ pub fn register_loop(primary: String, fallback_id: Option<String>, name: String,
     }
 }
 
-fn post_register(hub_ip: &str, hub_port: u16, name: &str, port: u16, scheme: &'static str, info: &serde_json::Value) -> bool {
+fn post_register(hub_ip: &str, hub_port: u16, name: &str, port: u16, scheme: &'static str, info: &serde_json::Value, tok: Option<&str>) -> bool {
     let url = format!("http://{hub_ip}:{hub_port}/register");
     let mut body = serde_json::json!({
         "name": name, "ip": local_ip(), "port": port, "scheme": scheme
@@ -66,7 +68,21 @@ fn post_register(hub_ip: &str, hub_port: u16, name: &str, port: u16, scheme: &'s
             obj.insert(k.clone(), v.clone());
         }
     }
-    ureq::post(&url).send_json(body).is_ok()
+    let mut req = ureq::post(&url);
+    if let Some(t) = tok {
+        req = req.query("tok", t);
+    }
+    match req.send_json(body) {
+        Ok(_) => true,
+        Err(ureq::Error::Status(st @ (401 | 403), _)) => {
+            static TOLD: std::sync::Once = std::sync::Once::new();
+            TOLD.call_once(|| {
+                eprintln!("hub refused /register ({st}): pass --relay-token htok_… (or set HIVE_RELAY_TOKEN) — mint one from the hub dashboard's \"Register a device\" panel");
+            });
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 fn direct_addr(target: &str) -> Option<(String, u16)> {

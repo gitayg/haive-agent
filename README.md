@@ -81,6 +81,13 @@ HIVE_RELAY_TOKEN=htok_… ./it-ai --relay https://your-hub.example.com --name <d
 line. `--persist` adds a per-user autostart entry; `--install` (run as root/admin) installs a boot
 service instead.
 
+**LAN mode** (`./it-ai <hub-ip>:<port> --id <hub-id>`, what the hub's `/install.sh` starts) registers
+over the LAN instead of through the relay. From hub 3.24.0 that registration needs a token too:
+agent 3.13.1+ sends `--relay-token` / `HIVE_RELAY_TOKEN` as `/register?tok=`, and the device is
+listed for that token's owner. Without one the hub answers 401 and the agent logs
+`hub refused /register`. Unlike relay mode, LAN mode gets no device secret: the token stays in use,
+so prefer `HIVE_RELAY_TOKEN` over the flag (a `--persist` entry keeps its arguments).
+
 From agent 3.7.0, with hub 3.16.0 or later:
 - **The enrollment token is used only to enroll.** On its first hello the agent asks the hub for
   its own credential, a device secret (`hdev_…`), logs `relay: device credential issued`, and
