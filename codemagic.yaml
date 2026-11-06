@@ -3,6 +3,9 @@
 # this repo. On a Codemagic Mac it builds the tagged agent into IT-AI.app, signs it with a Developer ID, notarizes
 # and staples it, wraps it in IT-AI.dmg (macos/dmg.sh) and uploads IT-AI.dmg and IT-AI-macos.zip to that release.
 #
+# Started on a branch instead (Codemagic: Start new build), it is a dry run: built, signed, notarized and kept as
+# this build's artifacts, nothing uploaded.
+#
 # Nothing here is secret. The Developer ID key and the Apple and GitHub credentials live in Codemagic only:
 #   env group "apple":  APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
 #                       (an App Store Connect API key, Admin role) and CERTIFICATE_PRIVATE_KEY (the RSA key the
@@ -26,7 +29,12 @@ workflows:
             [ -n "${!v:-}" ] || { echo "Add $v to the Codemagic env groups apple / github (see codemagic.yaml)"; exit 1; }
           done
           VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          [ "${CM_TAG:-}" = "v$VERSION" ] || { echo "Build a v* tag: CM_TAG='${CM_TAG:-}', Cargo.toml is $VERSION"; exit 1; }
+          # A branch build is a dry run: everything is built, signed and notarized, nothing is uploaded.
+          if [ -n "${CM_TAG:-}" ]; then
+            [ "$CM_TAG" = "v$VERSION" ] || { echo "The tag $CM_TAG is not Cargo.toml's version $VERSION"; exit 1; }
+          else
+            echo "No tag: dry run of $VERSION (the DMG and zip are this build's artifacts only)"
+          fi
       - name: Rust
         script: |
           set -eu
@@ -49,6 +57,7 @@ workflows:
       - name: Upload to the release
         script: |
           set -eu
+          [ -n "${CM_TAG:-}" ] || { echo "No tag: dry run, nothing uploaded"; exit 0; }
           command -v gh >/dev/null || brew install gh
           GH_TOKEN="$GITHUB_TOKEN" gh release upload "$CM_TAG" macos/dist/IT-AI.dmg macos/dist/IT-AI-macos.zip \
             --clobber -R gitayg/haive-agent
