@@ -297,6 +297,20 @@ stderr. This covers the `--background` relaunch, the trim at every start and the
 a root agent whose `~/.it-ai/agent.log`, or `~/.it-ai`, another user turned into a link never
 appends to, chmods or truncates the file it points at. Windows opens the path as before.
 
+### The macOS app (IT-AI.app)
+
+Installed from `IT-AI.dmg`, the agent runs as `/Applications/IT-AI.app`, signed with a Developer ID and
+notarized, so macOS keeps its Screen Recording and Accessibility permissions across updates. Its binary
+is never replaced on its own: that would install the unsigned release binary over the signed one,
+break the app's signature and lose those permissions. So inside the app the two-minute check does
+nothing, and a hub-pushed `POST /update` installs `IT-AI-macos.zip`, published beside the binary it
+names, instead. The zip is accepted only if `codesign` says it is `com.itai.agent` signed with a
+Developer ID certificate of team DA4PX65QXV (an Apple Development build of the same team fails), and
+only if its version is newer than the running one. The whole app is swapped, and put back if the new
+one does not start. The hub pushes `/update` when an agent's version differs from the one it
+advertises, so an app is kept current the same way. An agent installed as a bare binary is updated as
+before.
+
 ## Live screen
 
 From agent 3.13.0 the live view is delta-encoded (`GET /screen`; wire format in
@@ -552,6 +566,18 @@ cargo build --release            # produces target/release/{IT-AI,it-ai-mcp,itai
 ```
 Linux release binaries are cross-linked against glibc 2.31 via `cargo-zigbuild` (see
 `.github/workflows/build.yml`) so one binary runs on Debian 12, Ubuntu 22.04+, and ARM SBCs.
+
+### macOS app and DMG
+
+`macos/dmg.sh` builds the version in `Cargo.toml` into `IT-AI.app` (`macos/Info.plist`,
+`macos/it-ai.entitlements`, `macos/icon/`), signs it with the hardened runtime, notarizes and staples
+it, and writes `macos/dist/IT-AI.dmg` (the app and a link to Applications, signed, notarized and
+stapled too) and `macos/dist/IT-AI-macos.zip` (the app, for updates). It runs on a Mac and publishes
+nothing. The release build runs on Codemagic (`codemagic.yaml`): the `macos-app` job of `build.yml`
+starts it for each `v*` tag, and it uploads both files to that release. The Developer ID key and the
+Apple and GitHub credentials live in Codemagic, never in this repository; `codemagic.yaml` lists
+them. To build on your own Mac instead, as RubberMAC does: `xcrun notarytool store-credentials itai`
+once, put your Developer ID certificate's name in `macos/.signing-identity`, then run `macos/dmg.sh`.
 
 ## License
 

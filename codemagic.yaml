@@ -1,0 +1,57 @@
+# IT-AI.app for macOS on Codemagic, the way O-LINK builds its iPhone app there: a GitHub release of a v* tag
+# (build.yml) starts this workflow through Codemagic's API with that tag, because Codemagic gets no webhook from
+# this repo. On a Codemagic Mac it builds the tagged agent into IT-AI.app, signs it with a Developer ID, notarizes
+# and staples it, wraps it in IT-AI.dmg (macos/dmg.sh) and uploads IT-AI.dmg and IT-AI-macos.zip to that release.
+#
+# Nothing here is secret. The Developer ID key and the Apple and GitHub credentials live in Codemagic only:
+#   env group "apple":  APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
+#                       (an App Store Connect API key, Admin role) and CERTIFICATE_PRIVATE_KEY (the RSA key the
+#                       Developer ID Application certificate is created from and matched by)
+#   env group "github": GITHUB_TOKEN (fine-grained, gitayg/haive-agent only, Contents: read and write)
+workflows:
+  macos-app:
+    name: IT-AI.app → DMG
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      groups:
+        - apple
+        - github
+      xcode: latest
+    scripts:
+      - name: Check the tag and the secrets
+        script: |
+          set -eu
+          for v in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_IDENTIFIER APP_STORE_CONNECT_PRIVATE_KEY CERTIFICATE_PRIVATE_KEY GITHUB_TOKEN; do
+            [ -n "${!v:-}" ] || { echo "Add $v to the Codemagic env groups apple / github (see codemagic.yaml)"; exit 1; }
+          done
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          [ "${CM_TAG:-}" = "v$VERSION" ] || { echo "Build a v* tag: CM_TAG='${CM_TAG:-}', Cargo.toml is $VERSION"; exit 1; }
+      - name: Rust
+        script: |
+          set -eu
+          command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "PATH=$HOME/.cargo/bin:$PATH" >> "$CM_ENV"
+      - name: Developer ID certificate
+        script: |
+          set -eu
+          keychain initialize
+          # Reuse the certificate made from CERTIFICATE_PRIVATE_KEY; create it on the first build.
+          certs="$HOME/Library/MobileDevice/Certificates"
+          app-store-connect certificates list --type DEVELOPER_ID_APPLICATION --certificate-key @env:CERTIFICATE_PRIVATE_KEY --save || true
+          if ! ls "$certs"/*.p12 >/dev/null 2>&1; then
+            app-store-connect certificates create --type DEVELOPER_ID_APPLICATION --certificate-key @env:CERTIFICATE_PRIVATE_KEY --save
+          fi
+          keychain add-certificates
+          security find-identity -v -p codesigning | grep "Developer ID Application"
+      - name: Build, sign and notarize IT-AI.app and IT-AI.dmg
+        script: CI=1 macos/dmg.sh
+      - name: Upload to the release
+        script: |
+          set -eu
+          command -v gh >/dev/null || brew install gh
+          GH_TOKEN="$GITHUB_TOKEN" gh release upload "$CM_TAG" macos/dist/IT-AI.dmg macos/dist/IT-AI-macos.zip \
+            --clobber -R gitayg/haive-agent
+    artifacts:
+      - macos/dist/IT-AI.dmg
+      - macos/dist/IT-AI-macos.zip

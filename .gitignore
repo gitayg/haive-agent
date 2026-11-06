@@ -1,3 +1,6 @@
 /target
 *.scip
 .squash/
+/macos/build
+/macos/dist
+/macos/.signing-identity

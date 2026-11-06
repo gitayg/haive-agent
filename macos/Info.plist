@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>IT-AI</string>
+	<key>CFBundleExecutable</key>
+	<string>it-ai</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.itai.agent</string>
+	<key>CFBundleName</key>
+	<string>IT-AI</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Your IT administrator can view this Mac's camera when you allow it.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Your IT administrator can hear this Mac's audio during a remote session.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>IT-AI looks for your organization's hub on the local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_rmtscrn._tcp</string>
+	</array>
+</dict>
+</plist>
