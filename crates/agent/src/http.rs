@@ -630,6 +630,28 @@ fn update_ep(req: &mut Request) -> Resp {
     let Some(slot) = crate::updatelock::try_begin() else {
         return Response::from_string("an update is already in progress; try again shortly").with_status_code(409);
     };
+    // Running as IT-AI.app: install the signed app, never the bare binary (see `appbundle`).
+    if crate::appbundle::running_bundle().is_some() {
+        let Some(zip) = crate::appbundle::zip_url(&url) else {
+            return Response::from_string("cannot derive the app zip from the update url").with_status_code(400);
+        };
+        return match crate::appbundle::install(&zip, slot) {
+            Ok(crate::appbundle::Outcome::Current(v)) => {
+                Response::from_string(format!("the published app ({v}) is not newer than this one; nothing to do"))
+            }
+            Ok(crate::appbundle::Outcome::Installed(v)) => {
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    std::process::exit(0);
+                });
+                Response::from_string(format!("updated the app to {v}; restarting"))
+            }
+            Err(e) => {
+                eprintln!("update: {e}");
+                Response::from_string(e).with_status_code(500)
+            }
+        };
+    }
     let bytes = match download_bytes(&url) {
         Some(b) if !b.is_empty() => b,
         _ => return Response::from_string("download failed").with_status_code(502),
@@ -810,7 +832,7 @@ fn persist_ep() -> Resp {
     Response::from_string(format!("made persistent — {} (keep-awake on AC enabled)", crate::persistence::current_mode()))
 }
 
-fn download_bytes(url: &str) -> Option<Vec<u8>> {
+pub(crate) fn download_bytes(url: &str) -> Option<Vec<u8>> {
     let mut reader = ureq::get(url).call().ok()?.into_reader();
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).ok()?;
