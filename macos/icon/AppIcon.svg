@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- IT-AI app icon: a hub (honey hexagon) linked to its fleet (six device nodes). Source of AppIcon.png / AppIcon.icns. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14254f"/>
+      <stop offset="1" stop-color="#0d5b63"/>
+    </linearGradient>
+    <radialGradient id="glow" cx=".5" cy=".46" r=".5">
+      <stop offset="0" stop-color="#3fd0c4" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#3fd0c4" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="honey" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd463"/>
+      <stop offset="1" stop-color="#f08f12"/>
+    </linearGradient>
+    <linearGradient id="node" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e9fffc"/>
+      <stop offset="1" stop-color="#9fe6df"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#glow)"/>
+  <g stroke="#8fe3dc" stroke-opacity=".28" stroke-width="12" stroke-linecap="round">
+    <line x1="512.0" y1="220.0" x2="764.9" y2="366.0"/>
+    <line x1="764.9" y1="366.0" x2="764.9" y2="658.0"/>
+    <line x1="764.9" y1="658.0" x2="512.0" y2="804.0"/>
+    <line x1="512.0" y1="804.0" x2="259.1" y2="658.0"/>
+    <line x1="259.1" y1="658.0" x2="259.1" y2="366.0"/>
+    <line x1="259.1" y1="366.0" x2="512.0" y2="220.0"/>
+  </g>
+  <g stroke="#8fe3dc" stroke-opacity=".7" stroke-width="16" stroke-linecap="round">
+    <line x1="512" y1="512" x2="512.0" y2="220.0"/>
+    <line x1="512" y1="512" x2="764.9" y2="366.0"/>
+    <line x1="512" y1="512" x2="764.9" y2="658.0"/>
+    <line x1="512" y1="512" x2="512.0" y2="804.0"/>
+    <line x1="512" y1="512" x2="259.1" y2="658.0"/>
+    <line x1="512" y1="512" x2="259.1" y2="366.0"/>
+  </g>
+  <g filter="url(#shadow)">
+  <polygon points="512.0,156.0 567.4,188.0 567.4,252.0 512.0,284.0 456.6,252.0 456.6,188.0" fill="url(#node)" stroke="#bdf3ee" stroke-opacity=".55" stroke-width="5"/>
+  <polygon points="764.9,302.0 820.3,334.0 820.3,398.0 764.9,430.0 709.5,398.0 709.5,334.0" fill="url(#node)" stroke="#bdf3ee" stroke-opacity=".55" stroke-width="5"/>
+  <polygon points="764.9,594.0 820.3,626.0 820.3,690.0 764.9,722.0 709.5,690.0 709.5,626.0" fill="url(#node)" stroke="#bdf3ee" stroke-opacity=".55" stroke-width="5"/>
+  <polygon points="512.0,740.0 567.4,772.0 567.4,836.0 512.0,868.0 456.6,836.0 456.6,772.0" fill="url(#node)" stroke="#bdf3ee" stroke-opacity=".55" stroke-width="5"/>
+  <polygon points="259.1,594.0 314.5,626.0 314.5,690.0 259.1,722.0 203.7,690.0 203.7,626.0" fill="url(#node)" stroke="#bdf3ee" stroke-opacity=".55" stroke-width="5"/>
+  <polygon points="259.1,302.0 314.5,334.0 314.5,398.0 259.1,430.0 203.7,398.0 203.7,334.0" fill="url(#node)" stroke="#bdf3ee" stroke-opacity=".55" stroke-width="5"/>
+    <polygon points="512.0,354.0 648.8,433.0 648.8,591.0 512.0,670.0 375.2,591.0 375.2,433.0" fill="url(#honey)"/>
+    <polygon points="512.0,414.0 596.9,463.0 596.9,561.0 512.0,610.0 427.1,561.0 427.1,463.0" fill="none" stroke="#7a3f00" stroke-opacity=".35" stroke-width="14"/>
+    <polygon points="512.0,466.0 551.8,489.0 551.8,535.0 512.0,558.0 472.2,535.0 472.2,489.0" fill="#7a3f00" fill-opacity=".45"/>
+  </g>
+</svg>
