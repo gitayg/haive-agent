@@ -6,11 +6,12 @@
 # Started on a branch instead (Codemagic: Start new build), it is a dry run: built, signed, notarized and kept as
 # this build's artifacts, nothing uploaded.
 #
-# Nothing here is secret. The Developer ID key and the Apple and GitHub credentials live in Codemagic only:
-#   env group "apple":  APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY
-#                       (an App Store Connect API key, Admin role) and CERTIFICATE_PRIVATE_KEY (the RSA key the
-#                       Developer ID Application certificate is created from and matched by)
-#   env group "github": GITHUB_TOKEN (fine-grained, gitayg/haive-agent only, Contents: read and write)
+# Nothing here is secret. The Developer ID key and the Apple and GitHub credentials live in Codemagic only, in the
+# haive-agent app's env group "Github":
+#   APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY  an App Store Connect
+#     API key, Admin role
+#   CERTIFICATE_PRIVATE_KEY  the RSA key the Developer ID Application certificate is created from and matched by
+#   GITHUB_TOKEN             fine-grained, gitayg/haive-agent only, Contents: read and write
 workflows:
   macos-app:
     name: IT-AI.app → DMG
@@ -18,15 +19,14 @@ workflows:
     max_build_duration: 60
     environment:
       groups:
-        - apple
-        - github
+        - Github
       xcode: latest
     scripts:
       - name: Check the tag and the secrets
         script: |
           set -eu
           for v in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_IDENTIFIER APP_STORE_CONNECT_PRIVATE_KEY CERTIFICATE_PRIVATE_KEY GITHUB_TOKEN; do
-            [ -n "${!v:-}" ] || { echo "Add $v to the Codemagic env groups apple / github (see codemagic.yaml)"; exit 1; }
+            [ -n "${!v:-}" ] || { echo "Add $v to the Codemagic env group Github (see codemagic.yaml)"; exit 1; }
           done
           VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           # A branch build is a dry run: everything is built, signed and notarized, nothing is uploaded.
