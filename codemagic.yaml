@@ -44,6 +44,11 @@ workflows:
         script: |
           set -eu
           keychain initialize
+          # Which key this is, without showing it: its first line, its line count and the MD5 of its public modulus,
+          # the same figure `openssl rsa -in <key> -noout -modulus | openssl md5` gives on the Mac that made it.
+          k="$(mktemp)"; printf '%s\n' "$CERTIFICATE_PRIVATE_KEY" > "$k"
+          echo "CERTIFICATE_PRIVATE_KEY: $(head -1 "$k"), $(wc -l < "$k" | tr -d ' ') lines, modulus $(openssl rsa -in "$k" -noout -modulus 2>/dev/null | openssl md5)"
+          rm -f "$k"
           # Reuse the certificate made from CERTIFICATE_PRIVATE_KEY; create it on the first build.
           certs="$HOME/Library/MobileDevice/Certificates"
           app-store-connect certificates list --type DEVELOPER_ID_APPLICATION --certificate-key @env:CERTIFICATE_PRIVATE_KEY --save || true
