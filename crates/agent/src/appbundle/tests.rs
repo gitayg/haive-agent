@@ -60,6 +60,14 @@ fn only_a_strictly_newer_version_is_newer() {
 }
 
 #[test]
+fn a_bare_binary_moves_into_an_app_that_is_not_older() {
+    assert!(may_migrate_to("3.14.1", "3.14.1"), "the release it is already on");
+    assert!(may_migrate_to("3.14.2", "3.14.1"));
+    assert!(!may_migrate_to("3.14.0", "3.14.1"), "an older app would be a downgrade");
+    assert!(!may_migrate_to("3.14.1-beta", "3.14.0"), "an unparsable version");
+}
+
+#[test]
 fn the_version_is_read_from_the_info_plist() {
     let plist = "<?xml version=\"1.0\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>CFBundleIdentifier</key>\n\t<string>com.itai.agent</string>\n\t<key>CFBundleShortVersionString</key>\n\t<string> 3.14.0 </string>\n\t<key>CFBundleVersion</key>\n\t<string>42</string>\n</dict>\n</plist>\n";
     assert_eq!(plist_version(plist).as_deref(), Some("3.14.0"));

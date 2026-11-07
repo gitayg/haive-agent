@@ -652,6 +652,22 @@ fn update_ep(req: &mut Request) -> Resp {
             }
         };
     }
+    // A bare-binary Mac agent moves into the signed app instead (see `appbundle::migrate`);
+    // when it can't, it updates the binary as before.
+    if cfg!(target_os = "macos") {
+        match crate::appbundle::migrate(&url) {
+            Ok(crate::appbundle::Outcome::Installed(v)) => {
+                slot.hold_until_exit();
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    std::process::exit(0);
+                });
+                return Response::from_string(format!("moved into {} {v}; restarting", crate::appbundle::APP_NAME));
+            }
+            Ok(crate::appbundle::Outcome::Current(v)) => eprintln!("update: the published app ({v}) is older than this agent; updating the binary"),
+            Err(e) => eprintln!("update: {e}"),
+        }
+    }
     let bytes = match download_bytes(&url) {
         Some(b) if !b.is_empty() => b,
         _ => return Response::from_string("download failed").with_status_code(502),

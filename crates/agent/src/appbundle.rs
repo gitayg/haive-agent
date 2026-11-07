@@ -156,64 +156,90 @@ pub(crate) fn cleanup_leftovers() {
     }
 }
 
+/// The executable inside IT-AI.app (`CFBundleExecutable`).
+pub(crate) const APP_EXE: &str = "it-ai";
+/// Where a bare-binary agent moves the app to (`migrate`).
+pub(crate) const APPLICATIONS: &str = "/Applications";
+
+/// A bare-binary agent moves into the app only if the app is not older than what it
+/// runs: the same version (the release it is already on) or newer.
+pub(crate) fn may_migrate_to(app_version: &str, running: &str) -> bool {
+    parse_version(app_version).is_some() && !is_newer(running, app_version)
+}
+
+fn stage_tag() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    )
+}
+
+/// Download the app zip into `stage`, unpack it and check it: it must hold
+/// IT-AI.app with its executable, signed to `requirement()`. Nothing from the
+/// download is read before the signature passes. Returns the app and its version.
+#[cfg(target_os = "macos")]
+fn fetch_verified(zip_url: &str, stage: &Path) -> Result<(PathBuf, String), String> {
+    use std::process::Command;
+    let bytes = crate::http::download_bytes(zip_url).filter(|b| !b.is_empty()).ok_or("download of the app failed")?;
+    let zip = stage.join("update.zip");
+    std::fs::write(&zip, &bytes).map_err(|e| format!("cannot write the download: {e}"))?;
+    let unpacked = stage.join("app");
+    let ok = Command::new("/usr/bin/ditto").arg("-x").arg("-k").arg(&zip).arg(&unpacked).status().map(|s| s.success()).unwrap_or(false);
+    if !ok {
+        return Err("cannot unpack the app zip".to_string());
+    }
+    let new_app = unpacked.join(APP_NAME);
+    if !new_app.join("Contents/MacOS").join(APP_EXE).is_file() {
+        return Err(format!("the zip holds no {APP_NAME} with {APP_EXE}"));
+    }
+    let verified = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(format!("-R={}", requirement()))
+        .arg(&new_app)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !verified {
+        return Err(format!("the app is not {BUNDLE_ID} signed with team {TEAM_ID}'s Developer ID; refused"));
+    }
+    let plist = std::fs::read_to_string(new_app.join("Contents/Info.plist")).map_err(|e| format!("cannot read the app's Info.plist: {e}"))?;
+    let version = plist_version(&plist).ok_or("the app's Info.plist has no version")?;
+    Ok((new_app, version))
+}
+
+/// Restart as `exe` with this process's args and token handling (as `apply_update`):
+/// exec in place, else spawn. Ok only when a spawned replacement is running and the
+/// caller must exit; a successful exec never returns.
+#[cfg(target_os = "macos")]
+fn relaunch(exe: &Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let e = crate::relaycred::restart_command(exe, args.clone()).exec();
+    eprintln!("update: exec of {} failed ({e}); spawning it instead", exe.display());
+    crate::relaycred::restart_command(exe, args).spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 /// Install the signed app from `zip_url` over the running bundle and restart.
 /// `slot` is the one-update-at-a-time lock, as for `http::apply_update`.
 #[cfg(target_os = "macos")]
 pub(crate) fn install(zip_url: &str, slot: crate::updatelock::UpdateSlot) -> Result<Outcome, String> {
-    use std::process::Command;
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let app = bundle_of(&exe).ok_or("not running from an app bundle")?;
-    let exe_name = exe.file_name().ok_or("no executable name")?.to_owned();
     let parent = app.parent().ok_or("the app has no parent folder")?.to_path_buf();
-    let tag = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-    );
+    let tag = stage_tag();
     // Stage beside the app so the swap is a rename on one volume.
     let stage = parent.join(format!("{STAGE_PREFIX}{tag}"));
     std::fs::create_dir(&stage).map_err(|e| format!("cannot stage the update next to the app: {e}"))?;
     let result = (|| {
-        let bytes = crate::http::download_bytes(zip_url).filter(|b| !b.is_empty()).ok_or("download of the app failed")?;
-        let zip = stage.join("update.zip");
-        std::fs::write(&zip, &bytes).map_err(|e| format!("cannot write the download: {e}"))?;
-        let unpacked = stage.join("app");
-        let ok = Command::new("/usr/bin/ditto").arg("-x").arg("-k").arg(&zip).arg(&unpacked).status().map(|s| s.success()).unwrap_or(false);
-        if !ok {
-            return Err("cannot unpack the app zip".to_string());
-        }
-        let new_app = unpacked.join(APP_NAME);
-        if !new_app.join("Contents/MacOS").join(&exe_name).is_file() {
-            return Err(format!("the zip holds no {APP_NAME} with {}", exe_name.to_string_lossy()));
-        }
-        // Signature first: nothing from the download is read before it passes.
-        let verified = Command::new("/usr/bin/codesign")
-            .args(["--verify", "--deep", "--strict"])
-            .arg(format!("-R={}", requirement()))
-            .arg(&new_app)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !verified {
-            return Err(format!("the app is not {BUNDLE_ID} signed with team {TEAM_ID}'s Developer ID; refused"));
-        }
-        let plist = std::fs::read_to_string(new_app.join("Contents/Info.plist")).map_err(|e| format!("cannot read the app's Info.plist: {e}"))?;
-        let version = plist_version(&plist).ok_or("the app's Info.plist has no version")?;
-        let running = env!("CARGO_PKG_VERSION");
-        if !is_newer(&version, running) {
+        let (new_app, version) = fetch_verified(zip_url, &stage)?;
+        if !is_newer(&version, env!("CARGO_PKG_VERSION")) {
             return Ok(Outcome::Current(version));
         }
         let old = parent.join(format!("{OLD_PREFIX}{tag}"));
         swap(&app, &new_app, &old)?;
-        // Same args and token handling as a binary update (`apply_update`).
-        let args: Vec<String> = std::env::args().skip(1).collect();
-        {
-            use std::os::unix::process::CommandExt;
-            let e = crate::relaycred::restart_command(&exe, args.clone()).exec();
-            eprintln!("update: exec of the new app failed ({e}); spawning it instead");
-        }
-        match crate::relaycred::restart_command(&exe, args).spawn() {
-            Ok(_) => Ok(Outcome::Installed(version)),
+        match relaunch(&exe) {
+            Ok(()) => Ok(Outcome::Installed(version)),
             Err(e) => {
                 let back = unswap(&app, &new_app, &old);
                 Err(format!("the new app did not start ({e}); {}", match back {
@@ -232,9 +258,77 @@ pub(crate) fn install(zip_url: &str, slot: crate::updatelock::UpdateSlot) -> Res
     result
 }
 
+/// Move a bare-binary agent into IT-AI.app: install the signed app from beside
+/// `binary_url` to /Applications, point the launchd entry that runs this binary at
+/// the app, and restart as the app. Only an agent that a launchd entry runs moves (a
+/// `--ttl` support session or a one-off run never installs anything), and only when
+/// it can write /Applications. Every step is undone if a later one fails, and any
+/// error leaves the caller to update the bare binary as before. Ok(Installed) means
+/// the app is running and the caller must exit, holding its update slot.
+#[cfg(target_os = "macos")]
+pub(crate) fn migrate(binary_url: &str) -> Result<Outcome, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    if bundle_of(&exe).is_some() {
+        return Err("already running from an app".to_string());
+    }
+    let zip = zip_url(binary_url).ok_or("cannot derive the app zip from the update url")?;
+    let parent = PathBuf::from(APPLICATIONS);
+    let target = parent.join(APP_NAME);
+    let new_exe = target.join("Contents/MacOS").join(APP_EXE);
+    let tag = stage_tag();
+    let stage = parent.join(format!("{STAGE_PREFIX}{tag}"));
+    std::fs::create_dir(&stage).map_err(|e| format!("cannot write {APPLICATIONS} ({e}); staying a bare binary"))?;
+    let result = (|| {
+        let (new_app, version) = fetch_verified(&zip, &stage)?;
+        if !may_migrate_to(&version, env!("CARGO_PKG_VERSION")) {
+            return Ok(Outcome::Current(version));
+        }
+        // Move the app in first (beside any copy already there), then the entry.
+        let old = parent.join(format!("{OLD_PREFIX}{tag}"));
+        let had_app = target.exists();
+        if had_app {
+            swap(&target, &new_app, &old)?;
+        } else {
+            std::fs::rename(&new_app, &target).map_err(|e| format!("cannot move the app into {APPLICATIONS}: {e}"))?;
+        }
+        let undo_app = || {
+            if had_app {
+                let _ = unswap(&target, &new_app, &old);
+            } else {
+                let _ = std::fs::rename(&target, &new_app);
+            }
+        };
+        let (entry, previous) = match crate::persistence::mac_repoint(&exe, &new_exe) {
+            Ok(r) => r,
+            Err(e) => {
+                undo_app();
+                return Err(e);
+            }
+        };
+        eprintln!("update: moving into {} {version}; {} now runs it", target.display(), entry.display());
+        match relaunch(&new_exe) {
+            Ok(()) => Ok(Outcome::Installed(version)),
+            Err(e) => {
+                let _ = std::fs::write(&entry, previous);
+                undo_app();
+                Err(format!("the app did not start ({e}); stayed a bare binary"))
+            }
+        }
+    })();
+    if !matches!(result, Ok(Outcome::Installed(_))) {
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    result
+}
+
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn install(_zip_url: &str, _slot: crate::updatelock::UpdateSlot) -> Result<Outcome, String> {
     Err("app updates exist only on macOS".to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn migrate(_binary_url: &str) -> Result<Outcome, String> {
+    Err("the app exists only on macOS".to_string())
 }
 
 #[cfg(test)]

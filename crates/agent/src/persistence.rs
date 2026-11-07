@@ -323,6 +323,38 @@ fn win_service_uninstall() {
         .status();
 }
 
+/// `plist` with its program (the first `ProgramArguments` string) changed from `old_exe`
+/// to `new_exe`, everything else kept. None unless the plist runs exactly `old_exe`, so
+/// an entry that starts some other binary is never rewritten. Used when a bare-binary
+/// agent moves into IT-AI.app (`appbundle::migrate`).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn repoint_plist(plist: &str, old_exe: &Path, new_exe: &Path) -> Option<String> {
+    let key = "<key>ProgramArguments</key>";
+    let after = plist.find(key)? + key.len();
+    let open = after + plist[after..].find("<string>")? + "<string>".len();
+    let close = open + plist[open..].find("</string>")?;
+    if !plist[after..open].trim_start().starts_with("<array>") || plist[open..close] != *old_exe.to_string_lossy() {
+        return None;
+    }
+    Some(format!("{}{}{}", &plist[..open], new_exe.display(), &plist[close..]))
+}
+
+/// Point this machine's launchd entry (the LaunchDaemon, else the LaunchAgent) at
+/// `new_exe` if it runs `old_exe`. The file only: the running job is not reloaded,
+/// because the caller execs into `new_exe` in the same process. Returns the entry's
+/// path and its previous text, to put back if the move fails.
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_repoint(old_exe: &Path, new_exe: &Path) -> Result<(PathBuf, String), String> {
+    for p in [daemon_path(), plist_path()] {
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        if let Some(new_text) = repoint_plist(&text, old_exe, new_exe) {
+            std::fs::write(&p, new_text).map_err(|e| format!("cannot rewrite {}: {e}", p.display()))?;
+            return Ok((p, text));
+        }
+    }
+    Err(format!("no launchd entry runs {}; a session that is not autostarted stays a bare binary", old_exe.display()))
+}
+
 // ---- macOS: LaunchDaemon (starts at boot, root) ----
 #[cfg(target_os = "macos")]
 pub(crate) fn daemon_path() -> PathBuf {
@@ -545,6 +577,31 @@ mod service_home_tests {
         let u = service_unit(Path::new("/usr/local/bin/it-ai"), &args(), Path::new("/root"));
         assert!(u.lines().any(|l| l == "Environment=HOME=/root"), "unit has no pinned HOME:\n{u}");
         assert!(u.contains("ExecStart=/usr/local/bin/it-ai --relay https://hub.example\n"));
+    }
+
+    #[test]
+    fn repointing_changes_only_the_program_of_an_entry_that_runs_it() {
+        let old = Path::new("/Users/me/it-ai-1014");
+        let app = Path::new("/Applications/IT-AI.app/Contents/MacOS/it-ai");
+        for plist in [agent_plist(old, &args(), Path::new("/Users/me")), daemon_plist(old, &args(), Path::new("/var/root"))] {
+            let moved = repoint_plist(&plist, old, app).expect("an entry running the binary was not repointed");
+            assert_eq!(moved, plist.replacen(&old.display().to_string(), &app.display().to_string(), 1));
+            assert!(moved.contains("<string>/Applications/IT-AI.app/Contents/MacOS/it-ai</string>"));
+            for a in args() {
+                assert!(moved.contains(&format!("<string>{a}</string>")), "lost the argument {a}");
+            }
+            assert_eq!(repoint_plist(&moved, app, old).as_deref(), Some(plist.as_str()), "repointing back restores the entry");
+        }
+    }
+
+    #[test]
+    fn an_entry_running_another_binary_is_not_repointed() {
+        let plist = agent_plist(Path::new("/Users/me/it-ai-2001"), &args(), Path::new("/Users/me"));
+        let app = Path::new("/Applications/IT-AI.app/Contents/MacOS/it-ai");
+        assert_eq!(repoint_plist(&plist, Path::new("/Users/me/it-ai-1014"), app), None);
+        // A prefix of the program's path is not the program.
+        assert_eq!(repoint_plist(&plist, Path::new("/Users/me/it-ai-20"), app), None);
+        assert_eq!(repoint_plist("<plist><dict></dict></plist>", Path::new("/x"), app), None);
     }
 
     #[test]
