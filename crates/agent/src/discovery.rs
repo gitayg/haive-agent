@@ -149,6 +149,18 @@ pub fn auto_update_loop(primary: String, fallback_id: Option<String>, asset: Str
             // One update at a time: if a hub-pushed /update is running, skip this cycle.
             let Some(slot) = crate::updatelock::try_begin() else { continue };
             let url = format!("http://{ip}:{port}/bin/{asset}");
+            // A bare-binary Mac agent moves into the signed app first (see `appbundle::migrate`).
+            if cfg!(target_os = "macos") {
+                match crate::appbundle::migrate(&url) {
+                    Ok(crate::appbundle::Outcome::Installed(_)) => {
+                        slot.hold_until_exit();
+                        std::thread::sleep(Duration::from_millis(500));
+                        std::process::exit(0);
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("auto-update: {e}"),
+                }
+            }
             if let Some(newb) = download_agent(&url) {
                 // Verify a pinned-key signature before self-replacing — the LAN
                 // `/bin/` fetch is plaintext HTTP and mDNS-resolved, so the bytes are
@@ -192,6 +204,18 @@ pub fn auto_update_relay(base: String, asset: String) {
         // One update at a time: if a hub-pushed /update is running, skip this cycle.
         let Some(slot) = crate::updatelock::try_begin() else { continue };
         let url = format!("{b}/bin/{asset}");
+        // A bare-binary Mac agent moves into the signed app first (see `appbundle::migrate`).
+        if cfg!(target_os = "macos") {
+            match crate::appbundle::migrate(&url) {
+                Ok(crate::appbundle::Outcome::Installed(_)) => {
+                    slot.hold_until_exit();
+                    std::thread::sleep(Duration::from_millis(500));
+                    std::process::exit(0);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("auto-update: {e}"),
+            }
+        }
         if let Some(newb) = download_agent(&url) {
             // Require a valid pinned-key signature so a compromised/rogue hub can't
             // trojan the fleet via the auto-update channel.

@@ -308,8 +308,15 @@ names, instead. The zip is accepted only if `codesign` says it is `com.itai.agen
 Developer ID certificate of team DA4PX65QXV (an Apple Development build of the same team fails), and
 only if its version is newer than the running one. The whole app is swapped, and put back if the new
 one does not start. The hub pushes `/update` when an agent's version differs from the one it
-advertises, so an app is kept current the same way. An agent installed as a bare binary is updated as
-before.
+advertises, so an app is kept current the same way.
+
+From 3.14.1 a Mac agent installed as a bare binary moves into the app on its next update: it fetches
+`IT-AI-macos.zip` with the same `codesign` check, puts IT-AI.app in /Applications, points the launchd
+entry that runs it (the LaunchAgent or the LaunchDaemon) at the app and restarts as the app. Only an
+agent that a launchd entry runs moves, so a `--ttl` support session or a one-off run installs nothing,
+and only one that can write /Applications (an administrator, or the root service). Otherwise, or if
+any step fails (each is undone), it updates the binary as before. macOS then asks once more for
+Screen Recording and Accessibility, for "IT-AI", and keeps them across later updates.
 
 ## Live screen
 
