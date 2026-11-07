@@ -3,6 +3,7 @@
 
 // IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
 mod analysis;
+mod appbundle;
 mod capture;
 mod cursor;
 mod config;
@@ -494,6 +495,8 @@ fn main() {
     // A launchd-started agent logs into agent.log through launchd's own handle and
     // never goes through `log_file`, so trim it here too.
     logfile::cap(&log_path());
+    // An app update (IT-AI.app) leaves the replaced bundle beside the new one.
+    appbundle::cleanup_leftovers();
 
     if args.background && relaunch_detached() {
         return;

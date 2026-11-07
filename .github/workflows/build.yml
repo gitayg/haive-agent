@@ -179,3 +179,28 @@ jobs:
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: SHA256SUMS
+
+  # IT-AI.app and IT-AI.dmg for macOS are built on Codemagic (codemagic.yaml), the way O-LINK's iPhone app is: the
+  # Developer ID key and the Apple and GitHub credentials live there, never in this public repo. This starts that
+  # build for the tag once the release exists; Codemagic uploads IT-AI.dmg and IT-AI-macos.zip to it. Needs the
+  # CODEMAGIC_TOKEN secret (Codemagic, Team settings, Codemagic API) and the CODEMAGIC_APP_ID repository variable.
+  macos-app:
+    needs: checksums
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start the Codemagic build
+        env:
+          CODEMAGIC_TOKEN: ${{ secrets.CODEMAGIC_TOKEN }}
+          CODEMAGIC_APP_ID: ${{ vars.CODEMAGIC_APP_ID }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$CODEMAGIC_TOKEN" ] || [ -z "$CODEMAGIC_APP_ID" ]; then
+            echo "::warning::CODEMAGIC_TOKEN or CODEMAGIC_APP_ID is not set, so this release gets no IT-AI.app or IT-AI.dmg"
+            exit 0
+          fi
+          body=$(jq -n --arg app "$CODEMAGIC_APP_ID" --arg tag "$TAG" '{appId: $app, workflowId: "macos-app", tag: $tag}')
+          r=$(curl -fsS -X POST https://api.codemagic.io/builds -H "x-auth-token: $CODEMAGIC_TOKEN" -H 'Content-Type: application/json' -d "$body")
+          id=$(echo "$r" | jq -r .buildId)
+          echo "### IT-AI.app for $TAG: Codemagic build started" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://codemagic.io/app/$CODEMAGIC_APP_ID/build/$id" | tee -a "$GITHUB_STEP_SUMMARY"

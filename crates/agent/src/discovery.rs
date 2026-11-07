@@ -128,6 +128,13 @@ fn resolve_hub(primary: &str, fallback_id: &Option<String>) -> Option<(String, u
 /// Every 2 minutes, fetch the agent binary the hub is hosting for this platform;
 /// if it differs from the running executable, self-update and restart.
 pub fn auto_update_loop(primary: String, fallback_id: Option<String>, asset: String) {
+    // IT-AI.app compares nothing here: its signed binary never matches the published
+    // one, and writing that one over it would break the app's signature. The hub's
+    // version-based /update installs the signed app instead (see `appbundle`).
+    if crate::appbundle::running_bundle().is_some() {
+        eprintln!("auto-update: running as {}; updates come through the hub's /update", crate::appbundle::APP_NAME);
+        return;
+    }
     let self_bytes = match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
         Some(b) => b,
         None => return,
@@ -164,6 +171,13 @@ pub fn auto_update_loop(primary: String, fallback_id: Option<String>, asset: Str
 /// pull the binary straight from the relay URL's `/bin/`. `apply_update` self-
 /// replaces AND re-execs, so this self-restarts without needing a supervisor.
 pub fn auto_update_relay(base: String, asset: String) {
+    // IT-AI.app compares nothing here: its signed binary never matches the published
+    // one, and writing that one over it would break the app's signature. The hub's
+    // version-based /update installs the signed app instead (see `appbundle`).
+    if crate::appbundle::running_bundle().is_some() {
+        eprintln!("auto-update: running as {}; updates come through the hub's /update", crate::appbundle::APP_NAME);
+        return;
+    }
     let self_bytes = match std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()) {
         Some(b) => b,
         None => return,

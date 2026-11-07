@@ -1,0 +1,94 @@
+# IT-AI.app for macOS on Codemagic, the way O-LINK builds its iPhone app there: a GitHub release of a v* tag
+# (build.yml) starts this workflow through Codemagic's API with that tag, because Codemagic gets no webhook from
+# this repo. On a Codemagic Mac it builds the tagged agent into IT-AI.app, signs it with a Developer ID, notarizes
+# and staples it, wraps it in IT-AI.dmg (macos/dmg.sh) and uploads IT-AI.dmg and IT-AI-macos.zip to that release.
+#
+# Started on a branch instead (Codemagic: Start new build), it is a dry run: built, signed, notarized and kept as
+# this build's artifacts, nothing uploaded.
+#
+# Nothing here is secret. The Developer ID key and the Apple and GitHub credentials live in Codemagic only, in the
+# haive-agent app's env group "Github":
+#   APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER, APP_STORE_CONNECT_PRIVATE_KEY  an App Store Connect
+#     API key, Admin role
+#   CERTIFICATE_PRIVATE_KEY  the RSA key the Developer ID Application certificate is created from and matched by
+#   GITHUB_TOKEN             fine-grained, gitayg/haive-agent only, Contents: read and write
+workflows:
+  macos-app:
+    name: IT-AI.app → DMG
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      groups:
+        - Github
+      xcode: latest
+    scripts:
+      - name: Check the tag and the secrets
+        script: |
+          set -eu
+          for v in APP_STORE_CONNECT_ISSUER_ID APP_STORE_CONNECT_KEY_IDENTIFIER APP_STORE_CONNECT_PRIVATE_KEY CERTIFICATE_PRIVATE_KEY GITHUB_TOKEN; do
+            [ -n "${!v:-}" ] || { echo "Add $v to the Codemagic env group Github (see codemagic.yaml)"; exit 1; }
+          done
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          # A branch build is a dry run: everything is built, signed and notarized, nothing is uploaded.
+          if [ -n "${CM_TAG:-}" ]; then
+            [ "$CM_TAG" = "v$VERSION" ] || { echo "The tag $CM_TAG is not Cargo.toml's version $VERSION"; exit 1; }
+          else
+            echo "No tag: dry run of $VERSION (the DMG and zip are this build's artifacts only)"
+          fi
+      - name: Rust
+        script: |
+          set -eu
+          command -v rustup >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "PATH=$HOME/.cargo/bin:$PATH" >> "$CM_ENV"
+      - name: Developer ID certificate
+        script: |
+          set -eu
+          keychain initialize
+          # Apple lets only the Account Holder create a Developer ID certificate, in the portal, so this never creates
+          # one: it finds the Developer ID Application certificate made from CERTIFICATE_PRIVATE_KEY (match by public
+          # modulus), builds a .p12 from the two here and imports it. Only public figures are printed: each
+          # certificate's id and the MD5 of its modulus, the same as `openssl ... -noout -modulus | openssl md5` on a Mac.
+          w="$(mktemp -d)"
+          printf '%s\n' "$CERTIFICATE_PRIVATE_KEY" > "$w/key.pem"
+          want=$(/usr/bin/openssl rsa -in "$w/key.pem" -noout -modulus | /usr/bin/openssl md5 | awk '{print $NF}')
+          echo "CERTIFICATE_PRIVATE_KEY modulus: $want"
+          app-store-connect certificates list --type DEVELOPER_ID_APPLICATION --json > "$w/certs.json"
+          python3 -I - "$w" "$want" <<'PY'
+          import base64, json, subprocess, sys
+          w, want = sys.argv[1], sys.argv[2]
+          data = json.load(open(f"{w}/certs.json"))
+          certs = data if isinstance(data, list) else data.get("data", data.get("certificates", []))
+          found = None
+          for c in certs:
+              a = c.get("attributes", c)
+              der = base64.b64decode(a["certificateContent"])
+              open(f"{w}/c.der", "wb").write(der)
+              mod = subprocess.run(["/usr/bin/openssl", "x509", "-inform", "der", "-in", f"{w}/c.der", "-noout", "-modulus"], capture_output=True).stdout
+              md5 = subprocess.run(["/usr/bin/openssl", "md5"], input=mod, capture_output=True).stdout.decode().split()[-1]
+              print(f"certificate {c.get('id')} serial {a.get('serialNumber')} expires {a.get('expirationDate')} modulus {md5}")
+              if md5 == want and found is None:
+                  found = der
+          if found is None:
+              print("No Developer ID Application certificate matches CERTIFICATE_PRIVATE_KEY. Create one in the portal "
+                    "(Certificates, +, Developer ID Application) from a CSR of that key.")
+              sys.exit(1)
+          open(f"{w}/cert.der", "wb").write(found)
+          PY
+          /usr/bin/openssl x509 -inform der -in "$w/cert.der" -out "$w/cert.pem"
+          pw="$(/usr/bin/openssl rand -hex 16)"
+          /usr/bin/openssl pkcs12 -export -inkey "$w/key.pem" -in "$w/cert.pem" -out "$w/cert.p12" -passout "pass:$pw"
+          keychain add-certificates --certificate "$w/cert.p12" --certificate-password "$pw"
+          rm -rf "$w"
+          security find-identity -v -p codesigning | grep "Developer ID Application"
+      - name: Build, sign and notarize IT-AI.app and IT-AI.dmg
+        script: CI=1 macos/dmg.sh
+      - name: Upload to the release
+        script: |
+          set -eu
+          [ -n "${CM_TAG:-}" ] || { echo "No tag: dry run, nothing uploaded"; exit 0; }
+          command -v gh >/dev/null || brew install gh
+          GH_TOKEN="$GITHUB_TOKEN" gh release upload "$CM_TAG" macos/dist/IT-AI.dmg macos/dist/IT-AI-macos.zip \
+            --clobber -R gitayg/haive-agent
+    artifacts:
+      - macos/dist/IT-AI.dmg
+      - macos/dist/IT-AI-macos.zip
