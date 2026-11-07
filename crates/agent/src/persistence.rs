@@ -209,9 +209,7 @@ fn mac_install(exe: &Path, args: &[String]) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(&p, plist);
-    let _ = std::process::Command::new("launchctl")
-        .args(["load", &p.to_string_lossy()])
-        .status();
+    mac_reload(&p, false);
 }
 
 #[cfg(target_os = "macos")]
@@ -355,6 +353,67 @@ pub(crate) fn mac_repoint(old_exe: &Path, new_exe: &Path) -> Result<(PathBuf, St
     Err(format!("no launchd entry runs {}; a session that is not autostarted stays a bare binary", old_exe.display()))
 }
 
+/// `s` single-quoted for /bin/sh.
+#[cfg(any(target_os = "macos", test))]
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The shell that makes launchd run what `plist` says now: drop the loaded job (and
+/// its process), then load the file. `launchctl load` alone keeps a job that is
+/// already loaded, with its old program: a re-install or an app switch left launchd
+/// restarting the old binary every 10 s (agent 3.14.2).
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn reload_script(domain: &str, plist: &Path) -> String {
+    let p = sh_quote(&plist.to_string_lossy());
+    format!("launchctl bootout {domain}/com.itai.agent 2>/dev/null; launchctl bootstrap {domain} {p} || launchctl load {p}")
+}
+
+/// launchd starts its jobs with XPC_SERVICE_NAME set to their label.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_launchd_job() -> bool {
+    std::env::var("XPC_SERVICE_NAME").as_deref() == Ok("com.itai.agent")
+}
+
+#[cfg(target_os = "macos")]
+fn mac_domain(daemon: bool) -> String {
+    if daemon {
+        "system".into()
+    } else {
+        format!("gui/{}", unsafe { libc::getuid() })
+    }
+}
+
+/// Run the reload in a shell of its own session, after a second, and don't wait:
+/// the bootout ends the job's process, which may be this one.
+#[cfg(target_os = "macos")]
+pub(crate) fn mac_reload_detached(plist: &Path, daemon: bool) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let script = format!("sleep 1; {}", reload_script(&mac_domain(daemon), plist));
+    let mut c = std::process::Command::new("/bin/sh");
+    c.arg("-c").arg(script).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    c.spawn().map(|_| ())
+}
+
+/// Make launchd run `plist` now. From inside the job itself, detached (see above);
+/// otherwise in place, which also ends an older agent the job was running.
+#[cfg(target_os = "macos")]
+fn mac_reload(plist: &Path, daemon: bool) {
+    if is_launchd_job() {
+        if let Err(e) = mac_reload_detached(plist, daemon) {
+            eprintln!("warn: could not reload the launchd entry ({e})");
+        }
+        return;
+    }
+    let _ = std::process::Command::new("/bin/sh").arg("-c").arg(reload_script(&mac_domain(daemon), plist)).status();
+}
+
 // ---- macOS: LaunchDaemon (starts at boot, root) ----
 #[cfg(target_os = "macos")]
 pub(crate) fn daemon_path() -> PathBuf {
@@ -382,7 +441,7 @@ fn mac_install_service(exe: &Path, args: &[String], home: &Path) {
     let plist = daemon_plist(exe, args, home);
     let p = daemon_path();
     let _ = std::fs::write(&p, plist);
-    let _ = std::process::Command::new("launchctl").args(["load", &p.to_string_lossy()]).status();
+    mac_reload(&p, true);
 }
 
 #[cfg(target_os = "macos")]
@@ -577,6 +636,18 @@ mod service_home_tests {
         let u = service_unit(Path::new("/usr/local/bin/it-ai"), &args(), Path::new("/root"));
         assert!(u.lines().any(|l| l == "Environment=HOME=/root"), "unit has no pinned HOME:\n{u}");
         assert!(u.contains("ExecStart=/usr/local/bin/it-ai --relay https://hub.example\n"));
+    }
+
+    #[test]
+    fn a_reload_drops_the_loaded_job_before_loading_the_file() {
+        let s = reload_script("gui/501", Path::new("/Users/o'brien/Library/LaunchAgents/com.itai.agent.plist"));
+        assert_eq!(
+            s,
+            "launchctl bootout gui/501/com.itai.agent 2>/dev/null; launchctl bootstrap gui/501 '/Users/o'\\''brien/Library/LaunchAgents/com.itai.agent.plist' || launchctl load '/Users/o'\\''brien/Library/LaunchAgents/com.itai.agent.plist'"
+        );
+        let ok = std::process::Command::new("sh").args(["-n", "-c", &s]).status().map(|st| st.success()).unwrap_or(false);
+        assert!(ok, "not valid shell: {s}");
+        assert!(reload_script("system", Path::new("/Library/LaunchDaemons/com.itai.agent.plist")).starts_with("launchctl bootout system/com.itai.agent "));
     }
 
     #[test]

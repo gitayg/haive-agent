@@ -843,8 +843,24 @@ fn dissolve_ep() -> Resp {
 
 /// POST /persist — promote this running agent to a persistent autostart install
 /// (per-user autostart with the current relay args), and keep it awake on AC.
+#[cfg(target_os = "macos")]
+fn is_launchd_job() -> bool {
+    crate::persistence::is_launchd_job()
+}
+#[cfg(not(target_os = "macos"))]
+fn is_launchd_job() -> bool {
+    false
+}
+
 fn persist_ep() -> Resp {
     crate::persistence::install(&crate::persist_args(), false);
+    // On macOS launchd now runs the agent from that entry: this copy steps aside.
+    if cfg!(target_os = "macos") && !crate::persistence::current_mode().eq("ephemeral") && !is_launchd_job() {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            std::process::exit(0);
+        });
+    }
     Response::from_string(format!("made persistent — {} (keep-awake on AC enabled)", crate::persistence::current_mode()))
 }
 
