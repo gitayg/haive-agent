@@ -260,7 +260,7 @@ pub(crate) fn install(zip_url: &str, slot: crate::updatelock::UpdateSlot) -> Res
 
 /// Move a bare-binary agent into IT-AI.app: install the signed app from beside
 /// `binary_url` to /Applications, point the launchd entry that runs this binary at
-/// the app, and restart as the app. Only an agent that a launchd entry runs moves (a
+/// the app, and have launchd reload it, which starts the app and ends this process. Only an agent that a launchd entry runs moves (a
 /// `--ttl` support session or a one-off run never installs anything), and only when
 /// it can write /Applications. Every step is undone if a later one fails, and any
 /// error leaves the caller to update the bare binary as before. Ok(Installed) means
@@ -305,13 +305,20 @@ pub(crate) fn migrate(binary_url: &str) -> Result<Outcome, String> {
                 return Err(e);
             }
         };
-        eprintln!("update: moving into {} {version}; {} now runs it", target.display(), entry.display());
-        match relaunch(&new_exe) {
-            Ok(()) => Ok(Outcome::Installed(version)),
+        // launchd starts the app: a detached reload drops the loaded job (this process,
+        // or an older agent the job still ran) and loads the entry, now pointing at the
+        // app. Only re-pointing the file left launchd restarting the old binary when the
+        // loaded job was not this process (3.14.1, two installs on one Mac).
+        let daemon = entry == crate::persistence::daemon_path();
+        match crate::persistence::mac_reload_detached(&entry, daemon) {
+            Ok(()) => {
+                eprintln!("update: moving into {} {version}; launchd starts it from {}", target.display(), entry.display());
+                Ok(Outcome::Installed(version))
+            }
             Err(e) => {
                 let _ = std::fs::write(&entry, previous);
                 undo_app();
-                Err(format!("the app did not start ({e}); stayed a bare binary"))
+                Err(format!("could not hand the restart to launchd ({e}); stayed a bare binary"))
             }
         }
     })();

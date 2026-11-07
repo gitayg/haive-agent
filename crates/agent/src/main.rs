@@ -12,6 +12,8 @@ mod entryclean;
 mod entrytoken;
 mod h264;
 mod http;
+#[cfg(unix)]
+mod instance;
 mod input;
 mod jobs;
 mod logfile;
@@ -596,6 +598,12 @@ fn main() {
     logfile::adopt_stdio(&log_path());
     let lifetime = if args.persist {
         persistence::install(&persist_args(), true);
+        // launchd now runs the agent from the entry it just (re)loaded; staying would
+        // make two of them.
+        if cfg!(target_os = "macos") {
+            println!("IT-AI installed with autostart at login; launchd runs it now. You can close this window.");
+            return;
+        }
         "persistent (autostart at login)".to_string()
     } else if let Some(mins) = args.ttl {
         std::thread::spawn(move || {
@@ -607,6 +615,14 @@ fn main() {
     } else {
         "one-time (until closed)".to_string()
     };
+
+    // One long-running agent per user (`instance`), and none tied to the folder it
+    // was started from: an install command run inside a temporary folder left an
+    // agent whose working directory had been deleted.
+    #[cfg(unix)]
+    let _instance = instance::claim();
+    #[cfg(unix)]
+    let _ = std::env::set_current_dir("/");
 
     let mut cert = if tls {
         let home = std::env::var("HOME")

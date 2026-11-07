@@ -318,6 +318,16 @@ and only one that can write /Applications (an administrator, or the root service
 any step fails (each is undone), it updates the binary as before. macOS then asks once more for
 Screen Recording and Accessibility, for "IT-AI", and keeps them across later updates.
 
+From 3.14.2 installing an autostart on macOS (`--persist`, `--install`, `POST /persist`, and the move
+into the app) reloads launchd's `com.itai.agent` job (`launchctl bootout`, then `bootstrap`) instead of
+only loading it. `launchctl load` keeps a job that is already loaded, with its old program, so a second
+install or the move into the app left launchd restarting the previous binary every 10 s. `--persist` on
+macOS then exits, as `--install` does, and launchd runs the agent. Every agent also holds
+`~/.it-ai/agent.lock` while it runs: one started by hand replaces the agent already running for that
+user, and one started by launchd or systemd while another runs exits at once. Agents change to `/` at
+startup, so deleting the folder an install command ran in no longer leaves an agent without a working
+directory.
+
 ## Live screen
 
 From agent 3.13.0 the live view is delta-encoded (`GET /screen`; wire format in
