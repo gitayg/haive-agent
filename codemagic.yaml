@@ -44,18 +44,41 @@ workflows:
         script: |
           set -eu
           keychain initialize
-          # Which key this is, without showing it: its first line, its line count and the MD5 of its public modulus,
-          # the same figure `openssl rsa -in <key> -noout -modulus | openssl md5` gives on the Mac that made it.
-          k="$(mktemp)"; printf '%s\n' "$CERTIFICATE_PRIVATE_KEY" > "$k"
-          echo "CERTIFICATE_PRIVATE_KEY: $(head -1 "$k"), $(wc -l < "$k" | tr -d ' ') lines, modulus $(openssl rsa -in "$k" -noout -modulus 2>/dev/null | openssl md5)"
-          rm -f "$k"
-          # Reuse the certificate made from CERTIFICATE_PRIVATE_KEY; create it on the first build.
-          certs="$HOME/Library/MobileDevice/Certificates"
-          app-store-connect certificates list --type DEVELOPER_ID_APPLICATION --certificate-key @env:CERTIFICATE_PRIVATE_KEY --save || true
-          if ! ls "$certs"/*.p12 >/dev/null 2>&1; then
-            app-store-connect certificates create --type DEVELOPER_ID_APPLICATION --certificate-key @env:CERTIFICATE_PRIVATE_KEY --save
-          fi
-          keychain add-certificates
+          # Apple lets only the Account Holder create a Developer ID certificate, in the portal, so this never creates
+          # one: it finds the Developer ID Application certificate made from CERTIFICATE_PRIVATE_KEY (match by public
+          # modulus), builds a .p12 from the two here and imports it. Only public figures are printed: each
+          # certificate's id and the MD5 of its modulus, the same as `openssl ... -noout -modulus | openssl md5` on a Mac.
+          w="$(mktemp -d)"
+          printf '%s\n' "$CERTIFICATE_PRIVATE_KEY" > "$w/key.pem"
+          want=$(/usr/bin/openssl rsa -in "$w/key.pem" -noout -modulus | /usr/bin/openssl md5 | awk '{print $NF}')
+          echo "CERTIFICATE_PRIVATE_KEY modulus: $want"
+          app-store-connect certificates list --type DEVELOPER_ID_APPLICATION --json > "$w/certs.json"
+          python3 -I - "$w" "$want" <<'PY'
+          import base64, json, subprocess, sys
+          w, want = sys.argv[1], sys.argv[2]
+          data = json.load(open(f"{w}/certs.json"))
+          certs = data if isinstance(data, list) else data.get("data", data.get("certificates", []))
+          found = None
+          for c in certs:
+              a = c.get("attributes", c)
+              der = base64.b64decode(a["certificateContent"])
+              open(f"{w}/c.der", "wb").write(der)
+              mod = subprocess.run(["/usr/bin/openssl", "x509", "-inform", "der", "-in", f"{w}/c.der", "-noout", "-modulus"], capture_output=True).stdout
+              md5 = subprocess.run(["/usr/bin/openssl", "md5"], input=mod, capture_output=True).stdout.decode().split()[-1]
+              print(f"certificate {c.get('id')} serial {a.get('serialNumber')} expires {a.get('expirationDate')} modulus {md5}")
+              if md5 == want and found is None:
+                  found = der
+          if found is None:
+              print("No Developer ID Application certificate matches CERTIFICATE_PRIVATE_KEY. Create one in the portal "
+                    "(Certificates, +, Developer ID Application) from a CSR of that key.")
+              sys.exit(1)
+          open(f"{w}/cert.der", "wb").write(found)
+          PY
+          /usr/bin/openssl x509 -inform der -in "$w/cert.der" -out "$w/cert.pem"
+          pw="$(/usr/bin/openssl rand -hex 16)"
+          /usr/bin/openssl pkcs12 -export -inkey "$w/key.pem" -in "$w/cert.pem" -out "$w/cert.p12" -passout "pass:$pw"
+          keychain add-certificates --certificate "$w/cert.p12" --certificate-password "$pw"
+          rm -rf "$w"
           security find-identity -v -p codesigning | grep "Developer ID Application"
       - name: Build, sign and notarize IT-AI.app and IT-AI.dmg
         script: CI=1 macos/dmg.sh
