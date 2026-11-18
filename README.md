@@ -393,6 +393,9 @@ and `it-ai-mcp` mask the value (`mtok=***`) in every error they print or return.
 From hub 3.18.0 the hub sorts every `/m` action into a tier before anything reaches a device, and
 `itai` / `it-ai-mcp` 3.10.0 understand its answers:
 
+For a worked example, a cloud coding agent installing and benchmarking a release on a remote
+device through these approvals, see [`docs/USE-CASE-AGENT-ON-REMOTE-DEVICE.md`](docs/USE-CASE-AGENT-ON-REMOTE-DEVICE.md).
+
 | Tier | Hub answer | `it-ai-mcp` | `itai` |
 |---|---|---|---|
 | read, change | runs (change also notifies the owner) | the result | the result |
