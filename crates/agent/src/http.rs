@@ -1598,8 +1598,11 @@ fn upload_ep(req: &mut Request, cfg: &Config) -> Resp {
         Some(b) => b,
         None => return json_resp(&serde_json::json!({"ok": false, "error": "no multipart boundary"}), 400),
     };
-    let mut body = Vec::new();
-    let _ = req.as_reader().read_to_end(&mut body);
+    let declared = req.body_length();
+    let body = match read_declared(req.as_reader(), declared) {
+        Ok(b) => b,
+        Err(e) => return json_resp(&serde_json::json!({"ok": false, "error": e}), 400),
+    };
     let (file, dir) = parse_multipart(&body, &boundary);
     let (fname, data) = match file {
         Some(f) => f,
@@ -1624,6 +1627,18 @@ fn upload_ep(req: &mut Request, cfg: &Config) -> Resp {
     match std::fs::write(&dest, &data) {
         Ok(_) => json_resp(&serde_json::json!({"ok": true, "saved": dest.to_string_lossy()}), 200),
         Err(e) => json_resp(&serde_json::json!({"ok": false, "error": e.to_string()}), 500),
+    }
+}
+
+/// The whole body, or an error if it ended before its Content-Length: a sender
+/// cut off mid-stream (a staged relay body whose fetch broke) must not leave a
+/// truncated file behind. tiny_http reports that early end as a clean EOF.
+fn read_declared(mut r: impl std::io::Read, declared: Option<usize>) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    r.read_to_end(&mut body).map_err(|e| format!("upload body: {e}"))?;
+    match declared {
+        Some(n) if body.len() < n => Err(format!("upload body truncated: got {} of {n} bytes", body.len())),
+        _ => Ok(body),
     }
 }
 
@@ -1769,6 +1784,19 @@ async function run(c){if(!c)return;out.style.display='block';out.textContent='$ 
     :('[error] '+(j.error||'failed')));}
   catch(err){out.textContent='$ '+c+'\n[error] '+err;}}
 </script></body></html>"####;
+
+#[cfg(test)]
+mod upload_body_tests {
+    use super::read_declared;
+
+    #[test]
+    fn a_body_cut_short_of_its_content_length_is_refused() {
+        let e = read_declared(&b"abc"[..], Some(10)).unwrap_err();
+        assert!(e.contains("got 3 of 10"), "{e}");
+        assert_eq!(read_declared(&b"abcdefghij"[..], Some(10)).unwrap(), b"abcdefghij");
+        assert_eq!(read_declared(&b"abc"[..], None).unwrap(), b"abc");
+    }
+}
 
 #[cfg(test)]
 mod update_ep_tests {

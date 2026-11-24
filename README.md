@@ -211,7 +211,7 @@ From agent 3.7.0, with hub 3.16.0 or later:
 From agent 3.12.0, **a hub that answers with a redirect is not a hub that answered.** Before
 3.12.0 a hello answered with `307`/`308` counted as connected, so when the hub's address moved
 the agent kept logging `relay: connected` while no check-in or reply reached the hub. Now, on
-every `/relay/*` call (hello, poll, reply, config, cap-key, hub cert, analysis, AI relay):
+every `/relay/*` call (hello, poll, body, reply, config, cap-key, hub cert, analysis, AI relay):
 - **A `307`/`308` is followed only to `https` on the same host or a subdomain of it**, on the
   same port or 443, at most 3 hops, re-sending the same method and body. For example
   `https://crane.glick.run/x` → `https://haivecontrol-sandbox.crane.glick.run/x` is followed;
@@ -230,6 +230,24 @@ every `/relay/*` call (hello, poll, reply, config, cap-key, hub cert, analysis, 
   are NOT reaching the hub (not followed: …); update --relay to the new address`. URLs in these
   lines never include the query string (it carries the token). The line is logged on the first
   occurrence and on any change, then at most once every 10 minutes while it persists.
+
+From agent 3.15.0, **large request bodies are fetched, not inlined.** The agent's hello carries
+`"relay_body": 1`. For such an agent the hub (3.29.0+) sends a request body over 1 MiB (an
+`upload_file` chunk, for example) as `"bf":1,"bl":<length>` in the poll response instead of
+base64 in `b`. The agent then calls `GET /relay/body?id=…&tok=…&req=<request id>` (through the same
+redirect rules as every other `/relay/*` call) and streams the bytes straight into the endpoint
+the request is for, with `Content-Length: <length>` and the request's `Content-Type`; it never
+holds the whole body in memory. If that fetch fails, the hub answers other than `200`, its
+`Content-Length` differs from `bl`, or the stream ends early, the request is answered `502`
+`relay body fetch failed: <reason>` (for example `hub answered 404` or
+`short body: got 70000 of 200000 bytes`). A body cut off mid-stream never completes the call, and
+`/upload` refuses a body shorter than its `Content-Length` (`upload body truncated: got … of …
+bytes`) instead of saving a truncated file. Requests without `bf`, and every request from an
+older agent or to an older hub, still carry the body inline as before.
+
+From agent 3.15.0, when the agent cannot reach its own loopback endpoint for a relayed request,
+the `502` reply says only why (`relay self-call failed: Connection Failed: …`). Before 3.15.0 it
+carried the full loopback URL, including `dtok=`, the agent's direct token, to the hub.
 
 ## Verify what you downloaded
 

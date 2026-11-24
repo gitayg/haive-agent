@@ -6,6 +6,7 @@
 // HTTPS endpoint (PaaS bypass path):
 //   POST /relay/hello   — register + heartbeat (fresh sysinfo/metrics)
 //   GET  /relay/poll    — long-poll for the next request the hub wants run
+//   GET  /relay/body    — fetch a request body the hub staged (relay_body.rs)
 //   POST /relay/reply   — stream the response back (chunked upload)
 // Each request is satisfied by calling our own loopback server, so every
 // existing endpoint works over the tunnel with no special-casing.
@@ -23,6 +24,7 @@ fn hello_payload(relay_id: &str, name: &str, sysinfo: &serde_json::Value) -> Vec
     if let Some(o) = d.as_object_mut() {
         o.insert("relay_id".into(), serde_json::json!(relay_id));
         o.insert("name".into(), serde_json::json!(name));
+        o.insert("relay_body".into(), serde_json::json!(1));
         if let Some(m) = crate::live_metrics().as_object() {
             for (k, v) in m {
                 o.insert(k.clone(), v.clone());
@@ -42,6 +44,10 @@ pub(crate) fn hello_url(base: &str, relay_id: &str, token: &str) -> String {
 
 pub(crate) fn poll_url(base: &str, relay_id: &str, token: &str) -> String {
     format!("{base}/relay/poll?{}", auth_query(relay_id, token))
+}
+
+pub(crate) fn body_url(base: &str, relay_id: &str, token: &str, req_id: u64) -> String {
+    format!("{base}/relay/body?{}&req={req_id}", auth_query(relay_id, token))
 }
 
 pub(crate) fn reply_url(base: &str, relay_id: &str, token: &str, req_id: u64, status: u16, ctype: &str) -> String {
@@ -147,6 +153,10 @@ pub fn relay_loop(name: String, sysinfo: serde_json::Value, cred: Arc<RelayCred>
 }
 
 fn handle_req(cred: &RelayCred, body: &str) {
+    serve_req(cred, body, crate::http::loopback_port())
+}
+
+pub(crate) fn serve_req(cred: &RelayCred, body: &str, lp: u16) {
     let relay_id = cred.relay_id();
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
     let req_id = v.get("id").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -164,7 +174,6 @@ fn handle_req(cred: &RelayCred, body: &str) {
         let _ = relay_redirect::post(cred, &reply(status, "text/plain"), Body::Bytes(None, msg.as_bytes()), None);
     };
 
-    let lp = crate::http::loopback_port();
     if lp == 0 {
         short(503, "agent loopback not ready");
         return;
@@ -177,16 +186,33 @@ fn handle_req(cred: &RelayCred, body: &str) {
     // credential switches to a device secret.
     let url = loopback_url(lp, &path, cred);
     let r = ureq::request(&method, &url);
-    let sent = match &reqbody {
-        Some(b) if ct.is_empty() => r.send_bytes(b),
-        Some(b) => r.set("Content-Type", &ct).send_bytes(b),
-        None => r.call(),
+    let sent = if crate::relay_body::staged(&v) {
+        let want = v.get("bl").and_then(|x| x.as_u64()).unwrap_or(0);
+        match crate::relay_body::self_call(cred, req_id, want, r, &ct) {
+            Ok(sent) => sent,
+            Err(why) => {
+                short(502, &format!("relay body fetch failed: {why}"));
+                return;
+            }
+        }
+    } else {
+        match &reqbody {
+            Some(b) if ct.is_empty() => r.send_bytes(b),
+            Some(b) => r.set("Content-Type", &ct).send_bytes(b),
+            None => r.call(),
+        }
     };
     let resp = match sent {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
         Err(e) => {
-            short(502, &format!("relay self-call failed: {e}"));
+            // Never `{e}`: ureq's Display carries the loopback URL, whose `dtok=` is
+            // the agent's direct token, and this reply goes to the hub.
+            let why = match &e {
+                ureq::Error::Transport(t) => format!("{}{}", t.kind(), t.message().map(|m| format!(": {m}")).unwrap_or_default()),
+                ureq::Error::Status(s, _) => format!("HTTP {s}"),
+            };
+            short(502, &format!("relay self-call failed: {why}"));
             return;
         }
     };
@@ -207,6 +233,7 @@ mod tests {
         let urls = [
             super::hello_url(b, rid, tok),
             super::poll_url(b, rid, tok),
+            super::body_url(b, rid, tok, 7),
             super::reply_url(b, rid, tok, 7, 200, "text/plain"),
             crate::config::config_url(b, rid, tok),
             crate::config::cap_key_url(b, rid, tok),
@@ -220,6 +247,13 @@ mod tests {
             assert!(q.split('&').any(|kv| kv == "tok=hdev_x"), "no tok= in {u}");
         }
         assert!(urls[0].ends_with("&ds=1"), "hello must ask for a device secret: {}", urls[0]);
+    }
+
+    #[test]
+    fn the_hello_offers_staged_bodies() {
+        let p: serde_json::Value = serde_json::from_slice(&super::hello_payload("hc-1", "n", &serde_json::json!({}))).unwrap();
+        assert_eq!(p["relay_body"], 1, "{p}");
+        assert_eq!(p["relay_id"], "hc-1");
     }
 
     #[test]
