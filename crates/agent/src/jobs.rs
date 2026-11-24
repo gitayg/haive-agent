@@ -24,6 +24,7 @@ struct Job {
     pid: u32,
     started: u64,
     exit: Arc<Mutex<Option<i32>>>,
+    workspace: Option<PathBuf>,
 }
 
 impl Job {
@@ -34,12 +35,15 @@ impl Job {
 
 pub struct Registry {
     dir: PathBuf,
+    workspaces: PathBuf,
     jobs: Mutex<Vec<Job>>,
 }
 
 fn registry() -> &'static Registry {
     static R: OnceLock<Registry> = OnceLock::new();
-    R.get_or_init(|| Registry::new(PathBuf::from(crate::persistence::home()).join(".it-ai").join("jobs")))
+    R.get_or_init(|| {
+        Registry::new(PathBuf::from(crate::persistence::home()).join(".it-ai").join("jobs"), crate::workspace::root())
+    })
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -73,8 +77,8 @@ fn exit_code_of(s: std::process::ExitStatus) -> i32 {
 }
 
 impl Registry {
-    pub fn new(dir: PathBuf) -> Self {
-        Registry { dir, jobs: Mutex::new(Vec::new()) }
+    pub fn new(dir: PathBuf, workspaces: PathBuf) -> Self {
+        Registry { dir, workspaces, jobs: Mutex::new(Vec::new()) }
     }
 
     /// Drop the oldest finished jobs past MAX_JOBS. Running jobs are never dropped:
@@ -97,23 +101,40 @@ impl Registry {
             return (json!({"ok": false, "error": "empty command"}), 400);
         }
         let cwd = v.get("cwd").and_then(|c| c.as_str()).filter(|s| !s.is_empty());
+        let want_ws = v.get("workspace").and_then(Value::as_bool).unwrap_or(false);
+        if want_ws && cwd.is_some() {
+            return (json!({"ok": false, "error": "cwd and workspace cannot be combined"}), 400);
+        }
         if let Err(e) = std::fs::create_dir_all(&self.dir) {
             return (json!({"ok": false, "error": e.to_string()}), 500);
         }
         let id = new_id();
+        let workspace = match want_ws.then(|| crate::workspace::create(&self.workspaces, &id)).transpose() {
+            Ok(w) => w,
+            Err(e) => return (json!({"ok": false, "error": format!("workspace: {e}")}), 500),
+        };
+        let fail = |e: String| {
+            if let Some(w) = &workspace {
+                crate::workspace::remove(w);
+            }
+            (json!({"ok": false, "error": e}), 500)
+        };
         let log = self.dir.join(format!("{id}.log"));
         let out = match std::fs::OpenOptions::new().create(true).append(true).open(&log) {
             Ok(f) => f,
-            Err(e) => return (json!({"ok": false, "error": e.to_string()}), 500),
+            Err(e) => return fail(e.to_string()),
         };
         let err = match out.try_clone() {
             Ok(f) => f,
-            Err(e) => return (json!({"ok": false, "error": e.to_string()}), 500),
+            Err(e) => return fail(e.to_string()),
         };
         let mut c = shell(&cmd);
         c.stdin(Stdio::null()).stdout(out).stderr(err);
         if let Some(d) = cwd {
             c.current_dir(d);
+        }
+        if let Some(w) = &workspace {
+            c.current_dir(w).env("IT_AI_WORKSPACE", w);
         }
         #[cfg(unix)]
         {
@@ -127,20 +148,37 @@ impl Registry {
         }
         let mut child = match c.spawn() {
             Ok(ch) => ch,
-            Err(e) => return (json!({"ok": false, "error": e.to_string()}), 500),
+            Err(e) => return fail(e.to_string()),
         };
         let pid = child.id();
         let exit = Arc::new(Mutex::new(None));
         let exit_w = exit.clone();
+        let ws = workspace.clone();
+        let wid = id.clone();
         std::thread::spawn(move || {
             let code = child.wait().map(exit_code_of).unwrap_or(-1);
+            // Removed before the exit is published: a caller that sees the job ended
+            // never finds its workspace still there unless it is left for the sweep.
+            if let Some(w) = ws {
+                if !crate::workspace::remove(&w) {
+                    eprintln!("job {wid}: workspace {} is still in use; left for the startup sweep", w.display());
+                }
+            }
             *exit_w.lock().unwrap() = Some(code);
         });
         let started = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut reply = json!({"ok": true, "id": id, "pid": pid, "log": log.to_string_lossy()});
+        if let Some(w) = &workspace {
+            reply["workspace"] = json!(w.to_string_lossy());
+        }
         let mut jobs = self.jobs.lock().unwrap();
-        jobs.push(Job { id: id.clone(), cmd, pid, started, exit });
+        jobs.push(Job { id: id.clone(), cmd, pid, started, exit, workspace });
         Self::prune(&mut jobs);
-        (json!({"ok": true, "id": id, "pid": pid, "log": log.to_string_lossy()}), 200)
+        (reply, 200)
+    }
+
+    fn workspace_of(&self, id: &str) -> Option<PathBuf> {
+        self.jobs.lock().unwrap().iter().find(|j| j.id == id).and_then(|j| j.workspace.clone())
     }
 
     fn exit_of(&self, id: &str) -> Option<(u32, Arc<Mutex<Option<i32>>>)> {
@@ -172,19 +210,20 @@ impl Registry {
             Err(_) => 0,
         };
         let next = offset + data.len() as u64;
-        (
-            json!({
-                "ok": true,
-                "id": id,
-                "running": exit_code.is_none(),
-                "exit_code": exit_code,
-                "offset": next,
-                "size": size,
-                "eof": exit_code.is_some() && next >= size,
-                "data": String::from_utf8_lossy(&data),
-            }),
-            200,
-        )
+        let mut reply = json!({
+            "ok": true,
+            "id": id,
+            "running": exit_code.is_none(),
+            "exit_code": exit_code,
+            "offset": next,
+            "size": size,
+            "eof": exit_code.is_some() && next >= size,
+            "data": String::from_utf8_lossy(&data),
+        });
+        if let Some(w) = self.workspace_of(id) {
+            reply["workspace"] = json!(w.to_string_lossy());
+        }
+        (reply, 200)
     }
 
     pub fn stop(&self, id: &str) -> (Value, u16) {
@@ -209,7 +248,11 @@ impl Registry {
             .iter()
             .map(|j| {
                 let code = j.exit_code();
-                json!({"id": j.id, "cmd": j.cmd, "pid": j.pid, "started": j.started, "running": code.is_none(), "exit_code": code})
+                let mut row = json!({"id": j.id, "cmd": j.cmd, "pid": j.pid, "started": j.started, "running": code.is_none(), "exit_code": code});
+                if let Some(w) = &j.workspace {
+                    row["workspace"] = json!(w.to_string_lossy());
+                }
+                row
             })
             .collect();
         (json!({"ok": true, "jobs": rows}), 200)
@@ -273,6 +316,9 @@ pub fn list_ep() -> (Value, u16) {
 }
 
 #[cfg(all(test, unix))]
+mod workspace_tests;
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -285,7 +331,7 @@ mod tests {
     fn scratch(name: &str) -> Registry {
         let d = std::env::temp_dir().join(format!("it-ai-jobs-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        Registry::new(d)
+        Registry::new(d.join("jobs"), d.join("workspaces"))
     }
 
     fn start(r: &Registry, cmd: &str) -> String {

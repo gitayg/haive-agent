@@ -166,8 +166,10 @@ async fn every_hub_request_of_the_call_carries_the_receipt_and_raw_args() {
     let mut s = Session::start(&h).await;
     let out = s.call("run_command", json!({"device": "pc1", "command": "echo \"héllo\" 1.5", "_moorai": {"receipt": RECEIPT}})).await;
     assert_eq!(out, "ran\n");
-    let reqs = h.requests();
+    // The session-token exchange is the server's own request, not the call's.
+    let reqs: Vec<Req> = h.requests().into_iter().filter(|r| r.path != "/m/session-token").collect();
     assert!(reqs.iter().any(|r| r.path == "/m/agents") && reqs.iter().any(|r| r.path == "/m/exec"));
+    assert_no_moorai(&h.hits("/m/session-token"));
     for r in &reqs {
         assert_eq!(r.header("x-moorai-receipt"), Some(RECEIPT), "{}", r.path);
         assert_eq!(r.header("x-moorai-tool"), Some("run_command"), "{}", r.path);
@@ -194,7 +196,7 @@ async fn approval_polls_and_fleet_calls_carry_the_headers_and_the_next_call_does
     let out = s.call("run_command", json!({"device": "pc1", "command": "rm -rf /tmp/x", "_moorai": {"receipt": RECEIPT}})).await;
     assert!(out.starts_with("Approved by boss@x.io"), "{out}");
     assert!(!h.hits("/m/approval").is_empty());
-    for r in h.requests() {
+    for r in h.requests().into_iter().filter(|r| r.path != "/m/session-token") {
         assert_eq!(r.header("x-moorai-receipt"), Some(RECEIPT), "{}", r.path);
     }
     let before = h.requests().len();

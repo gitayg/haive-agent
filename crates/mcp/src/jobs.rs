@@ -25,6 +25,9 @@ pub struct JobStartArgs {
     /// working directory on the device (optional)
     #[serde(default)]
     cwd: Option<String>,
+    /// run in a scratch folder that is deleted when the job ends (its path is also in the job's IT_AI_WORKSPACE env var; needs agent 3.16.0)
+    #[serde(default)]
+    workspace: bool,
     /// true = only ask the hub what this would do (tier, approval, devices); nothing runs
     #[serde(default)]
     dry_run: bool,
@@ -51,7 +54,12 @@ pub struct JobIdArgs {
 #[cfg(test)]
 impl JobStartArgs {
     pub fn for_test(device: &str, command: &str, dry_run: bool) -> Self {
-        JobStartArgs { device: device.into(), command: command.into(), cwd: None, dry_run }
+        JobStartArgs { device: device.into(), command: command.into(), cwd: None, workspace: false, dry_run }
+    }
+
+    pub fn with_workspace(mut self) -> Self {
+        self.workspace = true;
+        self
     }
 }
 
@@ -74,12 +82,32 @@ pub fn list_url(ctl: &Controller, target: &str) -> String {
     ctl.hub_url("job/list", &format!("target={}", urlencode(target)))
 }
 
-pub fn start_body(command: &str, cwd: Option<&str>) -> serde_json::Value {
+pub fn start_body(command: &str, cwd: Option<&str>, workspace: bool) -> serde_json::Value {
     let mut body = serde_json::json!({ "cmd": command });
     if let Some(dir) = cwd.filter(|d| !d.is_empty()) {
         body["cwd"] = serde_json::json!(dir);
     }
+    if workspace {
+        body["workspace"] = serde_json::json!(true);
+    }
     body
+}
+
+/// The job_start result line. A workspace asked for and not reported back means
+/// the agent is older than 3.16.0 and ran the job without one.
+pub fn fmt_started(v: &serde_json::Value, workspace: bool) -> String {
+    let mut s = format!(
+        "started job {} (pid {}, log {})",
+        v["id"].as_str().unwrap_or(""),
+        v["pid"].as_u64().unwrap_or(0),
+        v["log"].as_str().unwrap_or("")
+    );
+    match v["workspace"].as_str().filter(|w| !w.is_empty()) {
+        Some(w) => s.push_str(&format!("; workspace {w} (deleted when the job ends)")),
+        None if workspace => s.push_str("; no workspace: this agent does not support one (needs agent 3.16.0), so the job runs in its default directory"),
+        None => {}
+    }
+    s
 }
 
 /// Mask any `mtok=` query value in an error message. `Controller::resolve`
@@ -107,7 +135,7 @@ fn jerr(e: impl ToString) -> ErrorData {
 /// Send a hub request and classify its answer. reqwest errors are stripped of
 /// their URL, which carries the `mtok` token.
 async fn send(srv: &Srv, rb: reqwest::RequestBuilder) -> Result<Reply, ErrorData> {
-    srv.ctl.hub_send(rb.timeout(REQUEST_TIMEOUT)).await.map_err(jerr)
+    srv.hub(rb.timeout(REQUEST_TIMEOUT)).await
 }
 
 fn text(s: String) -> CallToolResult {
@@ -167,10 +195,13 @@ pub fn fmt_list(v: &serde_json::Value) -> String {
 
 #[tool_router(router = job_router, vis = "pub(crate)")]
 impl Srv {
-    #[tool(description = "Start a long-running command on the named device in the background (dev servers, builds, anything past run_command's ~65s limit). Returns the job id; read its output with job_logs and end it with job_stop. Like run_command, a command that is not on the hub's read-only allowlist needs a human's approval in the IT-AI dashboard (the tool waits up to 60 s, then returns an approval id for approval_status).")]
+    #[tool(description = "Start a long-running command on the named device in the background (dev servers, builds, anything past run_command's ~65s limit). Returns the job id; read its output with job_logs and end it with job_stop. workspace=true runs it in a scratch folder that is deleted when the job ends. Like run_command, a command that is not on the hub's read-only allowlist needs a human's approval in the IT-AI dashboard (the tool waits up to 60 s, then returns an approval id for approval_status).")]
     pub(crate) async fn job_start(&self, Parameters(a): Parameters<JobStartArgs>) -> Result<CallToolResult, ErrorData> {
+        if a.workspace && a.cwd.as_deref().is_some_and(|c| !c.is_empty()) {
+            return Ok(CallToolResult::success(vec![ContentBlock::text("[error] cwd and workspace cannot be combined")]));
+        }
         let target = self.resolve(&a.device).await.map_err(jerr)?;
-        let body = start_body(&a.command, a.cwd.as_deref());
+        let body = start_body(&a.command, a.cwd.as_deref(), a.workspace);
         let mut url = start_url(&self.ctl, &target);
         if a.dry_run {
             url.push_str("&dry_run=1");
@@ -182,15 +213,7 @@ impl Srv {
         if let Some(r) = refused(&v) {
             return Ok(r);
         }
-        Ok(text(with_note(
-            note,
-            format!(
-                "started job {} (pid {}, log {})",
-                v["id"].as_str().unwrap_or(""),
-                v["pid"].as_u64().unwrap_or(0),
-                v["log"].as_str().unwrap_or("")
-            ),
-        )))
+        Ok(text(with_note(note, fmt_started(&v, a.workspace))))
     }
 
     #[tool(description = "Read a background job's output from a byte offset. Returns a JSON line with the next `offset`, `running`, `exit_code` and `eof`, then the output text. Call again with the returned offset to read what was written since; stop when eof is true.")]

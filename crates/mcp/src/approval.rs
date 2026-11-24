@@ -50,12 +50,20 @@ pub fn settled_result(s: Settled, fmt: &(dyn Fn(&Value) -> String + Sync)) -> Ca
 impl Srv {
     /// Send a hub request and classify its answer.
     pub(crate) async fn hub(&self, rb: reqwest::RequestBuilder) -> Result<Reply, ErrorData> {
-        self.ctl.hub_send(rb).await.map_err(err)
+        let r = rb.send().await.map_err(|e| err(e.without_url()))?;
+        self.seen.status(r.status().as_u16());
+        reply::read(r).await.map_err(err)
     }
 
     /// Run `op` on a device (LAN-direct or relay), or only ask the hub about it.
     pub(crate) async fn device_reply(&self, target: &str, op: Op, dry_run: bool) -> Result<Reply, ErrorData> {
-        let resp = if dry_run { self.ctl.dry_run(target, op).await } else { self.ctl.call_device(target, op).await }.map_err(err)?;
+        let resp = if dry_run {
+            let r = self.ctl.dry_run(target, op).await.map_err(err)?;
+            self.seen.status(r.status().as_u16());
+            r
+        } else {
+            self.call_device(target, op).await.map_err(err)?
+        };
         reply::read(resp).await.map_err(err)
     }
 
@@ -88,7 +96,10 @@ impl Srv {
     async fn approval_status(&self, Parameters(a): Parameters<ApprovalArgs>) -> Result<CallToolResult, ErrorData> {
         let v = match self.ctl.approval(&a.id).await {
             Ok(v) => v,
-            Err(e) => return Ok(error(format!("[error] {}", crate::jobs::redact_token(&e)))),
+            Err(e) => {
+                self.auth_check().await;
+                return Ok(error(format!("[error] {}", crate::jobs::redact_token(&e))));
+            }
         };
         Ok(match Settled::from_view(&v) {
             Some(s) => settled_result(s, &reply::result_text),

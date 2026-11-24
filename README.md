@@ -457,6 +457,68 @@ approval runs the one stored request, once; re-sending the action files a new re
   receipt-carrying call uses its own hub client, so it probes the LAN-direct route afresh rather
   than reusing the cached one. `it-ai-mcp` never logs the receipt or the args; the hub decides
   what a receipt is worth.
+- **Listing approvals** (`it-ai-mcp` 3.16.0, needs hub 3.30.0): `list_approvals(status?, device?)`
+  reads `GET /m/approvals` and shows your approval requests, one per line: those still waiting for
+  a human (with who asked and when the request expires) and the recently decided ones (with who
+  decided them, and the exit code once run). `status` is `pending`, `recent` or `all` (default);
+  `device` keeps one device's. A read; `approval_status(id)` still gives one request's result.
+- **Per-session tokens** (`it-ai-mcp` 3.16.0, needs hub 3.30.0): on its first tool call
+  `it-ai-mcp` trades `HIVE_MCP_TOKEN` for a session token (`POST /m/session-token`) named
+  `<client> · <host> · pid <pid>`, where `<client>` is the MCP client's `clientInfo.name` from
+  `initialize` (`it-ai-mcp` when it sent none), and uses it for every later hub request. The hub's
+  audit log and approval list then name that one session, and each session can be revoked on its
+  own in the dashboard. The session token has the configured token's scope and owner and lasts at
+  most 24 h.
+  - If the mint answers anything but 200 with a token (a hub older than 3.30.0, an open hub, a
+    refusal), `it-ai-mcp` keeps using `HIVE_MCP_TOKEN` and says so once on stderr. With no
+    `HIVE_MCP_TOKEN` set it does not try.
+  - A 401 for a session token that has worked before: it mints a new one, once. A 401 for a
+    session token that never worked, or a re-mint that fails: it falls back to `HIVE_MCP_TOKEN`
+    for the rest of the process.
+  - A tool call whose first hub request got the 401 is run again with the new token, because
+    nothing it sent had run. A call that got a 401 part-way through (say, in the middle of
+    `type_text`) is not repeated; the next call uses the new token.
+  - No token is ever printed: not on stderr, and not in an error (`mtok=***`).
+
+## Fetch a published file onto a device
+
+`fetch_url(device, url, sha256, dir?, name?)` (`it-ai-mcp` 3.16.0, needs hub 3.30.0) has the
+device download a file from a public https URL itself, and keep it only if its sha256 matches.
+Prefer it over `upload_file` and `push_file` for anything already published, such as release
+assets and CI artifacts: the bytes go from the source straight to the device, not through your
+machine or the hub.
+
+- The tool calls `POST /m/fetch-url?target=&url=&sha256=[&dir=][&name=]`, then polls
+  `GET /m/file-status?target=&job=` (the status `push_file` polls) until the device is done, and
+  returns `fetched <bytes> bytes to <path> (sha256 verified)` or the error. It waits up to
+  16 minutes; the agent gives up on a download after 15.
+- `url` must be https, name a host by its DNS name (no IP address, `localhost`, `.local`,
+  `.internal` or `.localhost`), and carry no credentials, query string or fragment. The hub
+  refuses anything else with a message naming the rule.
+- `sha256` is required, 64 hex characters. `name` defaults to the last segment of the URL;
+  `dir` defaults to the agent's share folder, else the user's home, inside the same sandbox as
+  `upload_file`.
+- The hub tiers it as `upload` (change), like `push_file`.
+- On the device (agent 3.16.0), `/fetch-file` — the endpoint both `fetch_url` and `push_file`
+  use — requires a 64-hex `sha256` (400 `need sha256: 64 hex characters`; before 3.16.0 an
+  empty one skipped the check). It follows redirects itself, at most 5, and only https → https,
+  so a GitHub release asset (which redirects to a signed storage URL) works and a downgrade to
+  http is refused. The file is written to `<name>.part` and renamed only when the hash matches;
+  the `.part` is deleted on any error. Error messages never show a URL's query string, and a
+  mismatch reports only `sha256 mismatch`, never the hash the agent computed.
+- A `fetch_url` request carries `"public": true`, and the agent then holds the download to the
+  public internet itself, since the hub checks only the first URL and only its name. The hub's
+  host rule (https, a DNS name, no IP address, `localhost`, `.localhost`, `.local`, `.internal`
+  or single-label name, no username or password) is applied to the URL and to every redirect
+  target, so a public server cannot redirect the device to `https://192.168.1.1/` or
+  `https://router.local/`. Names are resolved through a resolver that keeps only public
+  addresses: loopback, private (10/8, 172.16/12, 192.168/16), link-local (169.254/16,
+  fe80::/10), CGNAT 100.64/10, 0.0.0.0/8, 198.18/15, multicast, broadcast, unique-local
+  fc00::/7, and IPv4-mapped, IPv4-compatible and NAT64 (64:ff9b::/96) forms of those are
+  dropped at connect time. A name with nothing left fails with `the host resolves only to
+  non-public addresses`, which also covers a public name that resolves to, or rebinds to, a LAN
+  address. `push_file` does not set the flag: it pulls from the hub's own URL, which is
+  `http://<hub LAN address>:<port>` when `HUB_PUBLIC_URL` is unset.
 
 ## Background jobs
 
@@ -483,10 +545,14 @@ MCP tools, same operations:
 
 | Tool | Returns |
 |---|---|
-| `job_start(device, command, cwd?, dry_run?)` | job id, pid and log path (a command off the hub's allowlist waits for approval first) |
+| `job_start(device, command, cwd?, workspace?, dry_run?)` | job id, pid and log path (a command off the hub's allowlist waits for approval first); with `workspace: true`, also the scratch folder |
 | `job_logs(device, id, offset?)` | a JSON line with the next `offset`, `running`, `exit_code`, `eof`, `size`, then the output text |
 | `job_stop(device, id)` | whether it was running, and the exit code |
 | `job_list(device)` | id, running or exit code, pid, start time (unix secs), command |
+
+`job_start` with `workspace: true` runs the job in a scratch folder that is deleted when the job
+ends (its path is also in the job's `IT_AI_WORKSPACE`); it needs agent 3.16.0, and with an older
+agent the tool says the job ran without one.
 
 On the agent:
 

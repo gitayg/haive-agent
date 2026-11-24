@@ -15,7 +15,7 @@ remote exec is disabled (`cfg.exec_enabled == false`) with the same 403 body `/e
 
 | Method | Path | Request | Response (JSON) |
 |---|---|---|---|
-| POST | `/jobs/start` | body `{"cmd": "<shell command>", "cwd": "<dir>"?}` | `{"ok":true,"id":"<job id>","pid":<u32>,"log":"<path>"}` |
+| POST | `/jobs/start` | body `{"cmd": "<shell command>", "cwd": "<dir>"?, "workspace": <bool>?}` | `{"ok":true,"id":"<job id>","pid":<u32>,"log":"<path>","workspace":"<path>"?}` |
 | GET | `/jobs/logs?id=<id>&offset=<n>&max=<n>` | `offset` default 0; `max` default 65536, capped at 1048576 | `{"ok":true,"id","running":<bool>,"exit_code":<int\|null>,"offset":<next offset>,"size":<total bytes>,"eof":<bool>,"data":"<text>"}` |
 | POST | `/jobs/stop?id=<id>` | — | `{"ok":true,"id","stopped":<bool>,"exit_code":<int\|null>}` |
 | GET | `/jobs/list` | — | `{"ok":true,"jobs":[{"id","cmd","pid","started":<unix secs>,"running","exit_code"}]}` |
@@ -33,6 +33,15 @@ remote exec is disabled (`cfg.exec_enabled == false`) with the same 403 body `/e
   stay on disk). The registry keeps the most recent 50 jobs; older finished jobs are dropped
   from `list` (their logs remain).
 - Unknown id → `{"ok":false,"error":"unknown job"}` with 404.
+- **Workspace (agent 3.16.0).** With `"workspace": true` the agent creates a fresh
+  `~/.it-ai/workspaces/<job id>/` (`%USERPROFILE%` on Windows; 0700 on unix, the data dir's ACL
+  on Windows), runs the job there with `IT_AI_WORKSPACE=<path>` set, and deletes the whole tree
+  when the job's process exits (success, failure or `/jobs/stop`), before it reports
+  `running:false`. A tree that can't be deleted within ~2 s (Windows: a still-running child holds
+  a file open) is left, and the agent removes anything in `workspaces/` older than 24 h at its
+  next start. `workspace` with a non-empty `cwd` → 400 `cwd and workspace cannot be combined`
+  (the hub refuses the same before forwarding). The start reply, `/jobs/list` rows and
+  `/jobs/logs` carry `"workspace"` only when it was asked for.
 
 ## Hub (`HaiveControl`, `crates/hub`) — `/m/*` for MCP/CLI, `/x/*` for the dashboard
 
@@ -59,6 +68,6 @@ remote exec is disabled (`cfg.exec_enabled == false`) with the same 403 body `/e
 - `itai job logs <device> <id> [--offset N] [--follow]` → prints output; `--follow` polls every
   2 s from the returned offset until `eof`, then prints the exit code.
 - `itai job stop <device> <id>` · `itai job list <device>`.
-- MCP tools: `job_start(device, command, cwd?)`, `job_logs(device, id, offset?)` (returns the
+- MCP tools: `job_start(device, command, cwd?, workspace?)`, `job_logs(device, id, offset?)` (returns the
   text plus the next offset, `running` and `exit_code`), `job_stop(device, id)`,
   `job_list(device)`.

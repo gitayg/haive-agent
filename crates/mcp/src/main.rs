@@ -13,9 +13,14 @@
 //   HIVE_OWNER      owner id to act as (per-user hub scoping)
 //   HAIVE_CAFILE    optional PEM to verify a self-signed hub cert
 mod approval;
+mod approval_list;
+mod fetch;
 mod jobs;
 mod moorai;
 mod policy;
+mod session;
+#[cfg(test)]
+mod testmcp;
 
 use approval::{text, with_note};
 use base64::Engine;
@@ -218,13 +223,16 @@ struct RunPluginArgs {
 struct Srv {
     tool_router: ToolRouter<Srv>,
     hub: String,
-    mtok: String,
     owner: String,
     /// Shared LAN-direct/relay transport. Owns the hub client, the per-device
     /// route cache, and the `/m` URL construction — `itai` drives the same one.
     ctl: std::sync::Arc<Controller>,
     /// How long a tool waits for a human to approve a privileged action.
     wait: Wait,
+    session: std::sync::Arc<session::Session>,
+    /// This call's hub answers, for the session token's 401 handling.
+    seen: std::sync::Arc<session::Seen>,
+    on_session: bool,
 }
 
 fn err(e: impl ToString) -> ErrorData {
@@ -319,17 +327,42 @@ impl Srv {
     }
 
     fn with(hub: String, mtok: String, owner: String, wait: Wait) -> Self {
-        let mut tool_router = Self::tool_router() + Self::job_router() + Self::approval_router();
+        let mut tool_router = Self::tool_router() + Self::job_router() + Self::approval_router() + Self::approval_list_router() + Self::fetch_router();
         policy::annotate(&mut tool_router);
-        let ctl = std::sync::Arc::new(Controller::new(hub.clone(), mtok.clone(), owner.clone(), build_client(Default::default())));
-        Self { tool_router, hub, mtok, owner, ctl, wait }
+        let session = std::sync::Arc::new(session::Session::new(hub.clone(), mtok, owner.clone(), build_client(Default::default())));
+        let ctl = session.base();
+        Self { tool_router, hub, owner, ctl, wait, session, seen: Default::default(), on_session: false }
     }
 
-    /// This server for one tool call whose hub requests all carry `headers`. The
-    /// call gets its own hub client, and so its own LAN-direct route cache.
-    fn with_headers(&self, headers: reqwest::header::HeaderMap) -> Self {
-        let ctl = Controller::new(self.hub.clone(), self.mtok.clone(), self.owner.clone(), build_client(headers));
-        Self { ctl: std::sync::Arc::new(ctl), ..self.clone() }
+    /// This server for one tool call that runs with `tok`. A call whose hub
+    /// requests all carry `headers` gets its own hub client, and so its own
+    /// LAN-direct route cache.
+    fn for_call(&self, tok: &session::Effective, headers: Option<reqwest::header::HeaderMap>) -> Self {
+        let ctl = match headers {
+            Some(h) => std::sync::Arc::new(Controller::new(self.hub.clone(), tok.token.clone(), self.owner.clone(), build_client(h))),
+            None => tok.ctl.clone(),
+        };
+        Self { ctl, seen: Default::default(), on_session: tok.session, ..self.clone() }
+    }
+
+    /// After a failure that may hide a 401 (a device lookup, an approval poll,
+    /// a refused capability), ask the hub whether the session token still works.
+    async fn auth_check(&self) {
+        if self.on_session {
+            if let Ok(r) = self.client().get(self.m("agents", "")).timeout(std::time::Duration::from_secs(10)).send().await {
+                self.seen.status(r.status().as_u16());
+            }
+        }
+    }
+
+    /// `Controller::call_device`, with the answer's status noted.
+    async fn call_device(&self, target: &str, op: Op) -> Result<reqwest::Response, String> {
+        let r = self.ctl.call_device(target, op).await;
+        match &r {
+            Ok(resp) => self.seen.status(resp.status().as_u16()),
+            Err(_) => self.auth_check().await,
+        }
+        r
     }
 
     /// The hub client, for the `/m` actions the hub composes itself (fleet
@@ -345,7 +378,11 @@ impl Srv {
     }
 
     async fn resolve(&self, name: &str) -> Result<String, String> {
-        self.ctl.resolve(name).await
+        let r = self.ctl.resolve(name).await;
+        if r.is_err() {
+            self.auth_check().await;
+        }
+        r
     }
 
     /// Send one input event. `Some` = stop here and return this, because the hub
@@ -366,7 +403,7 @@ impl Srv {
 
     /// A JPEG from the device (frame, camera), or the hub's answer when it is not one.
     async fn device_image(&self, target: &str, op: Op) -> Result<CallToolResult, ErrorData> {
-        let resp = self.ctl.call_device(target, op).await.map_err(err)?;
+        let resp = self.call_device(target, op).await.map_err(err)?;
         match reply::bytes_or_reply(resp).await.map_err(err)? {
             Ok(bytes) => {
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -443,7 +480,7 @@ impl Srv {
     async fn download_file(&self, Parameters(a): Parameters<DownloadArgs>) -> Result<CallToolResult, ErrorData> {
         let target = self.resolve(&a.device).await.map_err(err)?;
         let op = Op::get("download").query("path", a.remote_path.clone());
-        let resp = self.ctl.call_device(&target, op).await.map_err(err)?;
+        let resp = self.call_device(&target, op).await.map_err(err)?;
         let bytes = match reply::bytes_or_reply(resp).await.map_err(err)? {
             Ok(b) => b,
             Err(r) => return self.finish(r, &reply::result_text).await,
@@ -780,16 +817,31 @@ impl Srv {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Srv {
     async fn call_tool(&self, mut request: CallToolRequestParams, context: RequestContext<RoleServer>) -> Result<CallToolResult, ErrorData> {
-        let receipt = moorai::take(&request.name, &mut request.arguments).map(|h| self.with_headers(h));
-        let srv = receipt.as_ref().unwrap_or(self);
-        self.tool_router.call(ToolCallContext::new(srv, request, context)).await
+        let headers = moorai::take(&request.name, &mut request.arguments);
+        let client = context.peer.peer_info().map(|i| i.client_info.name.clone());
+        let mut retries = 0;
+        loop {
+            let tok = self.session.token(client.as_deref()).await;
+            let srv = self.for_call(&tok, headers.clone());
+            let r = self.tool_router.call(ToolCallContext::new(&srv, request.clone(), context.clone())).await;
+            if tok.session && srv.seen.unauthorized() {
+                // Retried only when nothing in the call got past the hub's auth.
+                if self.session.rejected(&tok.token).await && srv.seen.first_unauthorized() && retries < 2 {
+                    retries += 1;
+                    continue;
+                }
+            } else if tok.session && srv.seen.through() {
+                self.session.proven(&tok.token).await;
+            }
+            return r;
+        }
     }
 
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), camera_snapshot, update_agent, dissolve_agent, job_start/job_logs/job_stop/job_list (background commands past run_command's ~65s limit). The hub tiers every action: read and change run, blocked is refused, and privileged waits for a human's approval in the IT-AI dashboard — a tool waits up to 60 s, then returns an approval id to check with approval_status. Never route around a pending or blocked action. Change tools take dry_run=true to see the hub's verdict without running anything.".to_string(),
+            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), fetch_url (the device downloads a published https file itself, sha256-checked — preferred for release assets and CI artifacts), camera_snapshot, update_agent, dissolve_agent, job_start/job_logs/job_stop/job_list (background commands past run_command's ~65s limit). The hub tiers every action: read and change run, blocked is refused, and privileged waits for a human's approval in the IT-AI dashboard — a tool waits up to 60 s, then returns an approval id to check with approval_status; list_approvals shows what is waiting. Never route around a pending or blocked action. Change tools take dry_run=true to see the hub's verdict without running anything.".to_string(),
         );
         info
     }

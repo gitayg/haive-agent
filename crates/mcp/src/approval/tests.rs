@@ -284,4 +284,6 @@ async fn tools_list_carries_the_tier_annotations() {
     assert_eq!(ann("click"), (json!(false), json!(false)));
     assert_eq!(ann("dissolve_agent"), (json!(false), json!(true)));
     assert_eq!(ann("run_command"), (json!(false), json!(true)));
+    assert_eq!(ann("list_approvals"), (json!(true), json!(false)));
+    assert_eq!(ann("fetch_url"), (json!(false), json!(false)));
 }

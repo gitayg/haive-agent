@@ -19,6 +19,8 @@ mod jobs;
 mod logfile;
 mod persistence;
 mod wakelock;
+mod workspace;
+mod fetchfile;
 mod presence;
 mod reap;
 mod relay;
@@ -624,6 +626,7 @@ fn main() {
     let _instance = instance::claim();
     #[cfg(unix)]
     let _ = std::env::set_current_dir("/");
+    workspace::sweep_at_startup();
 
     let mut cert = if tls {
         let home = std::env::var("HOME")

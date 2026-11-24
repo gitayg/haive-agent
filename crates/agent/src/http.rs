@@ -1459,15 +1459,10 @@ fn fetch_jobs() -> &'static std::sync::Mutex<std::collections::HashMap<String, F
 fn fetch_file_ep(req: &mut Request, cfg: &Config) -> Resp {
     let mut b = String::new();
     let _ = req.as_reader().read_to_string(&mut b);
-    let v: serde_json::Value = serde_json::from_str(&b).unwrap_or_default();
-    let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let sha = v.get("sha256").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let dir = v.get("dir").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let job = v.get("job").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    if url.is_empty() || name.is_empty() || job.is_empty() {
-        return json_resp(&serde_json::json!({"ok": false, "error": "need url, name, job"}), 200);
-    }
+    let crate::fetchfile::FetchReq { url, sha256: sha, dir, name, job, public } = match crate::fetchfile::parse(&b) {
+        Ok(r) => r,
+        Err((e, code)) => return json_resp(&serde_json::json!({"ok": false, "error": e}), code),
+    };
     // Resolve the destination directory through the SAME sandbox `/upload` uses,
     // so a pushed file can't escape the share/allowed root.
     let base = if dir.is_empty() {
@@ -1483,6 +1478,9 @@ fn fetch_file_ep(req: &mut Request, cfg: &Config) -> Resp {
         Some(d) => d,
         None => return json_resp(&serde_json::json!({"ok": false, "error": "bad destination"}), 400),
     };
+    if let Err(e) = crate::fetchfile::dest_dir_ready(&dest_dir) {
+        return json_resp(&serde_json::json!({"ok": false, "error": e}), 400);
+    }
     // Filename is always reduced to a basename — never let it carry separators.
     let safe_name = std::path::Path::new(&name)
         .file_name()
@@ -1498,7 +1496,7 @@ fn fetch_file_ep(req: &mut Request, cfg: &Config) -> Resp {
     );
     let (u, s, j, d) = (url, sha, job.clone(), dest.clone());
     std::thread::spawn(move || {
-        let res = fetch_to_file(&u, &d, &s);
+        let res = crate::fetchfile::fetch_to_file(&u, &d, &s, public);
         let mut m = fetch_jobs().lock().unwrap();
         if let Some(e) = m.get_mut(&j) {
             e.done = true;
@@ -1526,41 +1524,6 @@ fn file_status_ep(url: &str) -> Resp {
         ),
         None => json_resp(&serde_json::json!({"ok": false, "done": false, "error": "unknown job"}), 200),
     }
-}
-
-// Pull `url` → `dest`, verifying sha256. Writes to `<dest>.part` then renames, so a
-// partial or corrupt download never lands at the final path.
-fn fetch_to_file(url: &str, dest: &str, expected_sha: &str) -> Result<u64, String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Write;
-    let resp = ureq::get(url)
-        .timeout(std::time::Duration::from_secs(900))
-        .call()
-        .map_err(|e| format!("GET failed: {e}"))?;
-    let tmp = format!("{dest}.part");
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create: {e}"))?;
-    let mut reader = resp.into_reader();
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    let mut total: u64 = 0;
-    loop {
-        let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        file.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
-        total += n as u64;
-    }
-    let _ = file.flush();
-    drop(file);
-    let got = format!("{:x}", hasher.finalize());
-    if !expected_sha.is_empty() && !got.eq_ignore_ascii_case(expected_sha) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("sha256 mismatch (got {got})"));
-    }
-    std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
-    Ok(total)
 }
 
 fn download_ep(url: &str, cfg: &Config) -> Resp {
@@ -1826,7 +1789,7 @@ mod update_ep_tests {
 
 #[cfg(test)]
 mod fetch_tests {
-    use super::fetch_to_file;
+    use crate::fetchfile::fetch_to_file;
 
     // Serve `body` once over a throwaway loopback HTTP server; return its URL.
     fn serve_once(body: Vec<u8>) -> String {
@@ -1846,7 +1809,7 @@ mod fetch_tests {
         let sha = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&data));
         let url = serve_once(data.clone());
         let dest = std::env::temp_dir().join(format!("fetch_ok_{}.bin", std::process::id()));
-        let n = fetch_to_file(&url, &dest.to_string_lossy(), &sha).expect("fetch should succeed");
+        let n = fetch_to_file(&url, &dest.to_string_lossy(), &sha, false).expect("fetch should succeed");
         assert_eq!(n, data.len() as u64);
         assert_eq!(std::fs::read(&dest).unwrap(), data, "written bytes must match source");
         let _ = std::fs::remove_file(&dest);
@@ -1857,7 +1820,7 @@ mod fetch_tests {
         let url = serve_once(b"tampered content".to_vec());
         let dest = std::env::temp_dir().join(format!("fetch_bad_{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&dest);
-        let r = fetch_to_file(&url, &dest.to_string_lossy(), "00deadbeef00");
+        let r = fetch_to_file(&url, &dest.to_string_lossy(), "00deadbeef00", false);
         assert!(r.is_err(), "a sha mismatch must fail");
         assert!(!dest.exists(), "a corrupt download must not land at the destination");
     }
