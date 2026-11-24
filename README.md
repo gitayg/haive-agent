@@ -325,7 +325,15 @@ nothing, and a hub-pushed `POST /update` installs `IT-AI-macos.zip`, published b
 names, instead. The zip is accepted only if `codesign` says it is `com.itai.agent` signed with a
 Developer ID certificate of team DA4PX65QXV (an Apple Development build of the same team fails), and
 only if its version is newer than the running one. The whole app is swapped, and put back if the new
-one does not start. The hub pushes `/update` when an agent's version differs from the one it
+one does not start. A standard (non-admin) user can own `/Applications/IT-AI.app` yet cannot create
+anything in `/Applications` (`root:admin 775`), so the swap cannot even stage there. From 3.17.0 the app
+then updates in place: it stages in `~/.it-ai` (a new owner-only folder for each attempt), downloads and
+checks the zip the same way, backs up the current app, and replaces the bundle's contents where it
+stands. Each file is written beside its target and renamed over it, so the running executable is never
+overwritten, and files the new app does not have are removed. The installed app must pass the same
+`codesign` requirement; if it does not, or any step fails, the backup is put back and the current app is
+kept. Leftover staging folders are removed when the agent next starts. Only a permission error takes
+this path; any other error fails the update as before. The hub pushes `/update` when an agent's version differs from the one it
 advertises, so an app is kept current the same way.
 
 From 3.14.1 a Mac agent installed as a bare binary moves into the app on its next update: it fetches
@@ -479,6 +487,35 @@ approval runs the one stored request, once; re-sending the action files a new re
     nothing it sent had run. A call that got a 401 part-way through (say, in the middle of
     `type_text`) is not repeated; the next call uses the new token.
   - No token is ever printed: not on stderr, and not in an error (`mtok=***`).
+
+## Read files without a shell
+
+`list_dir(device, path?)`, `file_info(device, path)` and `file_hash(device, path)` (`it-ai-mcp` 3.17.0,
+need hub 3.31.0 and agent 3.17.0) read a device's filesystem with no shell, so no command line is parsed
+and, at the default policy, no approval is needed (they are the `download` tier, as reading a file is).
+They work the same on Windows, macOS and Linux; prefer them over `run_command` with `dir`, `ls`,
+`test-path`, `get-filehash` or `sha256sum` (PowerShell cmdlets don't run through `run_command` on
+Windows at all: it runs `cmd /S /C`).
+
+- `list_dir` prints one line per entry: `d`/`f`/`l`, size in bytes, modified time as
+  `YYYY-MM-DD HH:MM UTC`, and the name, plus a note when the listing was capped at 2000 entries. With no
+  path it lists the agent's share folder, else the user's home.
+- `file_info` prints exists, kind (file/dir/symlink/other), size, modified time and read-only. A missing
+  path is `exists: no`, not an error.
+- `file_hash` prints `<sha256>  <path> (<size> bytes)`, computed on the device.
+
+The agent serves them as authenticated endpoints confined by the same share rules as `/download`:
+`GET /list?path=` (entries with `name`, `dir`, `size`, `mtime`, `link`; at most 2000, `truncated: true`
+when some were left out), `GET /stat?path=` (`exists`, `kind`, `size`, `mtime`, `readonly`) and
+`GET /hash?path=` (`sha256`, `size`; read in 64 KiB chunks, so memory stays flat for multi-GB files; a
+folder or missing path is 404 `not a file`). An empty path is 400, a path outside the share 403. Over
+LAN-direct they use the `download` capability, like `/list`. An agent older than 3.17.0 gets
+`[error] the device's agent is older than 3.17.0 …`; an older hub `[error] the hub has no /m/… ; <tool>
+needs hub 3.31.0`.
+
+On macOS the agent's free-RAM metric (`free_gb`) is total RAM × `kern.memorystatus_level`, the free
+percentage macOS itself uses for memory pressure (3.17.0): sysinfo reported 0 GB available on macOS 27,
+which tripped the hub's low-memory alert. Linux and Windows are unchanged.
 
 ## Fetch a published file onto a device
 

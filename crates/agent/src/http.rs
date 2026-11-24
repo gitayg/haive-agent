@@ -12,6 +12,8 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use crate::capture::Grabber;
 use crate::input::Ev;
 
+mod fsread;
+
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 
 /// Port of the plaintext loopback server (127.0.0.1 only) the relay self-calls.
@@ -449,6 +451,8 @@ fn privileged_path(path: &str) -> bool {
             | "/persist"
             | "/download"
             | "/list"
+            | "/stat"
+            | "/hash"
             | "/upload"
             | "/fetch-file"
             | "/file-status"
@@ -567,7 +571,9 @@ fn handle(mut req: Request, cfg: &Config, tx: &Sender<Ev>) {
         (Method::Post, "/dissolve") => dissolve_ep(),
         (Method::Post, "/persist") => persist_ep(),
         (Method::Get, "/download") => download_ep(&url, cfg),
-        (Method::Get, "/list") => list_ep(&url, cfg),
+        (Method::Get, "/list") => fsread::list_ep(&url, cfg),
+        (Method::Get, "/stat") => fsread::stat_ep(&url, cfg),
+        (Method::Get, "/hash") => fsread::hash_ep(&url, cfg),
         (Method::Post, "/upload") => upload_ep(&mut req, cfg),
         (Method::Post, "/fetch-file") => fetch_file_ep(&mut req, cfg),
         (Method::Get, "/file-status") => file_status_ep(&url),
@@ -1384,47 +1390,6 @@ fn resolve_path(cfg: &Config, path: &str) -> Option<PathBuf> {
         }
         Some(PathBuf::from(expand_tilde(path)))
     }
-}
-
-fn list_ep(url: &str, cfg: &Config) -> Resp {
-    let query = url.split('?').nth(1).unwrap_or("");
-    let mut path = String::new();
-    for kv in query.split('&') {
-        if let Some(v) = kv.strip_prefix("path=") {
-            path = percent_decode(v);
-        }
-    }
-    if path.is_empty() {
-        path = if !cfg.share.is_empty() {
-            cfg.share.clone()
-        } else {
-            std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| "/".to_string())
-        };
-    }
-    let full = match resolve_path(cfg, &path) {
-        Some(f) => f,
-        None => return json_resp(&serde_json::json!({"ok": false, "error": "forbidden"}), 403),
-    };
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&full) {
-        for e in rd.flatten() {
-            let md = e.metadata().ok();
-            let dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
-            entries.push(serde_json::json!({"name": e.file_name().to_string_lossy(), "dir": dir, "size": size}));
-        }
-    }
-    entries.sort_by(|a, b| {
-        let (ad, bd) = (a["dir"].as_bool().unwrap_or(false), b["dir"].as_bool().unwrap_or(false));
-        bd.cmp(&ad).then_with(|| {
-            a["name"].as_str().unwrap_or("").to_lowercase().cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
-        })
-    });
-    let parent = full.parent().map(|p| p.to_string_lossy().to_string());
-    json_resp(
-        &serde_json::json!({"ok": true, "path": full.to_string_lossy(), "parent": parent, "entries": entries}),
-        200,
-    )
 }
 
 fn expand_tilde(p: &str) -> String {

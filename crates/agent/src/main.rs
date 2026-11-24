@@ -21,6 +21,7 @@ mod persistence;
 mod wakelock;
 mod workspace;
 mod fetchfile;
+mod freemem;
 mod presence;
 mod reap;
 mod relay;
@@ -371,7 +372,8 @@ pub(crate) fn live_metrics() -> serde_json::Value {
         (cpus.iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / cpus.len() as f64 * 10.0).round() / 10.0
     };
     sys.refresh_memory();
-    let free_gb = (sys.available_memory() as f64 / 1_073_741_824.0 * 10.0).round() / 10.0;
+    let free = freemem::free_bytes(sys.total_memory(), sys.available_memory(), freemem::memorystatus_level());
+    let free_gb = (free as f64 / 1_073_741_824.0 * 10.0).round() / 10.0;
     let mut m = serde_json::json!({ "cpu_pct": cpu_pct, "free_gb": free_gb });
     // Merge in who's-at-the-machine (logged_in / session_user / idle_secs / active).
     if let (Some(obj), Some(p)) = (m.as_object_mut(), presence::snapshot().as_object()) {

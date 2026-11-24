@@ -146,6 +146,8 @@ const OLD_PREFIX: &str = ".IT-AI.app.old-";
 /// because that process execs into the new one.
 pub(crate) fn cleanup_leftovers() {
     let Some(app) = running_bundle() else { return };
+    #[cfg(target_os = "macos")]
+    inplace::cleanup(&inplace::data_dir());
     let Some(parent) = app.parent() else { return };
     let Ok(entries) = std::fs::read_dir(parent) else { return };
     for e in entries.flatten() {
@@ -193,19 +195,23 @@ fn fetch_verified(zip_url: &str, stage: &Path) -> Result<(PathBuf, String), Stri
     if !new_app.join("Contents/MacOS").join(APP_EXE).is_file() {
         return Err(format!("the zip holds no {APP_NAME} with {APP_EXE}"));
     }
-    let verified = Command::new("/usr/bin/codesign")
-        .args(["--verify", "--deep", "--strict"])
-        .arg(format!("-R={}", requirement()))
-        .arg(&new_app)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !verified {
-        return Err(format!("the app is not {BUNDLE_ID} signed with team {TEAM_ID}'s Developer ID; refused"));
-    }
+    meets_requirement(&new_app)?;
     let plist = std::fs::read_to_string(new_app.join("Contents/Info.plist")).map_err(|e| format!("cannot read the app's Info.plist: {e}"))?;
     let version = plist_version(&plist).ok_or("the app's Info.plist has no version")?;
     Ok((new_app, version))
+}
+
+/// `codesign` says `app` meets `requirement()`.
+#[cfg(target_os = "macos")]
+fn meets_requirement(app: &Path) -> Result<(), String> {
+    let verified = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(format!("-R={}", requirement()))
+        .arg(app)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    verified.then_some(()).ok_or_else(|| format!("the app is not {BUNDLE_ID} signed with team {TEAM_ID}'s Developer ID; refused"))
 }
 
 /// Restart as `exe` with this process's args and token handling (as `apply_update`):
@@ -228,20 +234,34 @@ pub(crate) fn install(zip_url: &str, slot: crate::updatelock::UpdateSlot) -> Res
     let app = bundle_of(&exe).ok_or("not running from an app bundle")?;
     let parent = app.parent().ok_or("the app has no parent folder")?.to_path_buf();
     let tag = stage_tag();
-    // Stage beside the app so the swap is a rename on one volume.
-    let stage = parent.join(format!("{STAGE_PREFIX}{tag}"));
-    std::fs::create_dir(&stage).map_err(|e| format!("cannot stage the update next to the app: {e}"))?;
+    // Stage beside the app so the swap is a rename on one volume. A user who cannot
+    // write the app's folder (a standard user's /Applications) updates it in place.
+    let beside = parent.join(format!("{STAGE_PREFIX}{tag}"));
+    let (stage, in_place) = match inplace::stage_beside(&beside)? {
+        inplace::Beside::Staged => (beside, false),
+        inplace::Beside::Denied(e) => {
+            let stage = inplace::make_stage(&inplace::data_dir(), &tag)?;
+            eprintln!("update: cannot write {} ({e}); installing in place, staged in {}", parent.display(), stage.display());
+            (stage, true)
+        }
+    };
     let result = (|| {
         let (new_app, version) = fetch_verified(zip_url, &stage)?;
         if !is_newer(&version, env!("CARGO_PKG_VERSION")) {
             return Ok(Outcome::Current(version));
         }
         let old = parent.join(format!("{OLD_PREFIX}{tag}"));
-        swap(&app, &new_app, &old)?;
+        let backup = stage.join("backup").join(APP_NAME);
+        if in_place {
+            inplace::backup(&app, &backup)?;
+            inplace::put_in_place(&app, &new_app, &backup, meets_requirement)?;
+        } else {
+            swap(&app, &new_app, &old)?;
+        }
         match relaunch(&exe) {
             Ok(()) => Ok(Outcome::Installed(version)),
             Err(e) => {
-                let back = unswap(&app, &new_app, &old);
+                let back = if in_place { inplace::restore(&app, &backup) } else { unswap(&app, &new_app, &old) };
                 Err(format!("the new app did not start ({e}); {}", match back {
                     Ok(()) => "kept the current one".to_string(),
                     Err(b) => format!("and putting the current one back failed: {b}"),
@@ -338,5 +358,10 @@ pub(crate) fn migrate(_binary_url: &str) -> Result<Outcome, String> {
     Err("the app exists only on macOS".to_string())
 }
 
+#[cfg(target_os = "macos")]
+mod inplace;
+
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, target_os = "macos"))]
+mod inplace_tests;

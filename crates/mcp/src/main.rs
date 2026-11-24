@@ -15,6 +15,7 @@
 mod approval;
 mod approval_list;
 mod fetch;
+mod fsread;
 mod jobs;
 mod moorai;
 mod policy;
@@ -327,7 +328,7 @@ impl Srv {
     }
 
     fn with(hub: String, mtok: String, owner: String, wait: Wait) -> Self {
-        let mut tool_router = Self::tool_router() + Self::job_router() + Self::approval_router() + Self::approval_list_router() + Self::fetch_router();
+        let mut tool_router = Self::tool_router() + Self::job_router() + Self::approval_router() + Self::approval_list_router() + Self::fetch_router() + Self::fsread_router();
         policy::annotate(&mut tool_router);
         let session = std::sync::Arc::new(session::Session::new(hub.clone(), mtok, owner.clone(), build_client(Default::default())));
         let ctl = session.base();
@@ -841,7 +842,7 @@ impl ServerHandler for Srv {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), fetch_url (the device downloads a published https file itself, sha256-checked — preferred for release assets and CI artifacts), camera_snapshot, update_agent, dissolve_agent, job_start/job_logs/job_stop/job_list (background commands past run_command's ~65s limit). The hub tiers every action: read and change run, blocked is refused, and privileged waits for a human's approval in the IT-AI dashboard — a tool waits up to 60 s, then returns an approval id to check with approval_status; list_approvals shows what is waiting. Never route around a pending or blocked action. Change tools take dry_run=true to see the hub's verdict without running anything.".to_string(),
+            "Control IT-AI devices by hub name: list_devices, screenshot, run_command, click/type_text/press_key, download_file, upload_file, push_file (large-file stage-and-pull), fetch_url (the device downloads a published https file itself, sha256-checked — preferred for release assets and CI artifacts), list_dir/file_info/file_hash (read folders, path details and sha256 without a shell or an approval — prefer them over run_command for that), camera_snapshot, update_agent, dissolve_agent, job_start/job_logs/job_stop/job_list (background commands past run_command's ~65s limit). The hub tiers every action: read and change run, blocked is refused, and privileged waits for a human's approval in the IT-AI dashboard — a tool waits up to 60 s, then returns an approval id to check with approval_status; list_approvals shows what is waiting. Never route around a pending or blocked action. Change tools take dry_run=true to see the hub's verdict without running anything.".to_string(),
         );
         info
     }

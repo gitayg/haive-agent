@@ -134,7 +134,7 @@ pub fn op_for(path: &str, body: Option<&serde_json::Value>) -> Option<(&'static 
         "camera" | "camstream" => Some(("camera", String::new())),
         // `list` and `file-status` are reads of the same file surface `download`
         // covers, including the reachability probe the controller opens with.
-        "download" | "list" | "file-status" => Some(("download", String::new())),
+        "download" | "list" | "file-status" | "stat" | "hash" => Some(("download", String::new())),
         "upload" | "fetch-file" => Some(("upload", String::new())),
         _ if p.starts_with("shell/") => Some(("shell", String::new())),
         _ => None,
@@ -259,3 +259,6 @@ pub fn pubkey_from_hex(s: &str) -> Option<[u8; 32]> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+mod tests;
