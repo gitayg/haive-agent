@@ -517,6 +517,28 @@ On macOS the agent's free-RAM metric (`free_gb`) is total RAM × `kern.memorysta
 percentage macOS itself uses for memory pressure (3.17.0): sysinfo reported 0 GB available on macOS 27,
 which tripped the hub's low-memory alert. Linux and Windows are unchanged.
 
+## Windows: BitLocker without admin, and winget without prompts (3.17.1)
+
+The BitLocker WMI namespace (`ROOT\CIMV2\Security\MicrosoftVolumeEncryption`) admits administrators
+only, so an agent that runs as the logged-in user (install mode `autostart`) is refused. The encryption
+probe now says why (`access denied, 0x80041003: needs an elevated agent`) and reads each fixed drive's
+state the way Explorer's padlock does, from the shell property `System.Volume.BitLockerProtection`
+(`{2D15A9A1-A556-4189-91AD-027458F11A07}`, pid 1717; Windows' own value list: 1 On, 2 Off, 3 Encrypting,
+4 Decrypting, 5 Suspended, 6 Locked, 7 Not encryptable, 8 Waiting for activation), e.g.
+`C:  Protection On (from Explorer; run the agent elevated for method and progress)`. That source gives
+the state but not the method or percentage; run the agent elevated (`--install`) for those. Only On and
+Locked pass the hub's disk-encryption check; Encrypting reports Unknown until it finishes.
+
+The agent has no console input, so on Windows it adds `--accept-source-agreements` and
+`--disable-interactivity` to every `winget` command it runs (reports, analysis, `run_command`, jobs)
+when the subcommand supports them and they are missing; winget otherwise stops at the Microsoft Store
+source's terms with `0x8a150042 Error reading input in prompt`. `install`, `import` and `repair` also get
+`--accept-package-agreements`, and so does `upgrade` but only when it is already upgrading (`--all`,
+`--id`, `--silent`, …): on a bare `winget upgrade` that flag turns the listing into an upgrade of
+everything matching an empty query. Accepting the Store source's terms sends the device's 2-letter region
+to Microsoft. Approvals and the hub's command-safety check still see the original command line; winget
+nested inside `cmd /c`, `powershell -Command` or a script is not rewritten.
+
 ## Fetch a published file onto a device
 
 `fetch_url(device, url, sha256, dir?, name?)` (`it-ai-mcp` 3.16.0, needs hub 3.30.0) has the

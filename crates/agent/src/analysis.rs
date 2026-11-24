@@ -69,6 +69,8 @@ fn commands() -> Vec<(&'static str, String)> {
 /// Run one command, capturing stdout+stderr, bounded by a timeout so a hung
 /// command can't stall the whole analysis cycle.
 fn run(cmd: &str) -> String {
+    #[cfg(windows)]
+    let cmd = &crate::wingetflags::noninteractive(cmd);
     let (prog, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
     let mut c = std::process::Command::new(prog);
     c.arg(flag)

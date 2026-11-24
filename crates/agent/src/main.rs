@@ -41,6 +41,7 @@ mod shell;
 mod tls;
 #[cfg(target_os = "linux")]
 mod wayland;
+mod wingetflags;
 #[cfg(windows)]
 mod winsession;
 #[cfg(windows)]

@@ -18,7 +18,10 @@
 use std::collections::HashMap;
 
 use serde::Deserialize;
-use wmi::{COMLibrary, Variant, WMIConnection};
+use wmi::{COMLibrary, Variant, WMIConnection, WMIError};
+
+mod bitlocker_shell;
+mod bitlocker_text;
 
 /// Open a WMI connection to `namespace`, or `None` on any COM/WMI failure.
 ///
@@ -224,7 +227,8 @@ pub fn services_running() -> String {
 /// `manage-bde -status C:`. The hub renders this verbatim and grades it by
 /// substring ("protection on" ⇒ enabled), so ENABLED volumes emit the literal
 /// "Protection On" and disabled/unavailable output stays free of the "crypt"
-/// token that would false-pass the grader. Never panics.
+/// token that would false-pass the grader. Never panics. When WMI refuses (a
+/// non-elevated agent), the status comes from Explorer (winprobe/bitlocker_shell.rs).
 pub fn encryption_status() -> String {
     use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
 
@@ -282,14 +286,24 @@ pub fn encryption_status() -> String {
         })
     }
 
-    let conn = match wmi(r"ROOT\CIMV2\Security\MicrosoftVolumeEncryption") {
-        Some(c) => c,
-        None => return "BitLocker status: unavailable (WMI connection failed)".to_string(),
+    // The namespace admits administrators only: a non-elevated agent is refused
+    // and reads Explorer's per-volume BitLocker state instead.
+    fn refused(e: WMIError) -> String {
+        let hres = match &e {
+            WMIError::HResultError { hres } => Some(*hres),
+            _ => None,
+        };
+        bitlocker_shell::explorer_status(&bitlocker_text::wmi_reason(hres, &e.to_string()))
+    }
+    let conn = match COMLibrary::without_security()
+        .and_then(|com| WMIConnection::with_namespace_path(r"ROOT\CIMV2\Security\MicrosoftVolumeEncryption", com))
+    {
+        Ok(c) => c,
+        Err(e) => return refused(e),
     };
     let vols: Vec<EncVol> = match conn.query() {
         Ok(v) => v,
-        // Non-admin callers typically hit access-denied here.
-        Err(e) => return format!("BitLocker status: unavailable ({e})"),
+        Err(e) => return refused(e),
     };
 
     // Header is deliberately free of the "crypt" substring so a machine with only

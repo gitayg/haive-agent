@@ -1223,6 +1223,7 @@ fn shell_command(cmd: &str) -> std::process::Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        let cmd = crate::wingetflags::noninteractive(cmd);
         let mut c = std::process::Command::new("cmd");
         c.raw_arg("/S").raw_arg("/C").raw_arg(format!("\"{cmd}\""));
         c
