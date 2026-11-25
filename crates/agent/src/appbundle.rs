@@ -219,9 +219,8 @@ fn meets_requirement(app: &Path) -> Result<(), String> {
 /// caller must exit; a successful exec never returns.
 #[cfg(target_os = "macos")]
 fn relaunch(exe: &Path) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let e = crate::relaycred::restart_command(exe, args.clone()).exec();
+    let e = crate::instance::exec(crate::relaycred::restart_command(exe, args.clone()));
     eprintln!("update: exec of {} failed ({e}); spawning it instead", exe.display());
     crate::relaycred::restart_command(exe, args).spawn().map(|_| ()).map_err(|e| e.to_string())
 }

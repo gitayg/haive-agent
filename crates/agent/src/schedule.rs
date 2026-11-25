@@ -12,8 +12,7 @@ fn now_secs() -> u64 {
 }
 
 fn path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
-    std::path::PathBuf::from(format!("{home}/.it-ai/schedules.json"))
+    std::path::PathBuf::from(crate::persistence::home()).join(".it-ai").join("schedules.json")
 }
 
 fn store() -> &'static Mutex<Vec<serde_json::Value>> {

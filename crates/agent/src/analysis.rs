@@ -37,6 +37,7 @@ fn commands() -> Vec<(&'static str, String)> {
             ("processes", "tasklist".into()),
             ("network", "arp -a".into()),
             ("updates", "winget upgrade".into()),
+            ("app_updates", "winget upgrade".into()),
             ("encryption", "manage-bde -status C:".into()),
             ("firewall", "netsh advfirewall show allprofiles state".into()),
             ("av", ps("Get-MpComputerStatus | Select-Object AntivirusEnabled,RealTimeProtectionEnabled,AntivirusSignatureLastUpdated,AMRunningMode | Format-List")),
@@ -117,6 +118,10 @@ fn snapshot() -> BTreeMap<String, String> {
                     "services" => return (k.to_string(), crate::winprobe::services_running()),
                     "encryption" => return (k.to_string(), crate::winprobe::encryption_status()),
                     "firewall" => return (k.to_string(), crate::winprobe::firewall_status()),
+                    // OS updates come from the Windows Update Agent (the cached
+                    // answer, never waited for); winget's app upgrades stay
+                    // available under app_updates.
+                    "updates" => return (k.to_string(), crate::winupdate::snapshot_updates()),
                     _ => {}
                 }
             }
@@ -174,3 +179,12 @@ pub fn start(cred: Arc<RelayCred>) {
         }
     });
 }
+
+// main.rs declares winupdate on Windows only; its pure parts are built here so
+// their tests also run on macOS and Linux.
+#[cfg(all(test, not(windows)))]
+#[path = "winupdate/format.rs"]
+mod wua_format;
+#[cfg(all(test, not(windows)))]
+#[path = "winupdate/cache.rs"]
+mod wua_cache;

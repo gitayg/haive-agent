@@ -13,6 +13,7 @@ use crate::capture::Grabber;
 use crate::input::Ev;
 
 mod fsread;
+mod lanbind;
 
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
 
@@ -290,11 +291,11 @@ pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
     // whole process, taking the relay thread with it. With `--background` stderr is
     // /dev/null, so the agent died silently right after printing "running in the
     // background" and never registered.
-    let server = match build_server(&cfg) {
-        Some(s) => Arc::new(s),
-        None => {
+    let server = match lanbind::until_bound(cfg.port, &lanbind::PACE, || build_server(&cfg)) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
             eprintln!(
-                "warn: could not bind port {} (port in use?) — continuing with relay + loopback only",
+                "warn: could not bind port {} ({e}) — continuing with relay + loopback only",
                 cfg.port
             );
             // Park the main thread so the process stays alive for the relay loop.
@@ -318,9 +319,9 @@ pub fn serve(cfg: Arc<Config>, input_tx: Sender<Ev>) {
     }
 }
 
-/// Bind the public LAN listener, or None if it can't be bound. Never panics —
+/// Bind the public LAN listener, or why it can't be bound. Never panics —
 /// the caller degrades to relay + loopback rather than killing the agent.
-fn build_server(cfg: &Config) -> Option<Server> {
+fn build_server(cfg: &Config) -> Result<Server, lanbind::BindError> {
     // LAN-direct: a relay-enrolled device now binds 0.0.0.0 too, so a controller
     // that shares the LAN can skip the cloud round trip entirely. The listener
     // serves the hub-signed leaf cert fetched at startup (SANs = our LAN IPs), so
@@ -342,14 +343,13 @@ fn build_server(cfg: &Config) -> Option<Server> {
     let host = if lan_ok { "0.0.0.0" } else { "127.0.0.1" };
     let addr = format!("{host}:{}", cfg.port);
     if cfg.tls {
-        let (c, k) = cfg.cert.clone()?;
+        let (c, k) = cfg.cert.clone().ok_or("TLS is on but there is no certificate")?;
         Server::https(
             addr,
             tiny_http::SslConfig { certificate: c, private_key: k },
         )
-        .ok()
     } else {
-        Server::http(addr).ok()
+        Server::http(addr)
     }
 }
 
@@ -753,10 +753,9 @@ pub(crate) fn apply_update(slot: crate::updatelock::UpdateSlot, bytes: &[u8]) ->
     let args: Vec<String> = std::env::args().skip(1).collect();
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         // exec() replaces the process on success and never returns; if it returns,
         // it failed — fall through and spawn a fresh process instead.
-        let e = crate::relaycred::restart_command(&exe, args.clone()).exec();
+        let e = crate::instance::exec(crate::relaycred::restart_command(&exe, args.clone()));
         eprintln!("update: exec failed ({e}); spawning a replacement instead");
     }
     // Report whether the replacement actually launched. Callers must NOT exit the

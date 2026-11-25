@@ -151,13 +151,16 @@ fn refused(v: &serde_json::Value) -> Option<CallToolResult> {
 }
 
 pub fn fmt_logs(v: &serde_json::Value) -> Vec<ContentBlock> {
-    let meta = serde_json::json!({
+    let mut meta = serde_json::json!({
         "offset": v["offset"],
         "running": v["running"],
         "exit_code": v["exit_code"],
         "eof": v["eof"],
         "size": v["size"],
     });
+    if !v["workspace_pending_removal"].is_null() {
+        meta["workspace_pending_removal"] = v["workspace_pending_removal"].clone();
+    }
     let data = v["data"].as_str().unwrap_or("");
     vec![
         ContentBlock::text(meta.to_string()),
@@ -181,8 +184,9 @@ pub fn fmt_list(v: &serde_json::Value) -> String {
             } else {
                 format!("exit {}", exit_label(&j["exit_code"]))
             };
+            let pending = if j["workspace_pending_removal"].as_bool().unwrap_or(false) { " (workspace still being removed)" } else { "" };
             format!(
-                "{} [{state}] pid {} started {} — {}",
+                "{} [{state}] pid {} started {} — {}{pending}",
                 j["id"].as_str().unwrap_or(""),
                 j["pid"].as_u64().unwrap_or(0),
                 j["started"].as_u64().unwrap_or(0),

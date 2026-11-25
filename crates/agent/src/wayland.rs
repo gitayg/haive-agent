@@ -46,8 +46,7 @@ pub fn is_wayland() -> bool {
 }
 
 fn token_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    std::path::Path::new(&home).join(".it-ai").join("screencast.token")
+    std::path::PathBuf::from(crate::persistence::home()).join(".it-ai").join("screencast.token")
 }
 fn load_restore_token() -> Option<String> {
     std::fs::read_to_string(token_path()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())

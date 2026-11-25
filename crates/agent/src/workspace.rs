@@ -5,11 +5,13 @@
 //! job in a fresh `~/.it-ai/workspaces/<job id>/` (owner-only on unix; on Windows it
 //! inherits the data dir's ACL) and the tree is removed when the job's process exits.
 //! A tree that cannot be removed in a few tries (Windows: a still-running grandchild
-//! holds a file or its working directory open) is left for the startup sweep, which
-//! removes anything in `workspaces/` older than 24 h.
+//! holds a file or its working directory open) is handed to the `janitor`, which keeps
+//! retrying it in the background and also removes anything in `workspaces/` older than
+//! 24 h, at start and every hour.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub const SWEEP_AGE: Duration = Duration::from_secs(24 * 3600);
@@ -20,6 +22,25 @@ pub fn root() -> PathBuf {
     PathBuf::from(crate::persistence::home()).join(".it-ai").join("workspaces")
 }
 
+/// True unless `p` exists as something other than a directory itself: a link to a
+/// directory (a Windows junction included) is not one.
+fn not_a_link(p: &Path) -> bool {
+    p.symlink_metadata().map_or(true, |m| m.is_dir())
+}
+
+/// Whether workspaces may be made or removed under `root`. Everything below a root
+/// that is a link would land in the link's target, so nothing is; said once.
+fn usable_root(root: &Path) -> bool {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if not_a_link(root) {
+        return true;
+    }
+    if !SAID.swap(true, Ordering::SeqCst) {
+        eprintln!("job workspaces root {} is not a directory (a link?): no workspace is created, removed or swept there", root.display());
+    }
+    false
+}
+
 /// `<root>/<id>`, created new: an existing directory of that name is an error, never reused.
 pub fn create(root: &Path, id: &str) -> std::io::Result<PathBuf> {
     let mut b = std::fs::DirBuilder::new();
@@ -28,14 +49,21 @@ pub fn create(root: &Path, id: &str) -> std::io::Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(0o700);
     }
+    if !usable_root(root) {
+        return Err(std::io::Error::other(format!("{} is not a directory", root.display())));
+    }
     b.recursive(true).create(root)?;
     let dir = root.join(id);
     b.recursive(false).create(&dir)?;
     Ok(dir)
 }
 
-/// Remove `dir` and everything under it, never through a link. True when it is gone.
+/// Remove `dir` and everything under it, never through a link, nor when the
+/// directory it is in is a link. True when it is gone.
 pub fn remove(dir: &Path) -> bool {
+    if dir.parent().is_some_and(|root| !usable_root(root)) {
+        return false;
+    }
     for i in 0..REMOVE_TRIES {
         match std::fs::remove_dir_all(dir) {
             Ok(()) => return true,
@@ -78,8 +106,12 @@ fn make_writable(p: &Path) {
     }
 }
 
-/// Remove every entry of `root` last modified more than `older_than` ago. Returns how many went.
-pub fn sweep(root: &Path, older_than: Duration) -> usize {
+/// Remove every entry of `root` last modified more than `older_than` ago, except those `skip`
+/// names. Returns how many went.
+pub fn sweep(root: &Path, older_than: Duration, skip: &dyn Fn(&Path) -> bool) -> usize {
+    if !usable_root(root) {
+        return 0;
+    }
     let Ok(rd) = std::fs::read_dir(root) else { return 0 };
     let now = SystemTime::now();
     let mut n = 0;
@@ -87,7 +119,7 @@ pub fn sweep(root: &Path, older_than: Duration) -> usize {
         let p = e.path();
         let Ok(md) = p.symlink_metadata() else { continue };
         let old = md.modified().ok().and_then(|m| now.duration_since(m).ok()).is_some_and(|a| a > older_than);
-        if !old {
+        if !old || skip(&p) {
             continue;
         }
         let gone = if md.is_dir() { remove(&p) } else { std::fs::remove_file(&p).is_ok() };
@@ -98,15 +130,13 @@ pub fn sweep(root: &Path, older_than: Duration) -> usize {
     n
 }
 
-/// The startup sweep, off the main thread: a big leftover tree must not delay the agent.
+/// Start the janitor, whose first pass is the startup sweep, off the main thread: a big
+/// leftover tree must not delay the agent.
 pub fn sweep_at_startup() {
-    std::thread::spawn(|| {
-        let n = sweep(&root(), SWEEP_AGE);
-        if n > 0 {
-            eprintln!("removed {n} job workspace(s) older than 24 h");
-        }
-    });
+    crate::jobs::start_janitor();
 }
+
+pub mod janitor;
 
 #[cfg(test)]
 mod tests;

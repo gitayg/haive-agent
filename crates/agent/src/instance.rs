@@ -76,8 +76,15 @@ fn started_by_service_manager() -> bool {
 /// Become this user's only agent, or exit (see the module doc). The returned file
 /// must stay open while the agent runs; None means it runs without the lock.
 pub(crate) fn claim() -> Option<File> {
-    let path = lock_path();
-    let pid = match try_claim(&path) {
+    let held = claim_at(&lock_path());
+    if let Some(f) = &held {
+        handoff::remember(f);
+    }
+    held
+}
+
+fn claim_at(path: &Path) -> Option<File> {
+    let pid = match try_claim(path) {
         Claim::Held(f) => return Some(f),
         Claim::Unavailable(e) => {
             eprintln!("agent: {e}; running without the one-agent lock");
@@ -85,11 +92,14 @@ pub(crate) fn claim() -> Option<File> {
         }
         Claim::Taken(pid) => pid,
     };
+    if pid == Some(std::process::id()) {
+        return handoff::reclaim(path);
+    }
     if started_by_service_manager() {
         println!("agent: another IT-AI agent (pid {}) runs for this user; this start exits", pid.map(|p| p.to_string()).unwrap_or("?".into()));
         std::process::exit(0);
     }
-    let Some(pid) = pid.filter(|p| *p != std::process::id()) else {
+    let Some(pid) = pid else {
         eprintln!("agent: the one-agent lock is held by an unknown process; running without it");
         return None;
     };
@@ -100,13 +110,16 @@ pub(crate) fn claim() -> Option<File> {
         if i == 50 {
             unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         }
-        if let Claim::Held(f) = try_claim(&path) {
+        if let Claim::Held(f) = try_claim(path) {
             return Some(f);
         }
     }
     eprintln!("agent: pid {pid} did not let go of the one-agent lock; running without it");
     None
 }
+
+mod handoff;
+pub(crate) use handoff::exec;
 
 #[cfg(test)]
 mod tests;

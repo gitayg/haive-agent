@@ -38,8 +38,10 @@ remote exec is disabled (`cfg.exec_enabled == false`) with the same 403 body `/e
   on Windows), runs the job there with `IT_AI_WORKSPACE=<path>` set, and deletes the whole tree
   when the job's process exits (success, failure or `/jobs/stop`), before it reports
   `running:false`. A tree that can't be deleted within ~2 s (Windows: a still-running child holds
-  a file open) is left, and the agent removes anything in `workspaces/` older than 24 h at its
-  next start. `workspace` with a non-empty `cwd` → 400 `cwd and workspace cannot be combined`
+  a file open) is left and retried in the background (3.18.0: 30 s after the job ended, backing off
+  to every 10 min, until it goes); until then the job's status and `/jobs/list` row carry
+  `"workspace_pending_removal": true` (present whenever the job has a workspace). Anything in
+  `workspaces/` older than 24 h is removed at start and every hour, never a running job's workspace. `workspace` with a non-empty `cwd` → 400 `cwd and workspace cannot be combined`
   (the hub refuses the same before forwarding). The start reply, `/jobs/list` rows and
   `/jobs/logs` carry `"workspace"` only when it was asked for.
 

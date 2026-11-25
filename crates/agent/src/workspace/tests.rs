@@ -92,10 +92,10 @@ fn workspace_sweep_removes_only_entries_older_than_the_age() {
     fs::write(root.join("stray"), b"x").unwrap();
     age(&old, Duration::from_secs(25 * 3600));
     age(&root.join("stray"), Duration::from_secs(25 * 3600));
-    assert_eq!(sweep(&root, SWEEP_AGE), 2);
+    assert_eq!(sweep(&root, SWEEP_AGE, &|_| false), 2);
     assert!(!old.exists() && !root.join("stray").exists());
     assert!(fresh.join("f").exists(), "a workspace younger than 24 h was swept");
-    assert_eq!(sweep(&base.join("missing"), SWEEP_AGE), 0);
+    assert_eq!(sweep(&base.join("missing"), SWEEP_AGE, &|_| false), 0);
     let _ = fs::remove_dir_all(&base);
 }
 
@@ -113,8 +113,36 @@ fn workspace_sweep_removes_an_old_link_not_its_target() {
     let ts = libc::timespec { tv_sec: t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as libc::time_t, tv_nsec: 0 };
     let c = std::ffi::CString::new(root.join("jlink").as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [ts, ts].as_ptr(), libc::AT_SYMLINK_NOFOLLOW) }, 0);
-    assert_eq!(sweep(&root, SWEEP_AGE), 1);
+    assert_eq!(sweep(&root, SWEEP_AGE, &|_| false), 1);
     assert!(root.join("jlink").symlink_metadata().is_err());
     assert_eq!(fs::read(outside.join("keep")).unwrap(), b"k");
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_workspaces_root_that_is_a_link_is_never_swept_removed_or_used() {
+    let base = scratch("rootlink");
+    let target = base.join("elsewhere");
+    let old = target.join("jold");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(old.join("f"), b"x").unwrap();
+    fs::write(target.join("stray"), b"x").unwrap();
+    age(&old, Duration::from_secs(25 * 3600));
+    age(&target.join("stray"), Duration::from_secs(25 * 3600));
+    let root = base.join("workspaces");
+    std::os::unix::fs::symlink(&target, &root).unwrap();
+
+    assert_eq!(sweep(&root, SWEEP_AGE, &|_| false), 0, "the sweep went through the linked root");
+    assert!(old.join("f").exists() && target.join("stray").exists());
+
+    assert!(!remove(&root.join("jold")), "a workspace was removed through the linked root");
+    let j = janitor::Janitor::new(root.clone(), remove);
+    assert!(j.leave(&root.join("jold")));
+    assert_eq!(j.retry_due(std::time::Instant::now() + janitor::FIRST_RETRY, &|_| false), 0);
+    assert!(old.join("f").exists(), "the janitor's retry removed through the linked root");
+
+    assert!(create(&root, "jnew").is_err(), "a workspace was made in the linked root's target");
+    assert!(!target.join("jnew").exists());
     let _ = fs::remove_dir_all(&base);
 }

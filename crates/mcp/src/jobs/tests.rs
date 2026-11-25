@@ -156,3 +156,16 @@ async fn job_start_refuses_workspace_with_cwd_before_calling_the_hub() {
     assert_eq!(out(&r), "[error] cwd and workspace cannot be combined");
     assert!(h.hits("/m/job/start").is_empty(), "the hub was asked anyway");
 }
+
+#[test]
+fn a_workspace_still_being_removed_is_shown_in_logs_and_list() {
+    let logs = super::fmt_logs(&serde_json::json!({"offset": 3, "running": false, "exit_code": 0, "eof": true, "size": 3, "data": "hi\n", "workspace_pending_removal": true}));
+    let meta: serde_json::Value = serde_json::from_str(&format!("{:?}", logs[0]).split("text: \"").nth(1).map(|s| s.split("\", ").next().unwrap().replace("\\\"", "\"")).unwrap()).unwrap();
+    assert_eq!(meta["workspace_pending_removal"], true, "{meta}");
+    let list = super::fmt_list(&serde_json::json!({"jobs": [
+        {"id": "j1", "running": false, "exit_code": 0, "pid": 7, "started": 1, "cmd": "ping", "workspace": "/w/j1", "workspace_pending_removal": true},
+        {"id": "j2", "running": false, "exit_code": 0, "pid": 8, "started": 2, "cmd": "ls"},
+    ]}));
+    assert!(list.lines().next().unwrap().ends_with("ping (workspace still being removed)"), "{list}");
+    assert!(list.lines().nth(1).unwrap().ends_with("— ls"), "{list}");
+}

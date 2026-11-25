@@ -5,13 +5,15 @@
 // stdout+stderr appended to `<data dir>/jobs/<id>.log`, read back in pages and
 // stopped by id. Contract: docs/JOBS-API.md ("Agent").
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+
+use crate::workspace::janitor::Janitor;
 
 pub const MAX_JOBS: usize = 50;
 pub const DEFAULT_READ: u64 = 65536;
@@ -35,15 +37,21 @@ impl Job {
 
 pub struct Registry {
     dir: PathBuf,
-    workspaces: PathBuf,
+    janitor: Arc<Janitor>,
     jobs: Mutex<Vec<Job>>,
 }
 
 fn registry() -> &'static Registry {
     static R: OnceLock<Registry> = OnceLock::new();
-    R.get_or_init(|| {
+    let r = R.get_or_init(|| {
         Registry::new(PathBuf::from(crate::persistence::home()).join(".it-ai").join("jobs"), crate::workspace::root())
-    })
+    });
+    r.janitor.spawn(move |p| r.runs_in(p));
+    r
+}
+
+pub fn start_janitor() {
+    registry();
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -78,7 +86,21 @@ fn exit_code_of(s: std::process::ExitStatus) -> i32 {
 
 impl Registry {
     pub fn new(dir: PathBuf, workspaces: PathBuf) -> Self {
-        Registry { dir, workspaces, jobs: Mutex::new(Vec::new()) }
+        Self::with_janitor(dir, Arc::new(Janitor::new(workspaces, crate::workspace::remove)))
+    }
+
+    pub fn with_janitor(dir: PathBuf, janitor: Arc<Janitor>) -> Self {
+        Registry { dir, janitor, jobs: Mutex::new(Vec::new()) }
+    }
+
+    /// True when `dir` is the workspace of a job that is still running.
+    pub fn runs_in(&self, dir: &Path) -> bool {
+        self.jobs.lock().unwrap().iter().any(|j| j.exit_code().is_none() && j.workspace.as_deref() == Some(dir))
+    }
+
+    fn workspace_fields(&self, row: &mut Value, w: &Path) {
+        row["workspace"] = json!(w.to_string_lossy());
+        row["workspace_pending_removal"] = json!(self.janitor.is_pending(w));
     }
 
     /// Drop the oldest finished jobs past MAX_JOBS. Running jobs are never dropped:
@@ -109,13 +131,13 @@ impl Registry {
             return (json!({"ok": false, "error": e.to_string()}), 500);
         }
         let id = new_id();
-        let workspace = match want_ws.then(|| crate::workspace::create(&self.workspaces, &id)).transpose() {
+        let workspace = match want_ws.then(|| crate::workspace::create(self.janitor.root(), &id)).transpose() {
             Ok(w) => w,
             Err(e) => return (json!({"ok": false, "error": format!("workspace: {e}")}), 500),
         };
         let fail = |e: String| {
             if let Some(w) = &workspace {
-                crate::workspace::remove(w);
+                self.janitor.discard(w);
             }
             (json!({"ok": false, "error": e}), 500)
         };
@@ -154,15 +176,13 @@ impl Registry {
         let exit = Arc::new(Mutex::new(None));
         let exit_w = exit.clone();
         let ws = workspace.clone();
-        let wid = id.clone();
+        let janitor = self.janitor.clone();
         std::thread::spawn(move || {
             let code = child.wait().map(exit_code_of).unwrap_or(-1);
-            // Removed before the exit is published: a caller that sees the job ended
-            // never finds its workspace still there unless it is left for the sweep.
+            // Removed (or queued for retries) before the exit is published: a caller that
+            // sees the job ended finds its workspace gone or marked pending removal.
             if let Some(w) = ws {
-                if !crate::workspace::remove(&w) {
-                    eprintln!("job {wid}: workspace {} is still in use; left for the startup sweep", w.display());
-                }
+                janitor.discard(&w);
             }
             *exit_w.lock().unwrap() = Some(code);
         });
@@ -221,7 +241,7 @@ impl Registry {
             "data": String::from_utf8_lossy(&data),
         });
         if let Some(w) = self.workspace_of(id) {
-            reply["workspace"] = json!(w.to_string_lossy());
+            self.workspace_fields(&mut reply, &w);
         }
         (reply, 200)
     }
@@ -250,7 +270,7 @@ impl Registry {
                 let code = j.exit_code();
                 let mut row = json!({"id": j.id, "cmd": j.cmd, "pid": j.pid, "started": j.started, "running": code.is_none(), "exit_code": code});
                 if let Some(w) = &j.workspace {
-                    row["workspace"] = json!(w.to_string_lossy());
+                    self.workspace_fields(&mut row, w);
                 }
                 row
             })

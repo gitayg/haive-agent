@@ -2,6 +2,7 @@
 // Copyright (c) 2024-2026 Itay Glick
 
 // IT-AI — LAN remote control & screen sharing with an AI/MCP interface.
+mod agenthome;
 mod analysis;
 mod appbundle;
 mod capture;
@@ -632,10 +633,7 @@ fn main() {
     workspace::sweep_at_startup();
 
     let mut cert = if tls {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_default();
-        let dir = format!("{home}/.it-ai");
+        let dir = format!("{}/.it-ai", persistence::home());
         let c = tls::ensure_cert(&dir, &discovery::local_ip(), &[hostname(), "it-ai.local".to_string()]);
         if c.is_none() {
             eprintln!("cert generation failed; falling back to plain HTTP");

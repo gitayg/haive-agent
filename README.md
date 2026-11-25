@@ -354,6 +354,26 @@ user, and one started by launchd or systemd while another runs exits at once. Ag
 startup, so deleting the folder an install command ran in no longer leaves an agent without a working
 directory.
 
+From 3.18.0 an agent that restarts itself in place (a self-update or app relaunch on macOS or Linux,
+same pid) releases `agent.lock` just before the exec, and a restarted agent that still finds the lock
+held under its own pid waits up to 30 s for its pre-restart image to let go (on macOS an agent running
+mDNS discovery is torn down ~10 s after the exec). The LAN listener likewise retries a port that is
+still in use, every 250 ms for 30 s and then every 30 s, and logs when it binds; this also covers
+Windows, where the updated agent starts while the old process is still exiting. Before, the restarted
+agent ran without the lock and without its LAN listener until its next restart.
+
+**Where the agent keeps its data.** Everything it stores (`relay.cred`, its TLS cert/key, the lock,
+`agent.log`, jobs, workspaces, schedules, update staging) lives in `<home>/.it-ai`, always an absolute
+path (3.18.0). `<home>` is `HOME` (`USERPROFILE` on Windows). An agent started without one (e.g. a
+systemd unit with no `User=` or `Environment=HOME=`) uses `/` if `/.it-ai` already exists as its own
+directory and holds the relay credential (or no other credential exists) — where earlier agents kept
+their data in that case, so such devices keep their identity and nothing is moved — otherwise the
+user's home from the OS (`/root` for root; the profile folder on Windows), and only if that lookup
+fails `/` (Windows: `%SystemRoot%\System32\config\systemprofile`). To move a legacy device to
+`/root/.it-ai`: stop the agent, `mv /.it-ai /root/.it-ai`, add `Environment=HOME=/root` to the unit,
+and start it again. A device that first enrolls under 3.18.0 with no HOME keeps its data in
+`/root/.it-ai`, which an agent older than 3.18.0 would not find.
+
 ## Live screen
 
 From agent 3.13.0 the live view is delta-encoded (`GET /screen`; wire format in
@@ -517,6 +537,22 @@ On macOS the agent's free-RAM metric (`free_gb`) is total RAM × `kern.memorysta
 percentage macOS itself uses for memory pressure (3.17.0): sysinfo reported 0 GB available on macOS 27,
 which tripped the hub's low-memory alert. Linux and Windows are unchanged.
 
+## Windows Update compliance check (3.18.0)
+
+`it-ai:os-updates/check` answers from the last Windows Update Agent search while it is under 6 h old
+("Checked N min ago."), refreshes it in the background after 1 h, and otherwise waits up to 45 s, then
+says `Windows Update check in progress`. One search runs at a time; one stuck for 30 min is abandoned
+and a new one started (at most one abandoned), and a search still running when updates finish
+installing is discarded and re-run. A row is a security update — `[security: <MSRC severity>|unrated]`
+— when it has an MSRC severity or the "Security Updates" classification (matched by its GUID
+`0FA1201D-4330-4FA8-8AE9-B877473B6441`, not its localized name); "Critical Updates" are by Microsoft's
+definition non-security fixes. Every row carries `[class: <classification>]`. An update whose severity
+or classification can't be read is unreadable, which fails compliance. On Windows the 5-minute
+analysis snapshot's `updates` section is this answer (never waited for); `winget upgrade` moved to
+`app_updates`. The text is a pure function (`winupdate/format.rs`) pinned by
+`winupdate/format/fixtures.txt`, which the hub keeps a byte-identical copy of; regenerate it with
+`IT_AI_WUA_FIXTURES=$PWD/crates/agent/src/winupdate/format/fixtures.txt cargo test -p it-ai-agent fixture`.
+
 ## Windows: BitLocker without admin, and winget without prompts (3.17.1)
 
 The BitLocker WMI namespace (`ROOT\CIMV2\Security\MicrosoftVolumeEncryption`) admits administrators
@@ -611,7 +647,13 @@ MCP tools, same operations:
 
 `job_start` with `workspace: true` runs the job in a scratch folder that is deleted when the job
 ends (its path is also in the job's `IT_AI_WORKSPACE`); it needs agent 3.16.0, and with an older
-agent the tool says the job ran without one.
+agent the tool says the job ran without one. If the folder can't be deleted when the job ends (on
+Windows, a background process the job left running still has it open or as its working directory),
+the agent keeps retrying in the background from 3.18.0: 30 s after the job ended, then backing off to
+every 10 minutes, until it goes or the agent exits; until then the job's status and `/jobs/list` row
+carry `"workspace_pending_removal": true` (`job_list` / `job_logs` show it). The agent also removes
+anything in `workspaces/` older than 24 h at start and every hour, never the workspace of a job that is
+still running, and never through a `workspaces` folder that is a link.
 
 On the agent:
 

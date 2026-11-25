@@ -19,9 +19,10 @@
 //   * Every fallible call is `?`/`.ok()`/`match` — this module NEVER panics or
 //     unwraps. On any COM/WUA failure a probe returns a short, human-readable
 //     "unavailable (…)" / "access denied …" string instead.
-//   * COM is initialised and torn down per call on the *calling* thread (the
-//     transient tiny_http /exec worker), balanced by a drop guard, so it never
-//     clashes with the tao/wry/tray STA init that runs on a different thread.
+//   * COM is initialised and torn down per call on the thread that searches
+//     (a search thread of winupdate/cache.rs, or the /exec worker that
+//     installs), balanced by a drop guard, so it never clashes with the
+//     tao/wry/tray STA init that runs on a different thread.
 //
 // WUA is CLASSIC COM (wuapi type library), not WinRT. We therefore CoInitializeEx
 // the worker thread, CoCreateInstance the `UpdateSession` coclass, and drive the
@@ -42,6 +43,12 @@
 //      flagged here as the single biggest integration risk.
 #![cfg(windows)]
 
+mod cache;
+mod format;
+
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
 use windows::core::BSTR;
 use windows::Win32::Foundation::{DECIMAL, VARIANT_BOOL};
 use windows::Win32::System::Com::{
@@ -61,11 +68,6 @@ const SEARCH_CRITERIA: &str = "IsInstalled=0 AND Type='Software' AND IsHidden=0"
 
 /// Identifies us to the Windows Update service in its logs (best-effort cosmetic).
 const CLIENT_ID: &str = "IT-AI Agent";
-
-/// E_ACCESSDENIED — the HRESULT a non-elevated caller hits on Download/Install
-/// (and sometimes on the online Search). Surfaced as a clear "needs Administrator"
-/// message rather than a raw hex code.
-const E_ACCESSDENIED: i32 = 0x8007_0005u32 as i32;
 
 /// RPC_E_CHANGED_MODE — CoInitializeEx was already called on this thread with a
 /// different apartment model (e.g. the GUI thread went STA). Not fatal: COM is
@@ -116,12 +118,7 @@ impl Drop for ComGuard {
 /// elevation case explicitly (the most common real-world failure for OS-update
 /// download/install) so the hub can tell the admin to relaunch elevated.
 fn reason(ctx: &str, e: &windows::core::Error) -> String {
-    let code = e.code().0;
-    if code == E_ACCESSDENIED {
-        format!("{ctx}: access denied — needs Administrator (run the agent elevated)")
-    } else {
-        format!("{ctx}: unavailable (HRESULT 0x{:08X})", code as u32)
-    }
+    format::failure(ctx, e.code().0)
 }
 
 /// A WUA `VARIANT_BOOL` is true when non-zero (VARIANT_TRUE is -1). No panic path.
@@ -138,22 +135,6 @@ fn decimal_bytes(d: &DECIMAL) -> u128 {
     // DECIMAL; the two representations alias the same 8 bytes.
     let lo64 = unsafe { d.Anonymous2.Lo64 } as u128;
     ((d.Hi32 as u128) << 64) | lo64
-}
-
-/// Human-friendly size, e.g. `842.0 MB`. Keeps the check output compact.
-fn human_size(bytes: u128) -> String {
-    const KB: u128 = 1024;
-    const MB: u128 = KB * 1024;
-    const GB: u128 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Map WUA's `OperationResultCode` to a short label for the install summary.
@@ -184,32 +165,47 @@ fn new_session() -> Result<IUpdateSession, String> {
 
 // ── check ──────────────────────────────────────────────────────────────────────
 
-/// List the OS updates the machine is missing, via the WUA online searcher.
-///
-/// Flow: `UpdateSession` → `CreateUpdateSearcher()` → `Search("IsInstalled=0 AND
-/// Type='Software' AND IsHidden=0")` → enumerate the returned `IUpdateCollection`,
-/// formatting each update's Title, security flag, and download size.
-///
-/// The `Search` call contacts Windows Update (or WSUS, if the box is managed) and
-/// can take several seconds — the caller's /exec path already bounds the request,
-/// so this returns whatever the search yields. Returns:
-///   * a formatted list when updates are found,
-///   * "No OS updates available." when the machine is up to date,
-///   * a precise "unavailable (…)" / "access denied …" line on any COM failure.
-/// Never panics.
-pub fn check_updates() -> String {
-    let _com = match ComGuard::enter() {
-        Ok(g) => g,
-        Err(msg) => return format!("OS updates: {msg}"),
-    };
-    match check_updates_inner() {
-        Ok(s) => s,
-        Err(msg) => format!("OS updates: {msg}"),
+/// How long `it-ai:os-updates/check` waits for a search when it has no fresh
+/// result: inside the hub's 65 s wait for an /exec answer.
+const CHECK_WAIT: Duration = Duration::from_secs(45);
+
+fn searches() -> &'static cache::Cache {
+    static CACHE: OnceLock<cache::Cache> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let t0 = Instant::now();
+        cache::Cache::new(Arc::new(move || t0.elapsed().as_secs()), Arc::new(search))
+    })
+}
+
+fn answer(wait: Duration) -> String {
+    match searches().answer(wait) {
+        cache::Answer::Report { text, age } => format::checked(&text, age),
+        cache::Answer::Failed(line) => line,
+        cache::Answer::Checking { secs } => format::checking(secs),
     }
 }
 
-/// Inner check that can use `?`; all errors are already reason-formatted strings.
-fn check_updates_inner() -> Result<String, String> {
+/// The OS updates the machine is missing: the last Windows Update search while
+/// it is fresh (with its age), else a new search waited for up to CHECK_WAIT,
+/// else a "check in progress" line. Never panics.
+pub fn check_updates() -> String {
+    answer(CHECK_WAIT)
+}
+
+/// The same answer for the periodic analysis snapshot, which never waits: a
+/// missing or stale result starts a search the next snapshot picks up.
+pub fn snapshot_updates() -> String {
+    answer(Duration::ZERO)
+}
+
+/// One WUA online search (`IsInstalled=0 AND Type='Software' AND IsHidden=0`),
+/// formatted, or the full error line.
+fn search() -> Result<String, String> {
+    let _com = ComGuard::enter().map_err(|msg| format::error(&msg))?;
+    search_inner().map_err(|msg| format::error(&msg))
+}
+
+fn search_inner() -> Result<String, String> {
     let session = new_session()?;
 
     // SAFETY: each WUA call below returns a checked Result; nothing is unwrapped.
@@ -223,47 +219,29 @@ fn check_updates_inner() -> Result<String, String> {
         unsafe { search_result.Updates() }.map_err(|e| reason("read results", &e))?;
 
     let count = unsafe { updates.Count() }.map_err(|e| reason("count updates", &e))?;
-    if count <= 0 {
-        return Ok("No OS updates available.".to_string());
+    let rows: Vec<Option<format::Update>> = (0..count.max(0))
+        .map(|i| unsafe { updates.get_Item(i) }.ok().and_then(|u| format::read(&Wua(&u))))
+        .collect();
+    Ok(format::report(count.max(0) as usize, &rows))
+}
+
+struct Wua<'a>(&'a IUpdate);
+
+impl format::Fields for Wua<'_> {
+    fn title(&self) -> Option<String> {
+        unsafe { self.0.Title() }.ok().map(|b| b.to_string())
     }
-
-    let mut lines: Vec<String> =
-        vec![format!("{count} OS update(s) available (via Windows Update Agent):")];
-    let mut security = 0i32;
-    for i in 0..count {
-        let update: IUpdate = match unsafe { updates.get_Item(i) } {
-            Ok(u) => u,
-            // Skip a single unreadable row rather than aborting the whole list.
-            Err(_) => continue,
-        };
-        let title = unsafe { update.Title() }
-            .map(|b| b.to_string())
-            .unwrap_or_else(|_| "(untitled update)".to_string());
-
-        // MsrcSeverity is non-empty only for security updates (e.g. "Critical").
-        let severity = unsafe { update.MsrcSeverity() }
-            .map(|b| b.to_string())
-            .unwrap_or_default();
-        let is_security = !severity.trim().is_empty();
-        if is_security {
-            security += 1;
-        }
-
-        let size = unsafe { update.MaxDownloadSize() }
-            .map(|d| human_size(decimal_bytes(&d)))
-            .unwrap_or_else(|_| "size unknown".to_string());
-
-        let sec_tag = if is_security {
-            format!(" [security: {}]", severity.trim())
-        } else {
-            String::new()
-        };
-        lines.push(format!("  - {title} ({size}){sec_tag}"));
+    fn size(&self) -> Option<u128> {
+        unsafe { self.0.MaxDownloadSize() }.ok().map(|d| decimal_bytes(&d))
     }
-    lines.push(format!(
-        "Summary: {count} update(s), {security} security update(s)."
-    ));
-    Ok(lines.join("\n"))
+    fn msrc(&self) -> Option<String> {
+        unsafe { self.0.MsrcSeverity() }.ok().map(|b| b.to_string())
+    }
+    fn categories(&self) -> Option<Vec<Option<String>>> {
+        let c = unsafe { self.0.Categories() }.ok()?;
+        let n = unsafe { c.Count() }.ok()?;
+        Some((0..n).map(|i| unsafe { c.get_Item(i) }.ok().and_then(|cat| unsafe { cat.CategoryID() }.ok()).map(|b| b.to_string())).collect())
+    }
 }
 
 // ── install ─────────────────────────────────────────────────────────────────────
@@ -284,10 +262,12 @@ pub fn install_updates() -> String {
         Ok(g) => g,
         Err(msg) => return format!("OS update install: {msg}"),
     };
-    match install_updates_inner() {
+    let out = match install_updates_inner() {
         Ok(s) => s,
         Err(msg) => format!("OS update install: {msg}"),
-    }
+    };
+    searches().invalidate();
+    out
 }
 
 /// Inner install that can use `?`; all errors are already reason-formatted.

@@ -114,9 +114,7 @@ pub fn uninstall() {
 }
 
 pub(crate) fn home() -> String {
-    env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .unwrap_or_default()
+    crate::agenthome::get().to_string_lossy().into_owned()
 }
 
 /// The home a boot/logon SERVICE runs with, which is also where its relay.cred
@@ -128,7 +126,7 @@ pub(crate) fn service_home() -> PathBuf {
     #[cfg(unix)]
     {
         let inherited = env::var("HOME").ok();
-        let pw = passwd_home(unsafe { libc::geteuid() });
+        let pw = crate::agenthome::passwd_home(unsafe { libc::geteuid() });
         if pw.is_none() {
             eprintln!("warn: no passwd entry for this uid — using the inherited HOME for the service");
         }
@@ -143,20 +141,6 @@ pub(crate) fn service_home() -> PathBuf {
 #[cfg(unix)]
 fn pick_service_home(inherited: Option<&str>, passwd: Option<PathBuf>) -> PathBuf {
     passwd.unwrap_or_else(|| PathBuf::from(inherited.unwrap_or_default()))
-}
-
-#[cfg(unix)]
-fn passwd_home(uid: libc::uid_t) -> Option<PathBuf> {
-    // SAFETY: getpwuid returns a pointer into static storage (or null); we copy
-    // pw_dir out before any other passwd call can overwrite it.
-    unsafe {
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() || (*pw).pw_dir.is_null() {
-            return None;
-        }
-        let dir = std::ffi::CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned();
-        (!dir.is_empty()).then(|| PathBuf::from(dir))
-    }
 }
 
 // ---- macOS: LaunchAgent ----
@@ -736,7 +720,7 @@ mod service_home_tests {
         // Lookup failure is the only time the inherited HOME is used.
         assert_eq!(pick_service_home(Some("/fallback"), None), PathBuf::from("/fallback"));
         // And the real lookup works for this uid.
-        let me = passwd_home(unsafe { libc::geteuid() }).expect("passwd entry for the test uid");
+        let me = crate::agenthome::passwd_home(unsafe { libc::geteuid() }).expect("passwd entry for the test uid");
         assert!(me.is_absolute(), "{me:?}");
         // The real entry point agrees, whatever HOME this process inherited.
         assert_eq!(service_home(), me, "inherited HOME={:?}", env::var("HOME"));
